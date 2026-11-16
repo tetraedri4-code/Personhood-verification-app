@@ -100,7 +100,39 @@ fn run(ps: ProofSystem) {
     let bp4 = w.scheme.prove_binding(&mut rng, &alice2, &tree, &w.ik.public, &w.wk.public, ctx, 1, today, false, b"y").unwrap();
     assert_eq!(bp4.nym, bp.nym, "renewal keeps pseudonyms");
 
-    // revocation: once alice's handle is in the tree she can no longer prove
+    // re-check: the issuer learns the handle and the old month, and moves the month forward
+    {
+        let later = today + 600; // 20 months on, inside the 24-month window
+        let mut old = alice2.clone();
+        // keep the credential alive up to `later` by blind renewals, as a real holder would
+        let exp = dates::quarter_end(dates::quarter_of(later));
+        let (rp, rho) = w.scheme.prove_renewal(&mut rng, &old, &tree, &w.ik.public, &w.wk.public, today, b"r2").unwrap();
+        let sig = w.scheme.reissue(&mut rng, &w.ik, &vc, b"r2", &rp, exp).unwrap();
+        old = w.scheme.finish_renewal(&w.ik.public, &old, rho, &sig, exp).unwrap();
+        let vcl = VerifyCtx { today: later, ..vc.clone() };
+        let (rp, rho) = w.scheme.prove_recheck(&mut rng, &old, &tree, &w.ik.public, &w.wk.public, later, b"rc").unwrap();
+        let (h, oc) = (old.attrs.handle, old.attrs.last_check);
+        let (ne, nc) = (dates::quarter_end(dates::quarter_of(later) + 1), dates::month_start(later));
+        // wrong handle (another person's login), wrong month, wrong session, or a plain renewal proof: refused
+        assert!(w.scheme.reissue_recheck(&mut rng, &w.ik, &vcl, b"rc", &rp, 1 << 41, oc, ne, nc).is_err());
+        assert!(w.scheme.reissue_recheck(&mut rng, &w.ik, &vcl, b"rc", &rp, h, oc + 31, ne, nc).is_err());
+        assert!(w.scheme.reissue_recheck(&mut rng, &w.ik, &vcl, b"other", &rp, h, oc, ne, nc).is_err());
+        assert!(w.scheme.reissue(&mut rng, &w.ik, &vcl, b"rc", &rp, ne).is_err(), "a re-check proof is not a renewal proof");
+        let (plain, _) = w.scheme.prove_renewal(&mut rng, &old, &tree, &w.ik.public, &w.wk.public, later, b"rc").unwrap();
+        assert!(w.scheme.reissue_recheck(&mut rng, &w.ik, &vcl, b"rc", &plain, h, oc, ne, nc).is_err());
+        let sig = w.scheme.reissue_recheck(&mut rng, &w.ik, &vcl, b"rc", &rp, h, oc, ne, nc).unwrap();
+        let fresh = w.scheme.finish_recheck(&w.ik.public, &old, rho, &sig, ne, nc).unwrap();
+        assert_eq!(fresh.attrs.last_check, nc);
+        // same secret, same pseudonym; and it now renews at a date where the old one could not
+        let far = later + 400;
+        let vcf = VerifyCtx { today: far, ..vc.clone() };
+        let _ = vcf;
+        assert!(w.scheme.prove_renewal(&mut rng, &old, &tree, &w.ik.public, &w.wk.public, far, b"x").is_err(), "re-check overdue");
+        assert!(w.scheme.prove_renewal(&mut rng, &fresh, &tree, &w.ik.public, &w.wk.public, later + 300, b"x").is_ok());
+        let bp5 = w.scheme.prove_binding(&mut rng, &fresh, &tree, &w.ik.public, &w.wk.public, ctx, 1, later, false, b"y").unwrap();
+        assert_eq!(bp5.nym, bp.nym, "a re-check keeps pseudonyms");
+    }
+
     let tree2 = w.scheme.revocation_tree(&[5, 1 << 40]).unwrap();
     assert!(matches!(
         w.scheme.prove_like(&mut rng, &alice, &tree2, &w.ik.public, &w.wk.public, ctx, "p", today),

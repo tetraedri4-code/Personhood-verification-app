@@ -140,6 +140,9 @@ pub struct Cfg {
     pub ranges: Vec<Range>,
     pub d_entries: Vec<(u64, u64)>, // (state c*, quarter gamma0*)
     pub reissue: bool,
+    /// attributes the holder shows in the clear: (attribute index, value). The proof then says the
+    /// credential's attribute equals that value.
+    pub reveal: Vec<(usize, Fr)>,
     pub backend: Backend,
     pub width: usize,     // Poseidon width: 5 = Hp(tag, P, s, i); 3 = Hp(c, s) with c = H(tag, P, i) public
     pub compact: bool,    // BM7 savings: compact one-out-of-many, one-phase Bulletproofs encoding
@@ -699,6 +702,10 @@ fn linear_relations(p: &Public, cfg: &Cfg, lay: &Layout, pr: &Proof) -> Vec<LinR
             }
         }
         rels.push(LinRel::new(cn.into(), t));
+    }
+    for (j, v) in &cfg.reveal {
+        // h_j^v = h_j^{m_j}: the response for m_j is shared with every other relation, so this pins it
+        rels.push(LinRel::new(g.h[*j] * v, vec![(g.h[*j], *j)]));
     }
     rels
 }

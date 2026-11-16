@@ -60,7 +60,6 @@ pub struct UniquenessCluster {
     /// an operator that runs but holds no share yet
     pub standby: AdminEndpoint,
     eval_tokens: Vec<String>,
-    peer_token: String,
     #[serde(skip)]
     file: Option<std::path::PathBuf>,
 }
@@ -78,7 +77,6 @@ async fn start_uniqueness(n: u32, threshold: usize, data_dir: Option<&std::path:
         _ => None,
     };
     let total = n + 1;
-    let peer_token = saved.as_ref().map(|s| s.peer_token.clone()).unwrap_or_else(token);
     let mut admins = vec![];
     let mut endpoints = vec![];
     let mut eval_tokens = vec![];
@@ -90,10 +88,10 @@ async fn start_uniqueness(n: u32, threshold: usize, data_dir: Option<&std::path:
             index,
             eval_token: eval_token.clone(),
             admin_token: admin_token.clone(),
-            peer_token: peer_token.clone(),
             state_file: data_dir.map(|d| d.join(format!("uniqueness-operator-{index}.json"))),
             max_evals_per_minute: 6000,
             min_threshold: threshold.min(2),
+            test_fault: None,
         })?;
         let (l, url) = listen(0).await?;
         serve(l, pop_uniqueness::router(op));
@@ -114,7 +112,7 @@ async fn start_uniqueness(n: u32, threshold: usize, data_dir: Option<&std::path:
             (admin::dkg(&members, threshold).await?, members, admins[n as usize].clone())
         }
     };
-    let cluster = UniquenessCluster { key: key.clone(), threshold, members, standby, eval_tokens, peer_token, file };
+    let cluster = UniquenessCluster { key: key.clone(), threshold, members, standby, eval_tokens, file };
     cluster.save()?;
     Ok((cluster, ThresholdConfig { operators: endpoints, keys: vec![key] }))
 }
@@ -129,11 +127,9 @@ impl UniquenessCluster {
         Ok(())
     }
 
-    /// Refresh: every member gets a new share of the same key and erases the old one.
+    /// Refresh: every member gets a new share of the same key and erases the old one by itself.
     pub async fn refresh(&self) -> anyhow::Result<u64> {
-        let epoch = admin::reshare(&self.key, &self.members, &self.members, self.threshold).await?;
-        admin::finalize(&self.key, epoch, &self.members, &[]).await?;
-        Ok(epoch)
+        admin::reshare(&self.key, &self.members, &self.members, self.threshold).await
     }
 
     /// Replace the last member by the standby operator: the remaining members and the newcomer get
@@ -143,7 +139,6 @@ impl UniquenessCluster {
         let mut new_set: Vec<AdminEndpoint> = self.members[..self.members.len() - 1].to_vec();
         new_set.push(self.standby.clone());
         let epoch = admin::reshare(&self.key, &self.members, &new_set, self.threshold).await?;
-        admin::finalize(&self.key, epoch, &new_set, std::slice::from_ref(&leaver)).await?;
         let joined = self.standby.index;
         self.standby = leaver.clone();
         self.members = new_set;

@@ -459,7 +459,7 @@ impl Scheme {
                 bind: vec![],
             },
             StatementKind::Like => Stmt::Like { ctx: "setup".into(), post: "setup".into(), today, root: Fr::zero(), bind: vec![] },
-            StatementKind::Renewal => Stmt::Renewal { today, root: Fr::zero(), bind: vec![] },
+            StatementKind::Renewal => Stmt::Renewal { today, root: Fr::zero(), bind: vec![], shown: None },
         }
     }
 
@@ -511,7 +511,7 @@ impl Scheme {
                 let r = vec![Range { label: "tau >= today", terms: vec![(A_TAU, 1)], constant: -(*today as i64) }];
                 (h, r, *today, *root, bind.clone())
             }
-            Stmt::Renewal { today, root, bind } => {
+            Stmt::Renewal { today, root, bind, .. } => {
                 let t = *today as i64;
                 let r = vec![
                     Range { label: "tau >= today - 12 months", terms: vec![(A_TAU, 1)], constant: dates::RENEW_GRACE_DAYS as i64 - t },
@@ -536,6 +536,13 @@ impl Scheme {
         }
         context.extend_from_slice(&(bind.len() as u64).to_be_bytes());
         context.extend_from_slice(&bind);
+        let mut reveal = vec![];
+        if let Stmt::Renewal { shown: Some((handle, last_check)), .. } = st {
+            context.extend_from_slice(b"|RECHECK");
+            context.extend_from_slice(&handle.to_be_bytes());
+            context.extend_from_slice(&last_check.to_be_bytes());
+            reveal = vec![(A_R, Fr::from(*handle)), (A_ELL, Fr::from(*last_check as u64))];
+        }
         Cfg {
             name: kind.name().into(),
             context,
@@ -546,6 +553,7 @@ impl Scheme {
             ranges,
             d_entries: vec![],
             reissue: kind == StatementKind::Renewal,
+            reveal,
             backend: self.config.proof_system,
             width: 5,
             compact: false,
@@ -758,7 +766,7 @@ impl Scheme {
         today: Day,
         session: &[u8],
     ) -> Result<(RenewalProof, Fr)> {
-        let st = Stmt::Renewal { today, root: tree.root(), bind: session.to_vec() };
+        let st = Stmt::Renewal { today, root: tree.root(), bind: session.to_vec(), shown: None };
         let rho_new = Fr::rand(rng);
         let pr = self.prove_stmt_with(rng, &st, cred, tree, issuer, witness, Some(rho_new))?;
         Ok((RenewalProof { proof: hex::encode(codec::encode_proof(&pr)) }, rho_new))
@@ -777,7 +785,7 @@ impl Scheme {
         if new_expiry != dates::quarter_end(dates::quarter_of(new_expiry)) {
             return Err(CryptoError::OffGrid("new expiry".into()));
         }
-        let st = Stmt::Renewal { today: vc.today, root: vc.revocation_root, bind: session.to_vec() };
+        let st = Stmt::Renewal { today: vc.today, root: vc.revocation_root, bind: session.to_vec(), shown: None };
         let pr = self.verify_stmt(&st, vc, &rp.proof)?;
         let cnew = pr.cnew.ok_or(CryptoError::InvalidProof)?;
         let b = self.g.p1 + self.g.q1 * statement::domain() + cnew + self.g.h[A_TAU] * Fr::from(new_expiry as u64);
@@ -812,6 +820,85 @@ impl Scheme {
     }
 }
 
+// ------------------------------- re-check -------------------------------
+//
+// The two-year identity re-check (design §4.6). The holder logs in with the eID and shows a renewal
+// proof that also reveals the credential's handle and the month of its last check. The issuer, who
+// knows from the login which enrolment record this is, checks that the handle is that record's, and
+// signs the same hidden attributes with a new expiry and a new last-check month. The secret, and with
+// it every pseudonym, stays; the issuer learns nothing it did not know from the login.
+impl Scheme {
+    /// Holder: like [`Scheme::prove_renewal`], with the handle and last-check month shown.
+    pub fn prove_recheck<R: RngCore + CryptoRng>(
+        &self,
+        rng: &mut R,
+        cred: &Credential,
+        tree: &RevocationTree,
+        issuer: &IssuerPublicKey,
+        witness: &WitnessPublicKey,
+        today: Day,
+        session: &[u8],
+    ) -> Result<(RenewalProof, Fr)> {
+        let st = Stmt::Renewal { today, root: tree.root(), bind: session.to_vec(), shown: Some((cred.attrs.handle, cred.attrs.last_check)) };
+        let rho_new = Fr::rand(rng);
+        let pr = self.prove_stmt_with(rng, &st, cred, tree, issuer, witness, Some(rho_new))?;
+        Ok((RenewalProof { proof: hex::encode(codec::encode_proof(&pr)) }, rho_new))
+    }
+
+    /// Issuer: verify a re-check proof for the credential with `handle` whose last check was in the
+    /// month starting `old_check`, and sign with `new_expiry` and `new_check`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reissue_recheck<R: RngCore>(
+        &self,
+        rng: &mut R,
+        key: &IssuerKey,
+        vc: &VerifyCtx,
+        session: &[u8],
+        rp: &RenewalProof,
+        handle: u64,
+        old_check: Day,
+        new_expiry: Day,
+        new_check: Day,
+    ) -> Result<BlindSignature> {
+        if new_expiry != dates::quarter_end(dates::quarter_of(new_expiry)) || new_check != dates::month_start(new_check) || new_check < old_check {
+            return Err(CryptoError::OffGrid("new expiry or re-check month".into()));
+        }
+        let st = Stmt::Renewal { today: vc.today, root: vc.revocation_root, bind: session.to_vec(), shown: Some((handle, old_check)) };
+        let pr = self.verify_stmt(&st, vc, &rp.proof)?;
+        let cnew = pr.cnew.ok_or(CryptoError::InvalidProof)?;
+        // cnew commits to every attribute but the expiry, the old month included; swap the month
+        let b = self.g.p1 + self.g.q1 * statement::domain() + cnew + self.g.h[A_TAU] * Fr::from(new_expiry as u64)
+            + self.g.h[A_ELL] * (Fr::from(new_check as u64) - Fr::from(old_check as u64));
+        let e = Fr::rand(rng);
+        let a = (b * (key.x + e).inverse().unwrap()).into_affine();
+        Ok(BlindSignature { a: to_hex(&a), e: to_hex(&e) })
+    }
+
+    /// Holder: install the re-checked signature.
+    pub fn finish_recheck(&self, issuer: &IssuerPublicKey, old: &Credential, rho_new: Fr, sig: &BlindSignature, new_expiry: Day, new_check: Day) -> Result<Credential> {
+        let mut attrs = old.attrs.clone();
+        attrs.expiry = new_expiry;
+        attrs.last_check = new_check;
+        attrs.check_grid()?;
+        if new_check < old.attrs.last_check {
+            return Err(CryptoError::OffGrid("re-check month went backwards".into()));
+        }
+        let mut m = old.inner.m;
+        m[A_RHO] = rho_new;
+        m[A_TAU] = Fr::from(new_expiry as u64);
+        m[A_ELL] = Fr::from(new_check as u64);
+        let a: G1A = from_hex(&sig.a)?;
+        let e: Fr = from_hex(&sig.e)?;
+        if !statement::bbs_verify(&self.g, &issuer.w, &a, e, &statement::bbs_b(&self.g, &m)) {
+            return Err(CryptoError::BadSignature);
+        }
+        let mut mv = old.inner.mv;
+        mv[A_TAU] = new_expiry as u64;
+        mv[A_ELL] = new_check as u64;
+        Ok(Credential { inner: statement::Credential { a, e, m, mv }, attrs, handle_sig: old.handle_sig.clone() })
+    }
+}
+
 fn cfg_pos<'a>(s: &'a Scheme, cfg: &Cfg) -> &'a Poseidon {
     if cfg.width == 3 {
         &s.pos3
@@ -823,7 +910,8 @@ fn cfg_pos<'a>(s: &'a Scheme, cfg: &Cfg) -> &'a Poseidon {
 enum Stmt {
     Binding { ctx: String, slot: u32, quarters: [u32; 4], today: Day, probation: bool, root: Fr, bind: Vec<u8> },
     Like { ctx: String, post: String, today: Day, root: Fr, bind: Vec<u8> },
-    Renewal { today: Day, root: Fr, bind: Vec<u8> },
+    /// `shown`: a re-check shows the handle and the month of the last identity check to the issuer
+    Renewal { today: Day, root: Fr, bind: Vec<u8>, shown: Option<(u64, Day)> },
 }
 
 impl Stmt {

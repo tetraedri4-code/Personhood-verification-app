@@ -28,7 +28,9 @@
 //! across versions (`pop-issuer`).
 pub mod admin;
 pub mod client;
+pub mod ident;
 pub mod operator;
+pub mod round;
 pub mod shamir;
 pub mod wire;
 

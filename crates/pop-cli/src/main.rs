@@ -82,7 +82,7 @@ enum UniqCmd {
         #[arg(long, default_value = "127.0.0.1:4100")]
         listen: SocketAddr,
     },
-    /// Generate a new shared key among the operators of a cluster file. Prints the group key to pin in the issuer configuration
+    /// Generate a new shared key among operators you administer yourself. Prints the group key to pin in the issuer configuration
     Dkg {
         /// JSON list of {index, url, admin_token}
         #[arg(long)]
@@ -90,14 +90,14 @@ enum UniqCmd {
         #[arg(long)]
         threshold: usize,
     },
-    /// Give every operator a new share of the same key and erase the old shares
+    /// Give every operator you administer a new share of the same key; the old shares are erased
     Refresh {
         #[arg(long)]
         cluster: PathBuf,
         #[arg(long)]
         key: String,
     },
-    /// Hand the key to a changed operator set (add, remove or replace operators, or change the threshold)
+    /// Hand the key to a changed operator set you administer (add, remove or replace operators, or change the threshold)
     Reshare {
         #[arg(long)]
         key: String,
@@ -109,22 +109,11 @@ enum UniqCmd {
         to: PathBuf,
         #[arg(long)]
         threshold: usize,
-        /// do not erase the old shares yet; run `finalize` later
-        #[arg(long)]
-        keep_old: bool,
     },
-    /// Erase every share older than an epoch (the new set, and the operators that left)
-    Finalize {
-        #[arg(long)]
-        key: String,
-        #[arg(long)]
-        epoch: u64,
-        /// cluster file of every operator of the new epoch
-        #[arg(long)]
-        cluster: PathBuf,
-        /// cluster file of operators that left
-        #[arg(long)]
-        leavers: Option<PathBuf>,
+    /// Operators with different administrators: write a round, pass the file around, and each administrator joins it
+    Round {
+        #[command(subcommand)]
+        cmd: RoundCmd,
     },
     /// Show what each operator of a cluster file publishes: keys, epochs, thresholds, evaluation counts
     Status {
@@ -144,12 +133,56 @@ enum UniqCmd {
     },
 }
 
+#[derive(Subcommand)]
+enum RoundCmd {
+    /// Write the spec of a key generation. `members` is a JSON list of {index, url, identity}; leave
+    /// `identity` out only if you accept the key each operator publishes
+    NewDkg {
+        #[arg(long)]
+        members: PathBuf,
+        #[arg(long)]
+        threshold: usize,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Write the spec of a refresh (same members in --from and --to) or a change of operators or threshold
+    NewReshare {
+        #[arg(long)]
+        key: String,
+        /// members file of current holders that deal
+        #[arg(long)]
+        from: PathBuf,
+        /// members file of the new operator set
+        #[arg(long)]
+        to: PathBuf,
+        #[arg(long)]
+        threshold: usize,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Print what a spec says, for the administrator to check before joining
+    Show {
+        #[arg(long)]
+        spec: PathBuf,
+    },
+    /// Approve the round at your own operator and keep it moving until it is done
+    Join {
+        #[arg(long)]
+        spec: PathBuf,
+        /// JSON {index, url, admin_token} of your own operator
+        #[arg(long)]
+        operator: PathBuf,
+        /// give up after this many seconds (the others may not have joined yet)
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
+    },
+}
+
 #[derive(serde::Deserialize)]
 struct OperatorFile {
     index: u32,
     eval_token: String,
     admin_token: String,
-    peer_token: String,
     state_file: PathBuf,
     #[serde(default = "default_rate")]
     max_evals_per_minute: u32,
@@ -180,12 +213,13 @@ async fn uniqueness_cmd(cmd: UniqCmd) -> anyhow::Result<()> {
                 index,
                 eval_token: f.eval_token,
                 admin_token: f.admin_token,
-                peer_token: f.peer_token,
                 state_file: Some(f.state_file),
                 max_evals_per_minute: f.max_evals_per_minute,
                 min_threshold: f.min_threshold,
+                test_fault: None,
             })?;
             println!("Uniqueness operator {index} listening on http://{listen}");
+            println!("Identity key (give it to the other administrators): {}", op.identity());
             serve(listen, pop_uniqueness::router(op)).await?;
         }
         UniqCmd::Dkg { cluster: c, threshold } => {
@@ -199,24 +233,55 @@ async fn uniqueness_cmd(cmd: UniqCmd) -> anyhow::Result<()> {
             let ops = cluster(&c)?;
             let cur = admin::current_epoch(&key, &ops).await?;
             let epoch = admin::reshare(&key, &ops, &ops, cur.threshold).await?;
-            admin::finalize(&key, epoch, &ops, &[]).await?;
             println!("Shares refreshed: epoch {epoch}, old shares erased. The key and every deduplication key are unchanged.");
         }
-        UniqCmd::Reshare { key, from, to, threshold, keep_old } => {
+        UniqCmd::Reshare { key, from, to, threshold } => {
             let (dealers, receivers) = (cluster(&from)?, cluster(&to)?);
             let epoch = admin::reshare(&key, &dealers, &receivers, threshold).await?;
-            println!("New shares dealt: epoch {epoch}, {threshold}-of-{}.", receivers.len());
-            if keep_old {
-                println!("Old shares are still in place. Erase them with `pop uniqueness finalize --epoch {epoch}`, naming EVERY operator that held an older share under --leavers.");
-            } else {
-                admin::finalize(&key, epoch, &receivers, &dealers).await?;
-                println!("Old shares erased at the operators named in --from and --to. If other operators held a share of the old epoch, run `pop uniqueness finalize` with them under --leavers.");
-            }
+            println!("New shares dealt: epoch {epoch}, {threshold}-of-{}. Every operator of the round erased its older shares.", receivers.len());
+            println!("An operator that held a share but took no part still has it: check with `pop uniqueness status`.");
         }
-        UniqCmd::Finalize { key, epoch, cluster: c, leavers } => {
-            let leavers = leavers.as_ref().map(cluster).transpose()?.unwrap_or_default();
-            admin::finalize(&key, epoch, &cluster(&c)?, &leavers).await?;
-            println!("Shares older than epoch {epoch} erased.");
+        UniqCmd::Round { cmd } => {
+            use pop_uniqueness::admin::Member;
+            use pop_uniqueness::wire::RoundSpec;
+            let members = |p: &PathBuf| read_json::<Vec<Member>>(p);
+            let write = |spec: &RoundSpec, out: &PathBuf| -> anyhow::Result<()> {
+                std::fs::write(out, serde_json::to_vec_pretty(spec)?)?;
+                println!("Round {} written to {}. Send the file to every administrator; each checks it (`round show`) and runs `round join`.", spec.id(), out.display());
+                Ok(())
+            };
+            match cmd {
+                RoundCmd::NewDkg { members: m, threshold, out } => write(&admin::spec_dkg(&members(&m)?, threshold).await?, &out)?,
+                RoundCmd::NewReshare { key, from, to, threshold, out } => write(&admin::spec_reshare(&key, &members(&from)?, &members(&to)?, threshold).await?, &out)?,
+                RoundCmd::Show { spec } => {
+                    let s: RoundSpec = read_json(&spec)?;
+                    pop_uniqueness::round::check_spec(&s).map_err(|e| anyhow::anyhow!("this spec is not valid: {e}"))?;
+                    println!("Round {}", s.id());
+                    match &s.key {
+                        None => println!("  generates a NEW key, shared {}-of-{}", s.threshold, s.receivers.len()),
+                        Some(k) => println!("  gives new shares of key {} ({}-of-{}), dealt from epoch {} by operators {:?}, as epoch {}", pop_uniqueness::key_version(k), s.threshold, s.receivers.len(), s.from_epoch.unwrap_or(0), s.dealers, s.new_epoch),
+                    }
+                    println!("  operators that will hold a share afterwards: {:?}", s.receivers);
+                    let leaving: Vec<u32> = s.dealers.iter().copied().filter(|d| !s.receivers.contains(d)).collect();
+                    if !leaving.is_empty() {
+                        println!("  operators that leave and erase their share: {leaving:?}");
+                    }
+                    println!("  identity keys (compare each with what its administrator gave you):");
+                    for p in &s.peers {
+                        println!("    operator {} at {}: {}", p.index, p.url, p.identity);
+                    }
+                }
+                RoundCmd::Join { spec, operator, timeout } => {
+                    let s: RoundSpec = read_json(&spec)?;
+                    let me: AdminEndpoint = read_json(&operator)?;
+                    println!("Joining round {} as operator {} ...", s.id(), me.index);
+                    let st = admin::join(&s, &me, std::time::Duration::from_secs(timeout)).await?;
+                    match st.result {
+                        Some((key, epoch)) => println!("Done. This operator holds epoch {epoch} of key {} and erased its older shares.\nGroup key: {key}", pop_uniqueness::key_version(&key)),
+                        None => println!("Done. This operator left the set and erased its share."),
+                    }
+                }
+            }
         }
         UniqCmd::Status { cluster: c } => {
             for o in cluster(&c)? {

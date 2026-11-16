@@ -1,32 +1,45 @@
 //! One operator of the threshold uniqueness service.
 //!
-//! An operator holds, per group key Y, one share per epoch (normally one epoch; two between the commit
-//! of a round and its finalization). It serves three kinds of callers, each with its own bearer token:
+//! An operator holds its identity key and, per group key Y, one share per epoch (normally one epoch;
+//! two while a round is between commit and the last operator's confirmation). It serves:
 //!
 //! * the issuer (`eval_token`): `POST /v1/evaluate`, a^{share} for a blinded point a;
-//! * the operator's own administrator (`admin_token`): start, deal, check, commit or abort a round, and
-//!   finalize it (erase the older shares);
-//! * the other operators (`peer_token`): `POST /v1/peer/deal`, a sub-share in a round.
+//! * its own administrator (`admin_token`): approve a round, advance it, abort it;
+//! * the other operators: `POST /v1/peer/msg`, signed messages of a round. There is no shared
+//!   secret between operators: a message counts only if it is signed with the identity key the
+//!   approved round spec names for its sender.
 //!
-//! `GET /v1/public` is open: verification keys are public by design.
+//! `GET /v1/public` is open: identity key and verification keys are public by design.
 //!
 //! ## Rounds
 //!
-//! A round is all-or-nothing and has no complaint phase: if any check fails anywhere, the
-//! administrators abort and nothing changes. Every dealer picks a polynomial h_i of degree t'-1, sends
-//! h_i(j) to receiver j with Feldman commitments to the coefficients, and every receiver checks its
-//! value against the commitments.
+//! Each operator's administrator approves the same round spec at their own operator and then keeps
+//! calling `advance`. Nobody holds anyone else's credentials; operators talk to each other directly.
 //!
-//! * key generation: h_i(0) is random; the new share of j is Σ_i h_i(j) and Y = Π_i C_i0.
-//! * reshare (and refresh, which is a reshare to the same set): h_i(0) is dealer i's current share, the
-//!   commitment C_i0 must equal i's published verification key, and the new share of j is
-//!   Σ_i λ_i h_i(j) with λ_i the Lagrange coefficient of i among the dealers. Y cannot change: the
-//!   receivers check it.
+//! 1. **Commit.** Every dealer picks a polynomial h_i of degree t'-1 and sends everyone a hash of its
+//!    Feldman commitments. Nobody reveals anything until it holds every dealer's hash, so no dealer
+//!    can choose its contribution after seeing the others'.
+//! 2. **Deal.** Every dealer sends each receiver j the commitments and h_i(j), encrypted to j.
+//!    The receiver checks the hash, the value against the commitments, and
+//!    * key generation: a proof that the dealer knows h_i(0);
+//!    * reshare: that the commitment to h_i(0) is the dealer's published verification key.
+//! 3. **Complaint.** A receiver that gets a bad deal publishes it, opened with a proof, so that
+//!    every operator can check for itself who is at fault: the dealer (its signed deal is bad) or the
+//!    receiver (it complained about a good deal). The round fails and names the culprit; the
+//!    administrators run it again without that operator.
+//! 4. **Ready.** A receiver whose deals all check out says so, with a hash over every dealer's
+//!    commitments. Operators that saw different commitments notice here and the round fails.
+//! 5. **Store.** When every receiver is ready with the same hash, each computes its new share
+//!    (Σ_i h_i(j) in key generation, Σ_i λ_i h_i(j) in a reshare), checks that the group key did not
+//!    change, writes the share to disk and says so.
+//! 6. **Erase.** When every receiver has confirmed that its new share is on disk, each operator
+//!    erases its older shares of the key. An operator that left erases its last one.
 //!
-//! Before committing, the administrators compare what every receiver saw (the transcript). A dealer
-//! that sent different commitments to different receivers, or anyone who dealt in a dealer's name, is
-//! caught there.
-use crate::shamir::{commit, commitment_at, distinct_nonzero, eval_poly, lagrange_at_zero};
+//! A round that stalls after step 5 leaves the new epoch at some operators. Nothing was erased, the
+//! old epoch still works everywhere, and the next successful round erases the leftover.
+use crate::ident::{self, IdentityKey};
+use crate::round::{self, check_deal, check_spec, commit_hash, commitments_hash, pok_context, seal_context, Checked};
+use crate::shamir::{commit, commitment_at, eval_poly, lagrange_at_zero};
 use crate::wire::*;
 use ark_ec::{AffineRepr, CurveGroup, Group};
 use ark_ff::Zero;
@@ -55,9 +68,7 @@ pub struct OperatorConfig {
     pub eval_token: String,
     /// bearer token of this operator's administrator
     pub admin_token: String,
-    /// bearer token the operators use among themselves
-    pub peer_token: String,
-    /// where the shares are kept; None = memory only (tests, demo)
+    /// where the identity key and the shares are kept; None = memory only (tests, demo)
     pub state_file: Option<PathBuf>,
     /// Upper bound on evaluations per minute. Identity codes are guessable, so whoever can evaluate
     /// without limit can test guesses against the enrolment table. Set it to a small multiple of the
@@ -65,15 +76,28 @@ pub struct OperatorConfig {
     pub max_evals_per_minute: u32,
     /// refuse rounds whose new threshold is lower than this
     pub min_threshold: usize,
+    /// Tests only: make this operator misbehave. Not reachable from any configuration file.
+    #[doc(hidden)]
+    pub test_fault: Option<Fault>,
+}
+
+/// Misbehaviour an operator can be told to show in tests.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fault {
+    /// as a dealer, send this receiver a wrong value
+    BadShareTo(u32),
+    /// as a receiver, complain about this dealer's (good) deal
+    FalseComplaintAgainst(u32),
 }
 
 impl OperatorConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.index >= 1, "operator index must be at least 1");
-        for (name, t) in [("eval", &self.eval_token), ("admin", &self.admin_token), ("peer", &self.peer_token)] {
+        for (name, t) in [("eval", &self.eval_token), ("admin", &self.admin_token)] {
             anyhow::ensure!(t.len() >= 24, "{name} token must be at least 24 characters");
         }
-        anyhow::ensure!(self.eval_token != self.admin_token && self.eval_token != self.peer_token && self.admin_token != self.peer_token, "the three tokens must differ");
+        anyhow::ensure!(self.eval_token != self.admin_token, "the two tokens must differ");
         anyhow::ensure!(self.min_threshold >= 1, "min_threshold must be at least 1");
         Ok(())
     }
@@ -85,26 +109,53 @@ struct Epoch {
     threshold: usize,
     share: String,
     vks: BTreeMap<u32, String>,
+    /// identity keys of the epoch's operators, pinned for later rounds
+    #[serde(default)]
+    ids: BTreeMap<u32, String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
 struct Persisted {
+    /// identity secret key (hex)
+    #[serde(default)]
+    identity: String,
     /// group key (hex) ↦ epochs, oldest first
     keys: BTreeMap<String, Vec<Epoch>>,
 }
 
-struct ReceivedDeal {
+struct GoodDeal {
     commitments: Vec<G2A>,
     value: Fr,
     hash: String,
 }
 
+struct Out {
+    to: u32,
+    env: Envelope,
+    delivered: bool,
+}
+
 struct Round {
     spec: RoundSpec,
+    checked: Checked,
     created: u64,
     /// my polynomial, if I am a dealer
     poly: Option<Vec<Fr>>,
-    deals: BTreeMap<u32, ReceivedDeal>,
+    /// dealer ↦ (committed hash, the signed commit)
+    commits: BTreeMap<u32, (String, Envelope)>,
+    /// dealer ↦ its deal to me, checked
+    deals: BTreeMap<u32, GoodDeal>,
+    readys: BTreeMap<u32, String>,
+    committed: BTreeMap<u32, (String, u64)>,
+    outbox: Vec<Out>,
+    /// my deals, made when I committed and held back until every dealer has committed
+    pending_deals: Vec<(u32, Body)>,
+    sent_commit: bool,
+    sent_deals: bool,
+    sent_ready: bool,
+    stored: Option<(String, u64)>,
+    done: bool,
+    failed: Option<Failure>,
 }
 
 #[derive(Default)]
@@ -118,13 +169,13 @@ struct Inner {
 
 pub struct Operator {
     cfg: OperatorConfig,
+    identity: IdentityKey,
     inner: Mutex<Inner>,
     http: reqwest::Client,
 }
 
-const ROUND_TTL_SECS: u64 = 15 * 60;
+const ROUND_TTL_SECS: u64 = 30 * 60;
 const MAX_OPEN_ROUNDS: usize = 4;
-const MAX_OPERATORS: usize = 64;
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
@@ -132,14 +183,6 @@ fn now_secs() -> u64 {
 
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
-fn commitments_hash(c: &[G2A]) -> String {
-    let mut h = Sha256::new();
-    for p in c {
-        h.update(pop_crypto::codec::ser(p));
-    }
-    hex::encode(h.finalize())
 }
 
 pub struct ApiErr(StatusCode, String);
@@ -158,54 +201,64 @@ fn bad(msg: impl Into<String>) -> ApiErr {
     err(StatusCode::BAD_REQUEST, msg)
 }
 
-fn point_g2(s: &str) -> Result<G2A, ApiErr> {
-    let p: G2A = from_hex(s).map_err(|e| bad(format!("bad G2 point: {e}")))?;
-    if p.is_zero() {
-        return Err(bad("point at infinity"));
+fn write_private(p: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
+    if let Some(d) = p.parent() {
+        std::fs::create_dir_all(d)?;
     }
-    Ok(p)
+    let tmp = p.with_extension("tmp");
+    {
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            o.mode(0o600);
+        }
+        let mut f = o.open(&tmp)?;
+        std::io::Write::write_all(&mut f, content)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, p)
 }
 
 impl Operator {
     pub fn new(cfg: OperatorConfig) -> anyhow::Result<Arc<Self>> {
         cfg.validate()?;
-        let mut inner = Inner::default();
+        let mut st = Persisted::default();
         if let Some(p) = &cfg.state_file {
             match std::fs::read(p) {
-                Ok(b) => inner.st = serde_json::from_slice(&b).map_err(|e| anyhow::anyhow!("share file {} is damaged: {e}", p.display()))?,
+                Ok(b) => st = serde_json::from_slice(&b).map_err(|e| anyhow::anyhow!("share file {} is damaged: {e}", p.display()))?,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => anyhow::bail!("cannot read share file {}: {e}", p.display()),
             }
         }
+        let identity = if st.identity.is_empty() {
+            // shares without the identity key they were dealt to: something was tampered with
+            anyhow::ensure!(st.keys.is_empty(), "the share file holds shares but no identity key");
+            let k = IdentityKey::generate();
+            st.identity = k.to_hex();
+            if let Some(p) = &cfg.state_file {
+                write_private(p, &serde_json::to_vec_pretty(&st)?).map_err(|e| anyhow::anyhow!("cannot write share file {}: {e}", p.display()))?;
+            }
+            k
+        } else {
+            IdentityKey::from_hex(&st.identity).map_err(|e| anyhow::anyhow!("identity key in the share file: {e}"))?
+        };
         let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(20)).redirect(reqwest::redirect::Policy::none()).build()?;
-        Ok(Arc::new(Operator { cfg, inner: Mutex::new(inner), http }))
+        Ok(Arc::new(Operator { cfg, identity, inner: Mutex::new(Inner { st, ..Default::default() }), http }))
     }
 
     pub fn index(&self) -> u32 {
         self.cfg.index
     }
 
-    /// Write the shares: temp file, owner-only permissions, then rename.
+    pub fn identity(&self) -> String {
+        self.identity.public_hex()
+    }
+
     fn persist(&self, st: &Persisted) -> Result<(), ApiErr> {
         let Some(p) = &self.cfg.state_file else { return Ok(()) };
-        let io = |e: std::io::Error| err(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot write share file: {e}"));
-        if let Some(d) = p.parent() {
-            std::fs::create_dir_all(d).map_err(io)?;
-        }
-        let tmp = p.with_extension("tmp");
-        {
-            let mut o = std::fs::OpenOptions::new();
-            o.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                o.mode(0o600);
-            }
-            let mut f = o.open(&tmp).map_err(io)?;
-            std::io::Write::write_all(&mut f, &serde_json::to_vec_pretty(st).unwrap()).map_err(io)?;
-            f.sync_all().map_err(io)?;
-        }
-        std::fs::rename(&tmp, p).map_err(io)
+        write_private(p, &serde_json::to_vec_pretty(st).unwrap()).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot write share file: {e}")))
     }
 
     fn auth(&self, headers: &HeaderMap, token: &str) -> Result<(), ApiErr> {
@@ -221,6 +274,7 @@ impl Operator {
         let g = self.inner.lock().unwrap();
         PublicInfo {
             index: self.cfg.index,
+            identity: self.identity.public_hex(),
             keys: g
                 .st
                 .keys
@@ -259,87 +313,63 @@ impl Operator {
         Ok(EvalResponse { index: self.cfg.index, partials })
     }
 
-    fn start_round(&self, spec: RoundSpec) -> Result<(), ApiErr> {
+    // ------------------------------------------------------------------ rounds
+
+    fn envelope(&self, round_id: &str, body: &Body) -> Envelope {
+        let body = serde_json::to_string(body).expect("body serializes");
+        let sig = self.identity.sign(&Envelope::signed_bytes(round_id, self.cfg.index, &body));
+        Envelope { round_id: round_id.to_string(), from: self.cfg.index, body, sig }
+    }
+
+    /// The administrator approves a round. Returns its id.
+    fn start_round(&self, spec: RoundSpec) -> Result<String, ApiErr> {
         let me = self.cfg.index;
-        if !(16..=64).contains(&spec.round_id.len()) || !spec.round_id.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(bad("round id must be 16 to 64 hex characters"));
-        }
-        let recv: Vec<u32> = spec.receivers.iter().map(|p| p.index).collect();
-        if recv.is_empty() || recv.len() > MAX_OPERATORS || spec.dealers.is_empty() || spec.dealers.len() > MAX_OPERATORS {
-            return Err(bad("a round needs between 1 and 64 dealers and receivers"));
-        }
-        if !distinct_nonzero(&recv) || !distinct_nonzero(&spec.dealers) {
-            return Err(bad("operator indices must be distinct and at least 1"));
-        }
-        if spec.threshold < 1 || spec.threshold > recv.len() {
-            return Err(bad("threshold must be between 1 and the number of receivers"));
-        }
+        let checked = check_spec(&spec).map_err(bad)?;
         if spec.threshold < self.cfg.min_threshold {
             return Err(err(StatusCode::FORBIDDEN, format!("this operator refuses thresholds below {}", self.cfg.min_threshold)));
         }
         let am_dealer = spec.dealers.contains(&me);
-        let am_receiver = recv.contains(&me);
-        if !am_dealer && !am_receiver {
+        if !am_dealer && !spec.receivers.contains(&me) {
             return Err(bad("this operator is not part of the round"));
         }
-        if let Some(p) = spec.receivers.iter().find(|p| !crate::url_is_safe(&p.url)) {
-            return Err(bad(format!("receiver {} must be reached over https", p.index)));
+        if checked.peers[&me].1 != self.identity.public {
+            return Err(bad("the spec names another identity key for this operator"));
         }
         let mut g = self.inner.lock().unwrap();
         let now = now_secs();
         g.rounds.retain(|_, r| now.saturating_sub(r.created) <= ROUND_TTL_SECS);
-        if g.rounds.contains_key(&spec.round_id) {
-            return Err(err(StatusCode::CONFLICT, "round already started"));
+        if g.rounds.contains_key(&checked.id) {
+            return Ok(checked.id); // approving twice is harmless
         }
         if g.rounds.len() >= MAX_OPEN_ROUNDS {
             return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many open rounds; abort one first"));
         }
         let mut rng = rand::thread_rng();
         let constant = match spec.kind {
-            RoundKind::Dkg => {
-                let mut d = spec.dealers.clone();
-                let mut r = recv.clone();
-                d.sort_unstable();
-                r.sort_unstable();
-                if d != r || spec.key.is_some() {
-                    return Err(bad("in key generation every receiver deals, and there is no key yet"));
-                }
-                Fr::rand(&mut rng)
-            }
+            RoundKind::Dkg => Fr::rand(&mut rng),
             RoundKind::Reshare => {
-                let (Some(key), Some(from), Some(old_t)) = (spec.key.as_ref(), spec.from_epoch, spec.old_threshold) else {
-                    return Err(bad("reshare needs key, from_epoch and old_threshold"));
-                };
-                if *key != key.to_lowercase() {
-                    return Err(bad("key must be lower-case hex"));
-                }
-                let y = point_g2(key)?;
-                if spec.dealers.len() < old_t {
-                    return Err(bad(format!("{} dealers cannot reshare a key with threshold {old_t}", spec.dealers.len())));
-                }
-                // the dealers' verification keys must interpolate to Y; this is what lets a new
-                // operator, which has no earlier state, trust the spec
-                let mut acc = G2::zero();
-                for i in &spec.dealers {
-                    let vk = point_g2(spec.old_vks.get(i).ok_or_else(|| bad(format!("no verification key for dealer {i}")))?)?;
-                    acc += vk * lagrange_at_zero(&spec.dealers, *i);
-                }
-                if acc.into_affine() != y {
-                    return Err(bad("the dealers' verification keys do not combine to the group key"));
-                }
+                let key = spec.key.as_ref().expect("checked");
+                let from = spec.from_epoch.expect("checked");
                 match g.st.keys.get(key) {
                     Some(eps) => {
-                        if eps.iter().any(|e| e.epoch > from) {
-                            return Err(err(StatusCode::CONFLICT, "this operator already holds a newer epoch of the key"));
+                        if eps.iter().any(|e| e.epoch >= spec.new_epoch) {
+                            return Err(err(StatusCode::CONFLICT, format!("this operator already holds epoch {} or later of the key", spec.new_epoch)));
                         }
-                        let e = eps.iter().find(|e| e.epoch == from).ok_or_else(|| bad("this operator has no share of that epoch"))?;
-                        if e.threshold != old_t || spec.dealers.iter().any(|i| e.vks.get(i) != spec.old_vks.get(i)) {
-                            return Err(bad("the spec disagrees with this operator's record of the epoch"));
-                        }
-                        if am_dealer {
-                            from_hex::<Fr>(&e.share).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-                        } else {
-                            Fr::zero()
+                        match eps.iter().find(|e| e.epoch == from) {
+                            Some(e) => {
+                                if Some(e.threshold) != spec.old_threshold || spec.dealers.iter().any(|i| e.vks.get(i) != spec.old_vks.get(i)) {
+                                    return Err(bad("the spec disagrees with this operator's record of the epoch"));
+                                }
+                                // operators this one already knows must appear under the identity key it knows
+                                for p in &spec.peers {
+                                    if e.ids.get(&p.index).is_some_and(|known| *known != p.identity) {
+                                        return Err(bad(format!("the spec names another identity key for operator {} than the one pinned in epoch {from}", p.index)));
+                                    }
+                                }
+                                from_hex::<Fr>(&e.share).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                            }
+                            None if am_dealer => return Err(bad("this operator has no share of that epoch")),
+                            None => Fr::zero(),
                         }
                     }
                     None if am_dealer => return Err(bad("this operator holds no share of that key")),
@@ -347,208 +377,349 @@ impl Operator {
                 }
             }
         };
-        let mut round = Round { spec: spec.clone(), created: now, poly: None, deals: BTreeMap::new() };
-        if am_dealer {
-            let poly: Vec<Fr> = std::iter::once(constant).chain((1..spec.threshold).map(|_| Fr::rand(&mut rng))).collect();
-            if am_receiver {
-                // my own deal is in place before anyone can deal in my name
-                let commitments = commit(&poly);
-                round.deals.insert(me, ReceivedDeal { hash: commitments_hash(&commitments), value: eval_poly(&poly, me), commitments });
-            }
-            round.poly = Some(poly);
-        }
-        g.rounds.insert(spec.round_id.clone(), round);
-        Ok(())
+        let poly = am_dealer.then(|| std::iter::once(constant).chain((1..spec.threshold).map(|_| Fr::rand(&mut rng))).collect::<Vec<Fr>>());
+        let id = checked.id.clone();
+        g.rounds.insert(
+            id.clone(),
+            Round {
+                spec,
+                checked,
+                created: now,
+                poly,
+                commits: BTreeMap::new(),
+                deals: BTreeMap::new(),
+                readys: BTreeMap::new(),
+                committed: BTreeMap::new(),
+                outbox: vec![],
+                pending_deals: vec![],
+                sent_commit: false,
+                sent_deals: false,
+                sent_ready: false,
+                stored: None,
+                done: false,
+                failed: None,
+            },
+        );
+        Ok(id)
     }
 
-    /// As a dealer: send every other receiver its sub-share.
-    async fn deal(&self, round_id: &str) -> Result<(), ApiErr> {
+    fn my_deal(&self, r: &Round) -> (Vec<String>, Option<ident::Pok>) {
+        let poly = r.poly.as_ref().expect("dealer");
+        let commitments: Vec<String> = commit(poly).iter().map(to_hex).collect();
+        // deterministic per round: derived from the polynomial, so the hash committed to stays valid
+        let pok = (r.spec.kind == RoundKind::Dkg).then(|| ident::pok_prove(&poly[0], &pok_context(&r.checked.id, self.cfg.index)));
+        (commitments, pok)
+    }
+
+    /// Do every step that is possible now. Called under the lock; sends nothing itself.
+    fn progress(&self, g: &mut Inner, id: &str) -> Result<(), ApiErr> {
         let me = self.cfg.index;
-        let msgs: Vec<(Peer, Deal)> = {
-            let g = self.inner.lock().unwrap();
-            let r = g.rounds.get(round_id).ok_or_else(|| err(StatusCode::NOT_FOUND, "unknown round"))?;
-            let poly = r.poly.as_ref().ok_or_else(|| bad("this operator is not a dealer in the round"))?;
-            let commitments: Vec<String> = commit(poly).iter().map(to_hex).collect();
-            r.spec
-                .receivers
-                .iter()
-                .filter(|p| p.index != me)
-                .map(|p| (p.clone(), Deal { round_id: round_id.to_string(), from: me, commitments: commitments.clone(), value: to_hex(&eval_poly(poly, p.index)) }))
-                .collect()
+        let Inner { st, rounds, .. } = g;
+        let r = rounds.get_mut(id).ok_or_else(|| err(StatusCode::NOT_FOUND, "unknown round"))?;
+        if r.failed.is_some() || r.done {
+            return Ok(());
+        }
+        let everyone: Vec<u32> = r.checked.peers.keys().copied().collect();
+        let am_dealer = r.poly.is_some();
+        let am_receiver = r.spec.receivers.contains(&me);
+        let queue = |r: &mut Round, body: &Body, to: &[u32]| {
+            let env = self.envelope(id, body);
+            for t in to.iter().filter(|t| **t != me) {
+                r.outbox.push(Out { to: *t, env: env.clone(), delivered: false });
+            }
+            env
         };
-        for (peer, deal) in msgs {
-            let url = format!("{}/v1/peer/deal", peer.url.trim_end_matches('/'));
-            let resp = self.http.post(&url).bearer_auth(&self.cfg.peer_token).json(&deal).send().await.map_err(|e| err(StatusCode::BAD_GATEWAY, format!("operator {} unreachable: {e}", peer.index)))?;
-            if !resp.status().is_success() {
-                let code = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                return Err(err(StatusCode::BAD_GATEWAY, format!("operator {} refused the deal ({code}): {}", peer.index, body.chars().take(200).collect::<String>())));
-            }
-        }
-        Ok(())
-    }
 
-    fn receive_deal(&self, d: Deal) -> Result<(), ApiErr> {
-        let me = self.cfg.index;
-        let mut g = self.inner.lock().unwrap();
-        let r = g.rounds.get_mut(&d.round_id).ok_or_else(|| err(StatusCode::NOT_FOUND, "unknown round"))?;
-        if !r.spec.receivers.iter().any(|p| p.index == me) {
-            return Err(bad("this operator receives nothing in the round"));
+        // 1. commit to my polynomial
+        if am_dealer && !r.sent_commit {
+            let (commitments, pok) = self.my_deal(r);
+            // the proof of knowledge is randomized; fix it now so the committed hash matches the deal
+            let hash = commit_hash(&commitments, &pok);
+            let env = queue(r, &Body::Commit { hash: hash.clone() }, &everyone);
+            r.commits.insert(me, (hash, env));
+            r.sent_commit = true;
+            // keep the exact deal that was committed to
+            let poly = r.poly.clone().expect("dealer");
+            let mut deals = vec![];
+            for to in r.spec.receivers.clone() {
+                let mut value = eval_poly(&poly, to);
+                if self.cfg.test_fault == Some(Fault::BadShareTo(to)) {
+                    value += Fr::from(1u64);
+                }
+                if to == me {
+                    let c: Vec<G2A> = commit(&poly);
+                    r.deals.insert(me, GoodDeal { hash: commitments_hash(&c), commitments: c, value });
+                } else {
+                    let sealed = ident::seal(&r.checked.peers[&to].1, &seal_context(id, me, to), &value);
+                    deals.push((to, Body::Deal { to, commitments: commitments.clone(), pok: pok.clone(), sealed }));
+                }
+            }
+            r.pending_deals = deals;
         }
-        if d.from == me || !r.spec.dealers.contains(&d.from) {
-            return Err(bad("not a dealer of the round"));
+        // 2. deal, once every dealer is bound to its commitment
+        if am_dealer && !r.sent_deals && r.spec.dealers.iter().all(|d| r.commits.contains_key(d)) {
+            for (to, body) in std::mem::take(&mut r.pending_deals) {
+                queue(r, &body, &[to]);
+            }
+            r.sent_deals = true;
         }
-        if d.commitments.len() != r.spec.threshold {
-            return Err(bad("wrong number of commitments"));
+        // 4. ready
+        if am_receiver && !r.sent_ready && r.spec.dealers.iter().all(|d| r.deals.contains_key(d)) {
+            let mut h = Sha256::new();
+            h.update(id.as_bytes());
+            for (d, deal) in &r.deals {
+                h.update(d.to_be_bytes());
+                h.update(deal.hash.as_bytes());
+            }
+            let transcript = hex::encode(h.finalize());
+            if let Some((other, _)) = r.readys.iter().find(|(_, t)| **t != transcript) {
+                r.failed = Some(Failure { reason: format!("operator {other} saw other commitments than this operator: a dealer sent different deals"), blamed: None });
+                return Ok(());
+            }
+            queue(r, &Body::Ready { transcript: transcript.clone() }, &everyone);
+            r.readys.insert(me, transcript);
+            r.sent_ready = true;
         }
-        let commitments: Vec<G2A> = d.commitments.iter().map(|c| from_hex::<G2A>(c).map_err(|e| bad(e.to_string()))).collect::<Result<_, _>>()?;
-        let value: Fr = from_hex(&d.value).map_err(|e| bad(e.to_string()))?;
-        if G2::generator() * value != commitment_at(&commitments, me) {
-            return Err(bad("the value does not match the commitments"));
-        }
-        if r.spec.kind == RoundKind::Reshare && r.spec.old_vks.get(&d.from).map(String::as_str) != Some(to_hex(&commitments[0]).as_str()) {
-            return Err(bad("the dealer did not share its current share"));
-        }
-        let hash = commitments_hash(&commitments);
-        match r.deals.get(&d.from) {
-            Some(prev) if prev.hash == hash && prev.value == value => Ok(()),
-            Some(_) => Err(err(StatusCode::CONFLICT, "a different deal from this dealer was already received")),
-            None => {
-                r.deals.insert(d.from, ReceivedDeal { commitments, value, hash });
+        // 5. store the new share
+        if am_receiver && r.sent_ready && r.stored.is_none() && r.spec.receivers.iter().all(|x| r.readys.contains_key(x)) {
+            let spec = r.spec.clone();
+            let weight = |i: u32| match spec.kind {
+                RoundKind::Dkg => Fr::from(1u64),
+                RoundKind::Reshare => lagrange_at_zero(&spec.dealers, i),
+            };
+            let share: Fr = r.deals.iter().map(|(i, d)| weight(*i) * d.value).sum();
+            // the polynomial of the new sharing, in the exponent: F_k = Π_i C_ik^{w_i}
+            let mut poly = vec![G2::zero(); spec.threshold];
+            for (i, d) in &r.deals {
+                let w = weight(*i);
+                for (k, c) in d.commitments.iter().enumerate() {
+                    poly[k] += *c * w;
+                }
+            }
+            let poly: Vec<G2A> = poly.into_iter().map(|p| p.into_affine()).collect();
+            let key = to_hex(&poly[0]);
+            let fail = |r: &mut Round, reason: &str| {
+                r.failed = Some(Failure { reason: reason.into(), blamed: None });
                 Ok(())
+            };
+            if poly[0].is_zero() {
+                return fail(r, "the round produced an empty key");
+            }
+            if spec.kind == RoundKind::Reshare && spec.key.as_deref() != Some(key.as_str()) {
+                return fail(r, "the round would change the group key");
+            }
+            if st.keys.get(&key).is_some_and(|eps| eps.iter().any(|e| e.epoch >= spec.new_epoch)) {
+                return fail(r, "this operator already holds that epoch or a later one");
+            }
+            let vks: BTreeMap<u32, String> = spec.receivers.iter().map(|j| (*j, to_hex(&commitment_at(&poly, *j).into_affine()))).collect();
+            if to_hex(&(G2::generator() * share).into_affine()) != vks[&me] {
+                return fail(r, "the new share does not match its verification key");
+            }
+            let ids = spec.peers.iter().filter(|p| spec.receivers.contains(&p.index)).map(|p| (p.index, p.identity.clone())).collect();
+            st.keys.entry(key.clone()).or_default().push(Epoch { epoch: spec.new_epoch, threshold: spec.threshold, share: to_hex(&share), vks, ids });
+            if let Err(e) = self.persist(st) {
+                // not on disk means not stored
+                let eps = st.keys.get_mut(&key).unwrap();
+                eps.pop();
+                if eps.is_empty() {
+                    st.keys.remove(&key);
+                }
+                return Err(e);
+            }
+            let epoch = spec.new_epoch;
+            queue(r, &Body::Committed { key: key.clone(), epoch }, &everyone);
+            r.committed.insert(me, (key.clone(), epoch));
+            r.stored = Some((key.clone(), epoch));
+            tracing::info!("operator {me}: holds epoch {epoch} of key {}", crate::key_version(&key));
+        }
+        // 6. erase the older shares, once every receiver has its new share on disk
+        if !r.done && r.spec.receivers.iter().all(|x| r.committed.contains_key(x)) {
+            let first = r.committed.values().next().cloned().expect("receivers");
+            if r.committed.values().any(|c| *c != first) {
+                r.failed = Some(Failure { reason: "operators stored different keys or epochs".into(), blamed: None });
+                return Ok(());
+            }
+            let (key, epoch) = first;
+            if let Some(eps) = st.keys.get(&key).cloned() {
+                let kept: Vec<Epoch> = eps.iter().filter(|e| e.epoch >= epoch).cloned().collect();
+                if kept.len() != eps.len() {
+                    if kept.is_empty() {
+                        st.keys.remove(&key);
+                    } else {
+                        st.keys.insert(key.clone(), kept);
+                    }
+                    if let Err(e) = self.persist(st) {
+                        st.keys.insert(key, eps);
+                        return Err(e);
+                    }
+                    tracing::info!("operator {me}: erased its shares older than epoch {epoch}");
+                }
+            }
+            r.done = true;
+        }
+        Ok(())
+    }
+
+    fn status_of(&self, r: &Round) -> RoundStatus {
+        let missing = |have: &dyn Fn(&u32) -> bool, who: &[u32]| who.iter().copied().filter(|x| !have(x)).collect::<Vec<u32>>();
+        let mut waiting = vec![];
+        let phase = if r.failed.is_some() {
+            "failed"
+        } else if r.done {
+            "done"
+        } else if !r.spec.dealers.iter().all(|d| r.commits.contains_key(d)) {
+            waiting.push(format!("commitments from {:?}", missing(&|d| r.commits.contains_key(d), &r.spec.dealers)));
+            "commit"
+        } else if r.spec.receivers.contains(&self.cfg.index) && !r.sent_ready {
+            waiting.push(format!("deals from {:?}", missing(&|d| r.deals.contains_key(d), &r.spec.dealers)));
+            "deal"
+        } else if r.spec.receivers.iter().any(|x| !r.readys.contains_key(x)) {
+            waiting.push(format!("ready from {:?}", missing(&|x| r.readys.contains_key(x), &r.spec.receivers)));
+            "ready"
+        } else {
+            waiting.push(format!("confirmation from {:?}", missing(&|x| r.committed.contains_key(x), &r.spec.receivers)));
+            "store"
+        };
+        let undelivered: Vec<u32> = {
+            let mut v: Vec<u32> = r.outbox.iter().filter(|o| !o.delivered).map(|o| o.to).collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        if !undelivered.is_empty() {
+            waiting.push(format!("operators {undelivered:?} to accept messages (have they approved the round?)"));
+        }
+        RoundStatus { round_id: r.checked.id.clone(), phase: phase.into(), waiting_for: waiting, done: r.done, failed: r.failed.clone(), result: r.stored.clone() }
+    }
+
+    /// Take the round as far as it goes now: act, then deliver what is waiting to be sent.
+    async fn advance(&self, id: &str) -> Result<RoundStatus, ApiErr> {
+        let to_send: Vec<(usize, String, Envelope)> = {
+            let mut g = self.inner.lock().unwrap();
+            self.progress(&mut g, id)?;
+            let r = g.rounds.get(id).ok_or_else(|| err(StatusCode::NOT_FOUND, "unknown round"))?;
+            r.outbox.iter().enumerate().filter(|(_, o)| !o.delivered).map(|(i, o)| (i, r.checked.peers[&o.to].0.clone(), o.env.clone())).collect()
+        };
+        let mut delivered = vec![];
+        let mut blocked: Vec<String> = vec![];
+        for (i, url, env) in to_send {
+            // keep the order per receiver: after one failure, send that receiver nothing more this time
+            if blocked.contains(&url) {
+                continue;
+            }
+            match self.http.post(format!("{url}/v1/peer/msg")).json(&env).send().await {
+                Ok(resp) if resp.status().is_success() => delivered.push(i),
+                _ => blocked.push(url),
             }
         }
+        let mut g = self.inner.lock().unwrap();
+        if let Some(r) = g.rounds.get_mut(id) {
+            for i in delivered {
+                r.outbox[i].delivered = true;
+            }
+        }
+        self.progress(&mut g, id)?;
+        let r = g.rounds.get(id).ok_or_else(|| err(StatusCode::NOT_FOUND, "unknown round"))?;
+        Ok(self.status_of(r))
     }
 
-    fn status(&self, round_id: &str) -> Result<RoundStatus, ApiErr> {
-        let g = self.inner.lock().unwrap();
-        let r = g.rounds.get(round_id).ok_or_else(|| err(StatusCode::NOT_FOUND, "unknown round"))?;
-        Ok(RoundStatus {
-            received: r.deals.keys().copied().collect(),
-            missing: r.spec.dealers.iter().copied().filter(|i| !r.deals.contains_key(i)).collect(),
-            transcript: r.deals.iter().map(|(i, d)| (*i, d.hash.clone())).collect(),
-        })
-    }
-
-    fn commit(&self, req: &CommitRequest) -> Result<CommitResponse, ApiErr> {
+    /// A signed message from another operator.
+    fn receive(&self, env: Envelope) -> Result<(), ApiErr> {
         let me = self.cfg.index;
         let mut g = self.inner.lock().unwrap();
-        let r = g.rounds.get(&req.round_id).ok_or_else(|| err(StatusCode::NOT_FOUND, "unknown round"))?;
-        let spec = r.spec.clone();
-        if !spec.receivers.iter().any(|p| p.index == me) {
-            // a dealer that leaves keeps its old share until the round is finalized
-            g.rounds.remove(&req.round_id);
-            return Ok(CommitResponse { key: None, epoch: None });
+        let r = g.rounds.get_mut(&env.round_id).ok_or_else(|| err(StatusCode::NOT_FOUND, "this operator has not approved that round"))?;
+        if env.from == me {
+            return Err(bad("a message in this operator's own name"));
         }
-        if let Some(i) = spec.dealers.iter().find(|i| !r.deals.contains_key(i)) {
-            return Err(err(StatusCode::CONFLICT, format!("no deal from operator {i} yet")));
+        let body = round::open_envelope(&env, &r.spec, &r.checked).map_err(|e| err(StatusCode::UNAUTHORIZED, e))?;
+        if r.failed.is_some() || r.done {
+            return Ok(());
         }
-        let mine: BTreeMap<u32, String> = r.deals.iter().map(|(i, d)| (*i, d.hash.clone())).collect();
-        if mine != req.transcript {
-            return Err(err(StatusCode::CONFLICT, "this operator saw other commitments than the transcript says; abort the round"));
-        }
-        let weight = |i: u32| match spec.kind {
-            RoundKind::Dkg => Fr::from(1u64),
-            RoundKind::Reshare => lagrange_at_zero(&spec.dealers, i),
-        };
-        let share: Fr = r.deals.iter().map(|(i, d)| weight(*i) * d.value).sum();
-        // the polynomial of the new sharing, in the exponent: F_k = Π_i C_ik^{w_i}
-        let mut poly = vec![G2::zero(); spec.threshold];
-        for (i, d) in &r.deals {
-            let w = weight(*i);
-            for (k, c) in d.commitments.iter().enumerate() {
-                poly[k] += *c * w;
-            }
-        }
-        let poly: Vec<G2A> = poly.into_iter().map(|p| p.into_affine()).collect();
-        let key = to_hex(&poly[0]);
-        if poly[0].is_zero() {
-            return Err(err(StatusCode::CONFLICT, "the round produced an empty key; abort it"));
-        }
-        let epoch = match spec.kind {
-            RoundKind::Dkg => {
-                if g.st.keys.contains_key(&key) {
-                    return Err(err(StatusCode::CONFLICT, "key already exists"));
+        let from = env.from;
+        let is_dealer = r.spec.dealers.contains(&from);
+        let is_receiver = r.spec.receivers.contains(&from);
+        match body {
+            Body::Commit { hash } => {
+                if !is_dealer {
+                    return Err(bad("not a dealer"));
                 }
-                1
-            }
-            RoundKind::Reshare => {
-                if spec.key.as_deref() != Some(key.as_str()) {
-                    return Err(err(StatusCode::CONFLICT, "the round would change the group key; abort it"));
+                match r.commits.get(&from) {
+                    Some((h, _)) if *h == hash => {}
+                    Some(_) => r.failed = Some(Failure { reason: format!("operator {from} committed to two different polynomials"), blamed: Some(from) }),
+                    None => {
+                        r.commits.insert(from, (hash, env));
+                    }
                 }
-                spec.from_epoch.unwrap_or(0) + 1
             }
-        };
-        if g.st.keys.get(&key).is_some_and(|eps| eps.iter().any(|e| e.epoch >= epoch)) {
-            return Err(err(StatusCode::CONFLICT, "this operator already holds that epoch"));
-        }
-        let vks: BTreeMap<u32, String> = spec.receivers.iter().map(|p| (p.index, to_hex(&commitment_at(&poly, p.index).into_affine()))).collect();
-        if to_hex(&(G2::generator() * share).into_affine()) != vks[&me] {
-            return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "the new share does not match its verification key"));
-        }
-        g.st.keys.entry(key.clone()).or_default().push(Epoch { epoch, threshold: spec.threshold, share: to_hex(&share), vks });
-        if let Err(e) = self.persist(&g.st) {
-            // not on disk means not committed
-            let eps = g.st.keys.get_mut(&key).unwrap();
-            eps.pop();
-            if eps.is_empty() {
-                g.st.keys.remove(&key);
+            Body::Deal { to, commitments, pok, sealed } => {
+                if !is_dealer || to != me || !r.spec.receivers.contains(&me) {
+                    return Err(bad("not a deal for this operator"));
+                }
+                if r.deals.contains_key(&from) {
+                    return Ok(());
+                }
+                let Some((hash, commit_env)) = r.commits.get(&from).cloned() else {
+                    return Err(err(StatusCode::CONFLICT, "no commitment from this dealer yet"));
+                };
+                // reveal nothing before every dealer is bound
+                if !r.spec.dealers.iter().all(|d| r.commits.contains_key(d)) {
+                    return Err(err(StatusCode::CONFLICT, "not every dealer has committed yet"));
+                }
+                let ctx = seal_context(&r.checked.id, from, me);
+                let value = self.identity.open(&ctx, &sealed);
+                let verdict = check_deal(&r.spec, &r.checked.id, from, me, &commitments, &pok, value, &hash);
+                let verdict = if self.cfg.test_fault == Some(Fault::FalseComplaintAgainst(from)) { Err("test fault".to_string()) } else { verdict };
+                match verdict {
+                    Ok((c, v)) => {
+                        r.deals.insert(from, GoodDeal { hash: commitments_hash(&c), commitments: c, value: v });
+                    }
+                    Err(why) => {
+                        // publish the evidence; every operator judges it for itself
+                        let opening = self.identity.reveal(&ctx, &sealed).map_err(bad)?;
+                        let body = Body::Complaint { deal: Box::new(env), commit: Box::new(commit_env), opening };
+                        let complaint = self.envelope(&r.checked.id, &body);
+                        for t in r.checked.peers.keys().copied().filter(|t| *t != me).collect::<Vec<_>>() {
+                            r.outbox.push(Out { to: t, env: complaint.clone(), delivered: false });
+                        }
+                        r.failed = Some(Failure { reason: format!("operator {from} sent this operator a bad deal: {why}"), blamed: Some(from) });
+                    }
+                }
             }
-            return Err(e);
+            Body::Ready { transcript } => {
+                if !is_receiver {
+                    return Err(bad("not a receiver"));
+                }
+                let mine = r.readys.get(&me).cloned();
+                match r.readys.get(&from) {
+                    Some(t) if *t == transcript => {}
+                    Some(_) => r.failed = Some(Failure { reason: format!("operator {from} sent two different ready messages"), blamed: Some(from) }),
+                    None => {
+                        if mine.is_some_and(|m| m != transcript) {
+                            r.failed = Some(Failure { reason: format!("operator {from} saw other commitments than this operator: a dealer sent different deals"), blamed: None });
+                        } else {
+                            r.readys.insert(from, transcript);
+                        }
+                    }
+                }
+            }
+            Body::Committed { key, epoch } => {
+                if !is_receiver {
+                    return Err(bad("not a receiver"));
+                }
+                if epoch != r.spec.new_epoch || r.spec.key.as_ref().is_some_and(|k| *k != key) {
+                    r.failed = Some(Failure { reason: format!("operator {from} stored another key or epoch"), blamed: Some(from) });
+                } else {
+                    r.committed.entry(from).or_insert((key, epoch));
+                }
+            }
+            Body::Complaint { deal, commit, opening } => {
+                r.failed = Some(match round::verify_complaint(&r.spec, &r.checked, from, &deal, &commit, &opening) {
+                    Ok(dealer) => Failure { reason: format!("operator {dealer} sent operator {from} a bad deal (proven by {from}'s complaint)"), blamed: Some(dealer) },
+                    Err(why) => Failure { reason: format!("operator {from} made a complaint that does not hold: {why}"), blamed: Some(from) },
+                });
+            }
         }
-        g.rounds.remove(&req.round_id);
-        tracing::info!("operator {me}: holds epoch {epoch} of key {}", crate::key_version(&key));
-        Ok(CommitResponse { key: Some(key), epoch: Some(epoch) })
-    }
-
-    /// Erase every share of `key` older than `epoch`. This is what makes a refresh worth anything: a
-    /// share stolen before the refresh is useless once the others have erased theirs.
-    fn finalize(&self, req: &FinalizeRequest) -> Result<usize, ApiErr> {
-        let key = req.key.to_lowercase();
-        let mut g = self.inner.lock().unwrap();
-        let eps = g.st.keys.get(&key).ok_or_else(|| err(StatusCode::NOT_FOUND, "this operator holds no share of that key"))?.clone();
-        let kept: Vec<Epoch> = eps.iter().filter(|e| e.epoch >= req.epoch).cloned().collect();
-        let erased = eps.len() - kept.len();
-        if erased == 0 {
-            return Ok(0);
-        }
-        if kept.is_empty() && !req.leaving {
-            return Err(err(StatusCode::CONFLICT, format!("this operator holds no share of epoch {}; erasing its last share needs \"leaving\": true", req.epoch)));
-        }
-        if kept.is_empty() {
-            g.st.keys.remove(&key);
-        } else {
-            g.st.keys.insert(key.clone(), kept);
-        }
-        if let Err(e) = self.persist(&g.st) {
-            g.st.keys.insert(key, eps);
-            return Err(e);
-        }
-        Ok(erased)
-    }
-}
-
-impl Operator {
-    /// Undo a commit: drop `epoch` if it is the newest one this operator holds.
-    fn discard(&self, req: &DiscardRequest) -> Result<bool, ApiErr> {
-        let key = req.key.to_lowercase();
-        let mut g = self.inner.lock().unwrap();
-        let Some(eps) = g.st.keys.get(&key).cloned() else { return Ok(false) };
-        match eps.last() {
-            Some(e) if e.epoch == req.epoch => {}
-            Some(e) if e.epoch > req.epoch => return Err(err(StatusCode::CONFLICT, "a newer epoch exists; only the newest can be discarded")),
-            _ => return Ok(false),
-        }
-        if eps.len() == 1 {
-            g.st.keys.remove(&key);
-        } else {
-            g.st.keys.get_mut(&key).unwrap().pop();
-        }
-        if let Err(e) = self.persist(&g.st) {
-            g.st.keys.insert(key, eps);
-            return Err(e);
-        }
-        Ok(true)
+        Ok(())
     }
 }
 
@@ -558,7 +729,6 @@ type St = Arc<Operator>;
 enum Door {
     Eval,
     Admin,
-    Peer,
 }
 
 /// The token check runs before the body is read, so a caller without the right token learns nothing
@@ -567,7 +737,6 @@ async fn guard(State((s, door)): State<(St, Door)>, req: axum::extract::Request,
     let token = match door {
         Door::Eval => &s.cfg.eval_token,
         Door::Admin => &s.cfg.admin_token,
-        Door::Peer => &s.cfg.peer_token,
     };
     match s.auth(req.headers(), token) {
         Ok(()) => next.run(req).await,
@@ -578,20 +747,15 @@ async fn guard(State((s, door)): State<(St, Door)>, req: axum::extract::Request,
 pub fn router(op: Arc<Operator>) -> Router {
     let door = |d: Door| axum::middleware::from_fn_with_state((op.clone(), d), guard);
     let eval = Router::new().route("/v1/evaluate", post(h_evaluate)).layer(door(Door::Eval));
-    let peer = Router::new().route("/v1/peer/deal", post(h_peer_deal)).layer(door(Door::Peer));
     let admin = Router::new()
         .route("/v1/admin/round/start", post(h_start))
-        .route("/v1/admin/round/deal", post(h_deal))
-        .route("/v1/admin/round/status", post(h_status))
-        .route("/v1/admin/round/commit", post(h_commit))
+        .route("/v1/admin/round/advance", post(h_advance))
         .route("/v1/admin/round/abort", post(h_abort))
-        .route("/v1/admin/finalize", post(h_finalize))
-        .route("/v1/admin/discard", post(h_discard))
         .layer(door(Door::Admin));
     Router::new()
         .route("/v1/public", get(h_public))
+        .route("/v1/peer/msg", post(h_peer))
         .merge(eval)
-        .merge(peer)
         .merge(admin)
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024))
         .with_state(op)
@@ -605,38 +769,20 @@ async fn h_evaluate(State(s): State<St>, Json(req): Json<EvalRequest>) -> Result
     Ok(Json(s.evaluate(&req)?))
 }
 
-async fn h_peer_deal(State(s): State<St>, Json(req): Json<Deal>) -> Result<Json<serde_json::Value>, ApiErr> {
-    s.receive_deal(req)?;
+async fn h_peer(State(s): State<St>, Json(env): Json<Envelope>) -> Result<Json<serde_json::Value>, ApiErr> {
+    s.receive(env)?;
     Ok(Json(json!({"ok": true})))
 }
 
-async fn h_start(State(s): State<St>, Json(req): Json<RoundSpec>) -> Result<Json<serde_json::Value>, ApiErr> {
-    s.start_round(req)?;
-    Ok(Json(json!({"ok": true})))
+async fn h_start(State(s): State<St>, Json(req): Json<RoundSpec>) -> Result<Json<RoundId>, ApiErr> {
+    Ok(Json(RoundId { round_id: s.start_round(req)? }))
 }
 
-async fn h_deal(State(s): State<St>, Json(req): Json<RoundId>) -> Result<Json<serde_json::Value>, ApiErr> {
-    s.deal(&req.round_id).await?;
-    Ok(Json(json!({"ok": true})))
-}
-
-async fn h_status(State(s): State<St>, Json(req): Json<RoundId>) -> Result<Json<RoundStatus>, ApiErr> {
-    Ok(Json(s.status(&req.round_id)?))
-}
-
-async fn h_commit(State(s): State<St>, Json(req): Json<CommitRequest>) -> Result<Json<CommitResponse>, ApiErr> {
-    Ok(Json(s.commit(&req)?))
+async fn h_advance(State(s): State<St>, Json(req): Json<RoundId>) -> Result<Json<RoundStatus>, ApiErr> {
+    Ok(Json(s.advance(&req.round_id).await?))
 }
 
 async fn h_abort(State(s): State<St>, Json(req): Json<RoundId>) -> Result<Json<serde_json::Value>, ApiErr> {
     let existed = s.inner.lock().unwrap().rounds.remove(&req.round_id).is_some();
     Ok(Json(json!({"aborted": existed})))
-}
-
-async fn h_finalize(State(s): State<St>, Json(req): Json<FinalizeRequest>) -> Result<Json<serde_json::Value>, ApiErr> {
-    Ok(Json(json!({"erased": s.finalize(&req)?})))
-}
-
-async fn h_discard(State(s): State<St>, Json(req): Json<DiscardRequest>) -> Result<Json<serde_json::Value>, ApiErr> {
-    Ok(Json(json!({"discarded": s.discard(&req)?})))
 }
