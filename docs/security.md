@@ -1,6 +1,6 @@
 # Security
 
-This is a research prototype. It has had one internal review (below) and no independent audit. Do not
+This is a research prototype. It has had internal reviews (below) and no independent audit. Do not
 enrol real people on it without one.
 
 ## Review of 15–16 November 2026
@@ -21,6 +21,37 @@ who controls it and what they gain; `cargo audit` over the dependencies; then a 
 | 7 | Enrolment sessions never expired and kept the deduplication key | Unbounded growth; a lasting record of who tried to enrol and when | 15-minute lifetime, deleted when enrolment finishes, cap on open sessions | covered by the enrolment tests |
 | 8 | The claimed handle was stored as submitted | A claim could show a misleading handle next to a real account id | The platform's own spelling of the handle is stored; a handle that resolves to another account is refused | `directory_rejects_replays_...` |
 | 9 | `legogroth16`'s default features pulled in a WebAssembly runtime with two advisories (RUSTSEC-2026-0344, RUSTSEC-2026-0186) | Not reachable from this code, but 200 unused crates of attack surface | Feature switched off; the runtime is no longer built | `cargo audit` |
+
+### Review of the uniqueness service, 16 November 2026
+
+Same method, over the key versioning in the issuer and the new threshold service (`pop-uniqueness`):
+every operator endpoint, every message of a round, and what each token holder can do.
+
+| # | Problem | What an attacker could do | Fix | Test |
+|---|---|---|---|---|
+| 10 | Operator endpoints read and parsed the request before checking the token | Anyone who can reach an operator could make it parse input and learn the request format from the errors | The token check runs first, before the body is read | `tokens_and_rate_limit` |
+| 11 | An operator that repeated its answer made the issuer's combination step panic | One faulty or hostile operator could stop all enrolments | One answer per operator and epoch is used; the rest is ignored | `repeated_answers_are_ignored` |
+| 12 | A round whose commit reached only some operators left them at different epochs with no way forward | A crash or one failing operator at the wrong moment blocked every later refresh | Receivers that committed discard the new epoch; the round is undone automatically | `a_failed_commit_is_undone` |
+| 13 | `finalize` erased whatever was older than the epoch it was given | A wrong epoch number erased every share of the key, which cannot be undone | An operator refuses to erase its last share unless told it is leaving; the coordinator first verifies the new epoch from public data | `rounds_are_all_or_nothing` |
+| 14 | The issuer took the threshold of an epoch from the largest value any operator stated | One operator stating a huge threshold made the issuer skip a working epoch | The value most operators state is used; a wrong one only costs a failed check | `a_lying_operator_cannot_change_d` |
+
+Checked and found sound:
+
+- **A wrong d cannot be produced.** The combined result is checked against the pinned group key with a
+  pairing. Tested with a lying operator, a key the operators do not hold, and too few operators.
+- **A missing answer is never "not enrolled".** If any live key version cannot be evaluated the issuer
+  answers 503. If records exist under a key the service does not hold, the issuer does not start.
+- **Operators never see identities**: the request is blinded with a fresh random scalar.
+- **Each token opens one door**: evaluation, administration and peer tokens are separate, at least 24
+  characters, compared in constant time, and must differ.
+- **Deals are checked**: against the dealer's commitments, against the dealer's published verification
+  key in a reshare, and across receivers before commit. A forged deal (tested) aborts the round.
+- **The group key cannot change in a reshare**: every receiver recomputes it.
+- **Shares on disk** are written to a temporary file with mode 0600 and renamed; a damaged share file
+  stops the operator instead of starting it empty.
+- **Plain http is refused** by the issuer's client, the coordinator and the dealers except on loopback.
+
+What remains open for the threshold service is listed in [uniqueness.md](uniqueness.md) §4.
 
 ### Checked and found sound
 
@@ -53,9 +84,12 @@ These are limits of the prototype, in rough order of weight:
 
 1. **Trusted setup by one party.** With LegoGroth16 the issuer generates the proving keys and could forge
    proofs. Use Bulletproofs or run a ceremony ([crypto.md](crypto.md)).
-2. **One operator holds everything**: issuer key, witness key and uniqueness key in one process. The
-   design splits these so that no single party can mint people or test who is enrolled
-   ([real-servers.md](real-servers.md) §3).
+2. **One operator holds the issuer key and the witness key** in one process. The design splits these
+   so that no single party can mint people ([real-servers.md](real-servers.md) §3). The uniqueness key
+   can be split among operators (threshold service), but in the default single-operator mode it sits
+   with the issuer too. The threshold service has limits of its own: simple key generation without a
+   complaint phase, one coordinator holding the admin tokens, a shared peer token, sub-shares protected
+   by TLS only ([uniqueness.md](uniqueness.md) §4).
 3. **The secret is in a plain file** (`wallet.json`, mode 0600). Anything running as the same user can
    copy it and become that person. A real app wraps it with a hardware key.
 4. **Not constant-time.** Timing side channels on the proving device are possible.
@@ -74,7 +108,8 @@ These are limits of the prototype, in rough order of weight:
    cannot add more than one count to any post.
 9. **A count is self-reported.** It says an enrolled person's app reported a like, not that the like
    exists on the platform.
-10. **No rate limiting in the services.** Put it in the reverse proxy.
+10. **No rate limiting in the issuer and the directory.** Put it in the reverse proxy. (The uniqueness
+    operators do limit evaluations per minute.)
 11. **No recovery.** A lost wallet is a lost identity in this prototype: the person cannot enrol again.
 12. **The mock services have no security at all** by design: the mock identity provider logs anyone in
     as anyone, the mock feed has no passwords. They listen on loopback. Never expose them.

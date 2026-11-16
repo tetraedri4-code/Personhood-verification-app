@@ -65,6 +65,188 @@ enum Cmd {
     },
     /// The holder app (the person's device)
     Holder(HolderArgs),
+    /// Uniqueness keys: run a threshold operator, generate, refresh or hand over the shared key, rotate keys
+    Uniqueness {
+        #[command(subcommand)]
+        cmd: UniqCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum UniqCmd {
+    /// Run one operator of the threshold service
+    Operator {
+        /// JSON: index, eval_token, admin_token, peer_token, state_file, max_evals_per_minute, min_threshold
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long, default_value = "127.0.0.1:4100")]
+        listen: SocketAddr,
+    },
+    /// Generate a new shared key among the operators of a cluster file. Prints the group key to pin in the issuer configuration
+    Dkg {
+        /// JSON list of {index, url, admin_token}
+        #[arg(long)]
+        cluster: PathBuf,
+        #[arg(long)]
+        threshold: usize,
+    },
+    /// Give every operator a new share of the same key and erase the old shares
+    Refresh {
+        #[arg(long)]
+        cluster: PathBuf,
+        #[arg(long)]
+        key: String,
+    },
+    /// Hand the key to a changed operator set (add, remove or replace operators, or change the threshold)
+    Reshare {
+        #[arg(long)]
+        key: String,
+        /// cluster file of current holders that deal (at least the current threshold of them)
+        #[arg(long)]
+        from: PathBuf,
+        /// cluster file of the new operator set
+        #[arg(long)]
+        to: PathBuf,
+        #[arg(long)]
+        threshold: usize,
+        /// do not erase the old shares yet; run `finalize` later
+        #[arg(long)]
+        keep_old: bool,
+    },
+    /// Erase every share older than an epoch (the new set, and the operators that left)
+    Finalize {
+        #[arg(long)]
+        key: String,
+        #[arg(long)]
+        epoch: u64,
+        /// cluster file of every operator of the new epoch
+        #[arg(long)]
+        cluster: PathBuf,
+        /// cluster file of operators that left
+        #[arg(long)]
+        leavers: Option<PathBuf>,
+    },
+    /// Show what each operator of a cluster file publishes: keys, epochs, thresholds, evaluation counts
+    Status {
+        #[arg(long)]
+        cluster: PathBuf,
+    },
+    /// Single-operator keyed hash: add a new key next to the old ones (takes effect at the next issuer start)
+    RotateKey {
+        /// the issuer configuration file
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Count the issuer's enrolment records per key version (an old key with no records left can be retired)
+    Records {
+        #[arg(long)]
+        config: PathBuf,
+    },
+}
+
+#[derive(serde::Deserialize)]
+struct OperatorFile {
+    index: u32,
+    eval_token: String,
+    admin_token: String,
+    peer_token: String,
+    state_file: PathBuf,
+    #[serde(default = "default_rate")]
+    max_evals_per_minute: u32,
+    #[serde(default = "default_min_threshold")]
+    min_threshold: usize,
+}
+
+fn default_rate() -> u32 {
+    120
+}
+
+fn default_min_threshold() -> usize {
+    2
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(p: &PathBuf) -> anyhow::Result<T> {
+    serde_json::from_slice(&std::fs::read(p).with_context(|| format!("cannot read {}", p.display()))?).with_context(|| format!("cannot parse {}", p.display()))
+}
+
+async fn uniqueness_cmd(cmd: UniqCmd) -> anyhow::Result<()> {
+    use pop_uniqueness::admin::{self, AdminEndpoint};
+    let cluster = |p: &PathBuf| read_json::<Vec<AdminEndpoint>>(p);
+    match cmd {
+        UniqCmd::Operator { config, listen } => {
+            let f: OperatorFile = read_json(&config)?;
+            let index = f.index;
+            let op = pop_uniqueness::Operator::new(pop_uniqueness::OperatorConfig {
+                index,
+                eval_token: f.eval_token,
+                admin_token: f.admin_token,
+                peer_token: f.peer_token,
+                state_file: Some(f.state_file),
+                max_evals_per_minute: f.max_evals_per_minute,
+                min_threshold: f.min_threshold,
+            })?;
+            println!("Uniqueness operator {index} listening on http://{listen}");
+            serve(listen, pop_uniqueness::router(op)).await?;
+        }
+        UniqCmd::Dkg { cluster: c, threshold } => {
+            let ops = cluster(&c)?;
+            let key = admin::dkg(&ops, threshold).await?;
+            println!("New key shared {threshold}-of-{}.", ops.len());
+            println!("Group key (append to `uniqueness.keys` in the issuer configuration):\n{key}");
+            println!("Version: {}", pop_uniqueness::key_version(&key));
+        }
+        UniqCmd::Refresh { cluster: c, key } => {
+            let ops = cluster(&c)?;
+            let cur = admin::current_epoch(&key, &ops).await?;
+            let epoch = admin::reshare(&key, &ops, &ops, cur.threshold).await?;
+            admin::finalize(&key, epoch, &ops, &[]).await?;
+            println!("Shares refreshed: epoch {epoch}, old shares erased. The key and every deduplication key are unchanged.");
+        }
+        UniqCmd::Reshare { key, from, to, threshold, keep_old } => {
+            let (dealers, receivers) = (cluster(&from)?, cluster(&to)?);
+            let epoch = admin::reshare(&key, &dealers, &receivers, threshold).await?;
+            println!("New shares dealt: epoch {epoch}, {threshold}-of-{}.", receivers.len());
+            if keep_old {
+                println!("Old shares are still in place. Erase them with `pop uniqueness finalize --epoch {epoch}`, naming EVERY operator that held an older share under --leavers.");
+            } else {
+                admin::finalize(&key, epoch, &receivers, &dealers).await?;
+                println!("Old shares erased at the operators named in --from and --to. If other operators held a share of the old epoch, run `pop uniqueness finalize` with them under --leavers.");
+            }
+        }
+        UniqCmd::Finalize { key, epoch, cluster: c, leavers } => {
+            let leavers = leavers.as_ref().map(cluster).transpose()?.unwrap_or_default();
+            admin::finalize(&key, epoch, &cluster(&c)?, &leavers).await?;
+            println!("Shares older than epoch {epoch} erased.");
+        }
+        UniqCmd::Status { cluster: c } => {
+            for o in cluster(&c)? {
+                match admin::public(&o.url).await {
+                    Ok(info) => {
+                        println!("operator {} at {}", info.index, o.url);
+                        for k in info.keys {
+                            let eps: Vec<String> = k.epochs.iter().map(|e| format!("epoch {} ({}-of-{}, operators {:?})", e.epoch, e.threshold, e.vks.len(), e.vks.keys().collect::<Vec<_>>())).collect();
+                            println!("  {}  {}  evaluations since start: {}", pop_uniqueness::key_version(&k.key), eps.join(", "), k.evaluations);
+                        }
+                    }
+                    Err(e) => println!("operator {} at {}: unreachable ({e})", o.index, o.url),
+                }
+            }
+        }
+        UniqCmd::RotateKey { config } => {
+            let f: IssuerFile = read_json(&config)?;
+            let (new, all) = wiring::rotate_hmac_key(&f)?;
+            println!("New key {new} written. Restart the issuer to use it.");
+            println!("Keys now (newest first): {}", all.join(", "));
+            println!("Keep the older key files: records under them are matched and moved to the new key when their owner next logs in.");
+        }
+        UniqCmd::Records { config } => {
+            let f: IssuerFile = read_json(&config)?;
+            for (v, n) in wiring::records_per_version(&f).await? {
+                println!("{v}: {n} record(s)");
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Args, Clone)]
@@ -81,6 +263,10 @@ struct DevnetArgs {
     /// enrolments go through nine months of probation instead of counting at once
     #[arg(long)]
     no_rollout: bool,
+    /// who holds the deduplication key: `threshold` (2-of-3 operators, each its own server, plus a
+    /// standby) or `hmac` (one keyed hash inside the issuer)
+    #[arg(long, default_value = "threshold")]
+    uniqueness: String,
 }
 
 #[derive(Args, Clone, Default)]
@@ -176,6 +362,11 @@ fn devnet_opts(a: &DevnetArgs) -> anyhow::Result<DevnetOpts> {
         scheme: SchemeConfig { proof_system: wiring::proof_system(&a.proof_system)?, tree_depth: a.tree_depth, ..Default::default() },
         data_dir: a.data_dir.clone(),
         rollout: !a.no_rollout,
+        uniqueness: match a.uniqueness.as_str() {
+            "threshold" => devnet::UniquenessMode::Threshold { operators: 3, threshold: 2 },
+            "hmac" => devnet::UniquenessMode::Hmac,
+            _ => anyhow::bail!("--uniqueness must be threshold or hmac"),
+        },
         ..Default::default()
     })
 }
@@ -191,6 +382,12 @@ fn print_devnet(d: &devnet::Devnet) {
     println!("Mock ID provider   {}", d.idp_url);
     println!("Issuer             {}", d.issuer_url);
     println!("Directory          {}", d.directory_url);
+    if let Some(c) = &d.uniqueness {
+        for m in &c.members {
+            println!("Uniqueness op {}    {}  (holds a share, {}-of-{})", m.index, m.url, c.threshold, c.members.len());
+        }
+        println!("Uniqueness op {}    {}  (standby, no share)", c.standby.index, c.standby.url);
+    }
 }
 
 fn holder_for(wallet: PathBuf, d: &devnet::Devnet, as_handle: &str) -> anyhow::Result<Holder> {
@@ -200,7 +397,7 @@ fn holder_for(wallet: PathBuf, d: &devnet::Devnet, as_handle: &str) -> anyhow::R
 
 async fn demo(a: DevnetArgs) -> anyhow::Result<()> {
     println!("Starting the local services (the first start runs the proof-system setup, about a minute)...");
-    let d = devnet::start(devnet_opts(&a)?).await?;
+    let mut d = devnet::start(devnet_opts(&a)?).await?;
     print_devnet(&d);
     let tmp = a.data_dir.clone().unwrap_or_else(|| std::env::temp_dir().join(format!("pop-demo-{}", std::process::id())));
     let step = |n: u32, s: &str| println!("\n[{n}] {s}");
@@ -272,6 +469,18 @@ async fn demo(a: DevnetArgs) -> anyhow::Result<()> {
     step(7, "Alice renews her credential blindly. Her pseudonym and badge stay.");
     let exp = alice.renew().await?;
     println!("    new expiry {}", dates::fmt_day(exp));
+
+    if let Some(c) = d.uniqueness.as_mut() {
+        step(8, "The uniqueness operators refresh their shares, then one operator is replaced. The key is never put together.");
+        let epoch = c.refresh().await?;
+        println!("    refreshed: every operator holds a new share (epoch {epoch}) and erased the old one");
+        let (left, joined, epoch) = c.replace_last_member().await?;
+        println!("    operator {left} left and erased its share; operator {joined} joined (epoch {epoch})");
+        let url = dup.enrol_start().await?;
+        let code = devnet::mock_login(&url, "010190-900A").await?;
+        anyhow::ensure!(code.is_empty() && dup.enrol_finish(&code).await.is_err(), "Alice's identity was not recognised after the operator change");
+        println!("    Alice's identity code is still recognised: a second enrolment is refused as before");
+    }
 
     let token = std::env::var("POP_PAIRING_TOKEN").ok().filter(|t| t.len() >= 16).unwrap_or_else(local_api::new_token);
     let l = tokio::net::TcpListener::bind("127.0.0.1:4010").await?;
@@ -389,6 +598,7 @@ async fn main() -> anyhow::Result<()> {
             serve(listen, pop_mockfeed::router()).await?;
         }
         Cmd::Holder(a) => holder_cmd(a).await?,
+        Cmd::Uniqueness { cmd } => uniqueness_cmd(cmd).await?,
     }
     Ok(())
 }

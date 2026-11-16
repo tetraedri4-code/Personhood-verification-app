@@ -1,0 +1,31 @@
+[package]
+name = "pop-uniqueness"
+description = "Threshold uniqueness service: t-of-n operators share the deduplication key (Shamir), evaluate it blindly, refresh their shares and hand the key to a changed operator set"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pop-crypto.workspace = true
+pop-protocol.workspace = true
+ark-ec.workspace = true
+ark-ff.workspace = true
+ark-std.workspace = true
+axum.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
+rand.workspace = true
+sha2.workspace = true
+hex.workspace = true
+url.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+axum.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true

@@ -1,4 +1,4 @@
-use crate::uniqueness::UniquenessService;
+use crate::uniqueness::{DedupKey, UniquenessService};
 use axum::{
     extract::{Path, Query, State},
     http::{header, StatusCode},
@@ -92,6 +92,9 @@ struct Session {
     nonce: String,
     status: EnrolStatus,
     dedup: Option<String>,
+    /// uniqueness key version `dedup` was computed under
+    #[serde(default)]
+    dedup_version: Option<String>,
     country: Option<u32>,
     error: Option<String>,
 }
@@ -103,6 +106,10 @@ struct Enrolment {
     guardian: String,
     status: String,
     enrolled_on: Day,
+    /// Version of the uniqueness key the record's key d was computed under. d is only comparable with
+    /// values made under the same key, so a record without its key is a record nobody can match.
+    #[serde(default)]
+    key_version: String,
 }
 
 fn load_or<T>(dir: &Option<PathBuf>, name: &str, make: impl FnOnce() -> (T, Vec<u8>), parse: impl FnOnce(&[u8]) -> Option<T>) -> T {
@@ -154,6 +161,7 @@ impl Issuer {
         }
         let revoked: Vec<u64> = store.list(T_REVOKED).await?.iter().filter_map(|(k, _)| k.parse().ok()).collect();
         let tree = scheme.revocation_tree(&revoked)?;
+        check_key_versions(&*uniq, &store).await?;
         let rev = RevState { epoch: 0, root: root_to_hex(&tree.root()), previous_root: None, revoked, tree };
         Ok(Arc::new(Issuer { scheme, key, witness, lego, idp, uniq, store, cfg, rev: RwLock::new(rev), rng: Mutex::new(rng) }))
     }
@@ -218,6 +226,87 @@ impl Issuer {
     pub fn revocations(&self) -> Revocations {
         let rv = self.rev.read().unwrap();
         Revocations { epoch: rv.epoch, revoked: rv.revoked.clone(), root: rv.root.clone(), previous_root: rv.previous_root.clone() }
+    }
+}
+
+/// Fail closed: every enrolment record must be under a key version the uniqueness service still holds.
+/// If a key was lost, replaced or regenerated, the records under it can no longer recognise anyone and
+/// every enrolled person could enrol again. Starting anyway would silently drop the one-per-person
+/// guarantee, so the issuer refuses.
+async fn check_key_versions(uniq: &dyn UniquenessService, store: &SharedStore) -> anyhow::Result<()> {
+    let live = uniq.versions().await?;
+    anyhow::ensure!(!live.is_empty(), "the uniqueness service lists no key version");
+    let mut orphans: BTreeMap<String, usize> = BTreeMap::new();
+    for (_, v) in store.list(T_ENROL).await? {
+        let version = v["key_version"].as_str().unwrap_or_default().to_string();
+        if !live.contains(&version) {
+            *orphans.entry(version).or_default() += 1;
+        }
+    }
+    if orphans.is_empty() {
+        return Ok(());
+    }
+    let list: Vec<String> = orphans
+        .iter()
+        .map(|(v, n)| if v.is_empty() { format!("{n} record(s) without a key version (made before key versions existed)") } else { format!("{n} record(s) under {v}") })
+        .collect();
+    anyhow::bail!(
+        "refusing to start: enrolment records exist under uniqueness key version(s) this service does not hold: {}. \
+         Live versions: {}. Restore the missing key (docs/real-servers.md, \"Uniqueness keys\"); starting without it \
+         would let every person under it enrol a second time.",
+        list.join("; "),
+        live.join(", ")
+    )
+}
+
+/// Outcome of looking a person up under every live key version.
+enum Lookup {
+    New(DedupKey),
+    Enrolled,
+}
+
+impl Issuer {
+    /// Look the person up under every live key version (newest first). A match under an older version
+    /// is moved to the newest one, so old keys empty out as people log in.
+    async fn lookup_and_migrate(&self, country: u32, subject: &str) -> Result<Lookup, ApiErr> {
+        let keys = self.uniq.dedup_keys(country, subject).await.map_err(|e| {
+            tracing::error!("uniqueness service failed: {e:#}");
+            err(StatusCode::SERVICE_UNAVAILABLE, "the uniqueness service is not available; try again later")
+        })?;
+        let live = self.uniq.versions().await.map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
+        // an answer that leaves a version out would let an enrolled person through as new
+        if keys.is_empty() || keys.len() != live.len() || keys.iter().zip(&live).any(|(k, v)| k.version != *v) {
+            tracing::error!("uniqueness service answered for {} of {} key versions", keys.len(), live.len());
+            return Err(err(StatusCode::SERVICE_UNAVAILABLE, "the uniqueness service is not available; try again later"));
+        }
+        let current = keys[0].clone();
+        for (i, k) in keys.iter().enumerate() {
+            let Some(v) = self.store.get(T_ENROL, &k.d).await? else { continue };
+            if i > 0 {
+                let mut rec: Enrolment = serde_json::from_value(v)?;
+                let from = std::mem::replace(&mut rec.key_version, current.version.clone());
+                // write the new record first: a crash in between leaves two records of one person,
+                // both of which still block a second enrolment
+                self.store.insert_new(T_ENROL, &current.d, serde_json::to_value(&rec)?).await?;
+                self.store.delete(T_ENROL, &k.d).await?;
+                tracing::info!("migrated an enrolment record from key version {from} to {}", current.version);
+            }
+            return Ok(Lookup::Enrolled);
+        }
+        Ok(Lookup::New(current))
+    }
+
+    /// How many enrolment records sit under each key version (for the operator: when an old key has no
+    /// records left, it can be retired).
+    pub async fn records_per_key_version(&self) -> anyhow::Result<BTreeMap<String, u64>> {
+        let mut m = BTreeMap::new();
+        for v in self.uniq.versions().await? {
+            m.insert(v, 0);
+        }
+        for (_, v) in self.store.list(T_ENROL).await? {
+            *m.entry(v["key_version"].as_str().unwrap_or_default().to_string()).or_default() += 1;
+        }
+        Ok(m)
     }
 }
 
@@ -295,7 +384,7 @@ async fn enrol_start(State(s): State<St>) -> Result<Json<EnrolStartResponse>, Ap
     let state = s.rand_hex(16);
     let nonce = s.rand_hex(16);
     let url = s.idp.authorization_url(&state, &nonce).await?;
-    let sess = Session { state: state.clone(), created: now_secs(), confirm_code: None, attempts: 0, nonce, status: EnrolStatus::WaitingForLogin, dedup: None, country: None, error: None };
+    let sess = Session { state: state.clone(), created: now_secs(), confirm_code: None, attempts: 0, nonce, status: EnrolStatus::WaitingForLogin, dedup: None, dedup_version: None, country: None, error: None };
     s.store.put(T_SESSIONS, &session, serde_json::to_value(sess)?).await?;
     s.store.put(T_STATES, &state, json!(session)).await?;
     Ok(Json(EnrolStartResponse { session, authorize_url: url }))
@@ -342,10 +431,13 @@ async fn enrol_callback(State(s): State<St>, Query(q): Query<CallbackQ>) -> Resu
     let msg = match outcome {
         Ok(id) => {
             // d is all we keep; `id.subject` goes out of scope here
-            let d = s.uniq.dedup_key(&id).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            let exists = s.store.get(T_ENROL, &d).await?.is_some();
+            let found = s.lookup_and_migrate(id.country, &id.subject).await?;
+            let exists = matches!(found, Lookup::Enrolled);
             sess.status = if exists { EnrolStatus::AlreadyEnrolled } else { EnrolStatus::Authenticated };
-            sess.dedup = Some(d);
+            if let Lookup::New(k) = found {
+                sess.dedup = Some(k.d);
+                sess.dedup_version = Some(k.version);
+            }
             sess.country = Some(id.country);
             if exists {
                 "This person is already enrolled. Use your existing device."
@@ -396,14 +488,22 @@ async fn enrol_finish(State(s): State<St>, Json(req): Json<EnrolFinishRequest>) 
     if g.len() != 32 {
         return Err(err(StatusCode::BAD_REQUEST, "guardian key must be an Ed25519 public key"));
     }
-    let d = sess.dedup.clone().unwrap();
+    let (Some(d), Some(key_version)) = (sess.dedup.clone(), sess.dedup_version.clone()) else {
+        return Err(err(StatusCode::CONFLICT, "session has no deduplication key; start again"));
+    };
+    // the key may have been rotated between login and finish; a record under a retired key would be
+    // an orphan, so the person starts again under the current key
+    if s.uniq.versions().await.ok().and_then(|v| v.first().cloned()).as_deref() != Some(key_version.as_str()) {
+        drop_session(&s, &req.session, &sess).await?;
+        return Err(err(StatusCode::CONFLICT, "the uniqueness key changed during enrolment; start again"));
+    }
     let handle = loop {
         let h = (s.rng.lock().unwrap().next_u64() >> 1).max(1);
         if !s.rev.read().unwrap().revoked.contains(&h) {
             break h;
         }
     };
-    let rec = Enrolment { handle, guardian: req.guardian_public_key.clone(), status: "active".into(), enrolled_on: s.today() };
+    let rec = Enrolment { handle, guardian: req.guardian_public_key.clone(), status: "active".into(), enrolled_on: s.today(), key_version };
     // atomic: two sessions of one person cannot both get through
     if !s.store.insert_new(T_ENROL, &d, serde_json::to_value(&rec)?).await? {
         return Err(err(StatusCode::CONFLICT, "already enrolled"));

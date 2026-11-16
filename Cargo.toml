@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/pop-crypto", "crates/pop-protocol", "crates/pop-storage", "crates/pop-idp", "crates/pop-mock-idp", "crates/pop-issuer", "crates/pop-directory", "crates/pop-mockfeed", "crates/pop-platform-mockfeed", "crates/pop-platform-bluesky", "crates/pop-holder", "crates/pop-cli"]
+members = ["crates/pop-crypto", "crates/pop-protocol", "crates/pop-storage", "crates/pop-idp", "crates/pop-mock-idp", "crates/pop-issuer", "crates/pop-uniqueness", "crates/pop-directory", "crates/pop-mockfeed", "crates/pop-platform-mockfeed", "crates/pop-platform-bluesky", "crates/pop-holder", "crates/pop-cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -46,6 +46,7 @@ pop-crypto = { path = "crates/pop-crypto" }
 pop-protocol = { path = "crates/pop-protocol" }
 pop-storage = { path = "crates/pop-storage" }
 pop-issuer = { path = "crates/pop-issuer" }
+pop-uniqueness = { path = "crates/pop-uniqueness" }
 pop-directory = { path = "crates/pop-directory" }
 pop-idp = { path = "crates/pop-idp" }
 pop-mock-idp = { path = "crates/pop-mock-idp" }

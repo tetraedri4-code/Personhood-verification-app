@@ -69,7 +69,7 @@ Tables in use:
 
 | Service | Table | Key | Holds |
 |---|---|---|---|
-| issuer | `enrolments` | deduplication key d | handle, guardian public key, status, day |
+| issuer | `enrolments` | deduplication key d | handle, guardian public key, status, day, uniqueness key version |
 | issuer | `enrol_sessions`, `enrol_states` | random ids | sessions in progress, deleted at the end or after 15 minutes |
 | issuer | `revoked` | handle | day of revocation |
 | directory | `bindings` | platform, account, pseudonym | the claim and its proof |
@@ -87,13 +87,14 @@ the "one account per pseudonym" and "count once" logic into database transaction
 
 ## 3. Keys
 
-With `data_dir` set, the issuer writes to `data_dir/keys/`:
+With `data_dir` set, the issuer writes to `data_dir/keys/` (and the uniqueness keys to
+`data_dir/uniqueness-keys/`):
 
 | File | What | If it leaks |
 |---|---|---|
 | `issuer.key` | BBS signing key | credentials can be forged |
 | `witness.key` | signs revocation handles | with the issuer key: forged credentials pass |
-| `uniqueness.key` | keys the deduplication hash | enrolment records can be tested against known identity codes |
+| `uniqueness-keys/NNNN.key` | keys the deduplication hash (single-operator mode) | enrolment records can be tested against known identity codes |
 | `lego-*.bin` | proving keys | public; but see below |
 
 For anything beyond a demo:
@@ -103,13 +104,14 @@ For anything beyond a demo:
   `WitnessKey::sign_handle` in `pop-issuer/src/service.rs`, which becomes a call to a separate service.
 - Move the keys into a hardware module or a cloud key service. Both keys are used in a handful of
   places in `pop-crypto/src/scheme.rs` (`issue_blind`, `reissue`, `sign_handle`).
-- Replace `HmacUniqueness` with a threshold service: implement `UniquenessService`
-  (`pop-issuer/src/uniqueness.rs`, one method) as a client of several operators running a threshold
-  OPRF, as in design v2 §4.2. Then no single operator can test whether a given person is enrolled.
+- Run the uniqueness key as a threshold service (`"uniqueness": {"kind": "threshold", ...}`), as in
+  design v2 §4.2: several operators each hold a share, and no single one can test whether a given
+  person is enrolled. Setup, refresh, operator changes and key rotation are in
+  [uniqueness.md](uniqueness.md).
 - **Run a real setup ceremony for LegoGroth16**, or use Bulletproofs. The issuer currently generates the
   proving keys alone, and whoever ran the setup can forge proofs. See [crypto.md](crypto.md).
-- Back up `enrolments` and the keys together. Losing `uniqueness.key` means nobody can be recognised as
-  already enrolled.
+- Back up `enrolments` and the uniqueness keys together. Without the key of its records nobody can be
+  recognised as already enrolled, so the issuer refuses to start ([uniqueness.md](uniqueness.md) §1).
 
 ## 4. Revocation list
 
