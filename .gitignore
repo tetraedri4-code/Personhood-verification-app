@@ -1,0 +1,5 @@
+target/
+*.local.json
+/data/
+/wallet/
+node_modules/
