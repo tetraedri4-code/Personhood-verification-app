@@ -61,7 +61,7 @@ uniqueness operators and a round protocol without a coordinator. Rows 12 and 13 
 (`discard`, `finalize`) that no longer exist: operators now erase old shares themselves once every
 receiver has confirmed its new one, and a stalled round erases nothing.
 
-The review was repeated until a pass found nothing with a reasonable fix: four passes, each a fresh
+The review was repeated until a pass found nothing with a reasonable fix: five passes, each a fresh
 read of every new handler and message with the question "who controls this input, and what do they
 gain", followed by fixes and tests.
 
@@ -91,7 +91,14 @@ gain", followed by fixes and tests.
 | 24 | The app updated its backup right after every binding and unbinding | The backup host can tell whose a backup is (through the ticket). An update at the moment of a binding, next to the public list's new entry, told it which account that person had just bound | The backup is updated only after renewal, re-check and replacement; bindings reach it with the next renewal | `recheck_backup_and_restore_keep_the_same_person` |
 | 25 | `replace_wait_days` was unchecked | A typo in the configuration (a huge number) wrapped the date arithmetic and made waits end at once | The issuer refuses values above ten years at start | start-up check |
 
-**Pass 4** found nothing new with a reasonable fix. What it weighed and left is in "Known and not
+**Pass 4**
+
+| # | Problem | What an attacker could do | Fix | Test |
+|---|---|---|---|---|
+| 26 | A reshare could be written that left some holders of the old epoch out, with nothing said | Those operators keep their old shares; with enough of them the old sharing stays usable, which defeats the refresh | The command warns and names them; the documentation says to list every reachable holder as a dealer (a dealer that is not a receiver erases at the end) | `holders_left_out` in `d_survives_refresh_and_operator_changes` |
+| 27 | A round spec could spell a key in upper-case hex | Deals are compared with the spec's text, so an honest dealer's correct deal would have looked wrong to a newcomer and the dealer been named | Keys in a spec must be in canonical form | `complaints_are_checked_by_everyone` |
+
+**Pass 5** found nothing new with a reasonable fix. What it weighed and left is in "Known and not
 fixed" below and in [recovery.md](recovery.md) §4 and [uniqueness.md](uniqueness.md) §4.
 
 Checked and found sound in this change:

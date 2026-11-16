@@ -267,6 +267,9 @@ impl Holder {
             Err(e) => return Err(e.into()),
         };
         let file = open(&keys, &blob)?;
+        if file.v != 1 {
+            return Err(HolderError::BadBackup);
+        }
         // refuse a backup that does not parse as a credential before anything is written
         pop_crypto::Credential::from_json(&file.credential).map_err(|_| HolderError::BadBackup)?;
         st.credential = Some(file.credential);

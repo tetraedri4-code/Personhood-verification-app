@@ -120,4 +120,5 @@ No part depends on another part's implementation, only on the interfaces in `pop
 | Understand the two-year re-check, backups and replacing a lost secret | [docs/recovery.md](docs/recovery.md) |
 | Add a platform | [docs/adding-a-platform.md](docs/adding-a-platform.md) |
 | Change the proof system or understand the cryptography | [docs/crypto.md](docs/crypto.md) |
+| Know how much data the app uses | [docs/data-usage.md](docs/data-usage.md) |
 | Know what was checked and what is still unsafe | [docs/security.md](docs/security.md) |

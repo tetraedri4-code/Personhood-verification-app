@@ -65,7 +65,7 @@ pub struct Issuer {
     /// one backup write at a time (a ticket must not pay for two backups)
     pub(crate) backups: tokio::sync::Mutex<()>,
     /// Held while an enrolment record is read, decided on and written back (revoke, re-check,
-    /// replace, claim, veto), so two requests about one person cannot both act on the old record.
+    /// replace, claim), so two requests about one person cannot both act on the old record.
     /// A deployment with several issuer processes needs compare-and-swap in its store instead.
     pub(crate) records: tokio::sync::Mutex<()>,
 }

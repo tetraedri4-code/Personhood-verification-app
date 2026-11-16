@@ -41,6 +41,9 @@ pub fn check_spec(spec: &RoundSpec) -> Result<Checked, String> {
             return Err(format!("operator {} must be reached over https", p.index));
         }
         let key = ident::parse_public(&p.identity).map_err(|e| format!("identity key of operator {}: {e}", p.index))?;
+        if to_hex(&key) != p.identity {
+            return Err(format!("identity key of operator {} is not in canonical form", p.index));
+        }
         if peers.insert(p.index, (p.url.trim_end_matches('/').to_string(), key)).is_some() {
             return Err(format!("operator {} is listed twice", p.index));
         }
@@ -82,7 +85,13 @@ pub fn check_spec(spec: &RoundSpec) -> Result<Checked, String> {
             // which has no earlier state, trust the spec: nobody can deal for another key.
             let mut acc = G2::zero();
             for i in d {
-                let vk = ident::parse_public(spec.old_vks.get(i).ok_or(format!("no verification key for dealer {i}"))?)?;
+                let text = spec.old_vks.get(i).ok_or(format!("no verification key for dealer {i}"))?;
+                let vk = ident::parse_public(text)?;
+                // deals are compared with this text; another spelling of the same point would make
+                // an honest dealer's deal look wrong
+                if to_hex(&vk) != *text {
+                    return Err(format!("verification key of dealer {i} is not in canonical form"));
+                }
                 acc += vk * lagrange_at_zero(d, *i);
             }
             if acc.into_affine() != y {

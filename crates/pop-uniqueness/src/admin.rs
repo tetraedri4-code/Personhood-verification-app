@@ -111,6 +111,15 @@ pub async fn spec_reshare(key: &str, dealers: &[Member], receivers: &[Member], t
     for d in dealers {
         ensure!(cur.vks.contains_key(&d.index), "operator {} holds no share of epoch {}", d.index, cur.epoch);
     }
+    let left_out = holders_left_out(&cur, dealers, receivers);
+    if !left_out.is_empty() {
+        tracing::warn!(
+            "operators {left_out:?} hold a share of epoch {} and take no part in this round: they will KEEP that share. \
+             Name every reachable holder under the dealers (a dealer that is not a receiver erases its share at the end); \
+             destroy the state file of a holder that is gone for good",
+            cur.epoch
+        );
+    }
     // later than anything any participant holds, so a leftover of a stalled round is superseded
     let newest = infos.iter().flat_map(|i| epochs_of(i, &key)).map(|e| e.epoch).max().unwrap_or(cur.epoch);
     Ok(RoundSpec {
@@ -126,6 +135,13 @@ pub async fn spec_reshare(key: &str, dealers: &[Member], receivers: &[Member], t
         peers,
         threshold,
     })
+}
+
+/// Holders of `epoch` that a round among `dealers` and `receivers` leaves out. An operator erases its
+/// old share only at the end of a round it takes part in, so these would keep theirs; if `threshold`
+/// of them remain, the old sharing stays usable.
+pub fn holders_left_out(epoch: &PublicEpoch, dealers: &[Member], receivers: &[Member]) -> Vec<u32> {
+    epoch.vks.keys().copied().filter(|i| !dealers.iter().chain(receivers).any(|m| m.index == *i)).collect()
 }
 
 /// Approve `spec` at one's own operator. Read the spec first: this is the administrator's consent.

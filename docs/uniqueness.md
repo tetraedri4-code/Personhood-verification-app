@@ -259,6 +259,11 @@ to start, rotation with migration, and the threshold service behind a full enrol
   deals, so a dealer cannot steer the key; but it can refuse to finish a round whose key it does not
   like, and try again. It is named each time. For this key that gains nothing (any random key is as
   good as another).
+- **A holder that takes no part in a reshare keeps its old share.** An operator erases at the end of a
+  round it is part of. Name every reachable holder under the dealers; one that is not also a receiver
+  erases its share when the round ends. `pop uniqueness reshare` and `round new-reshare` warn when
+  holders are left out. If as many as the old threshold are left out, the old sharing stays usable
+  among them. Destroy the state file of a holder that is gone for good.
 - **Blame is evidence for the administrators, not an automatic exclusion.** The round fails and says
   who; the administrators run it again without that operator.
 - **Identity keys are pinned by the administrators.** If `identity` is left out of the members file,

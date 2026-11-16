@@ -96,6 +96,12 @@ async fn d_survives_refresh_and_operator_changes() {
     // the new member alone with one old member is enough
     assert_eq!(alice, d(&client(&[eps[1].clone(), eps[3].clone()], &[&key]), "010190-900A").await);
 
+    // a round that leaves holders out is noticed: they would keep their old shares
+    let cur = admin::current_epoch(&key, &new_set).await.unwrap();
+    let m = |i: usize| Member::from(&admins[i]);
+    assert_eq!(admin::holders_left_out(&cur, &[m(0)], &[m(4)]), vec![2, 4]);
+    assert!(admin::holders_left_out(&cur, &[m(0), m(3)], &[m(1), m(3), m(4), m(5)]).is_empty());
+
     // other threshold and a mostly new set: 3-of-4 on operators 2, 4, 5, 6, dealt by two holders
     let newer = [admins[1].clone(), admins[3].clone(), admins[4].clone(), admins[5].clone()];
     admin::reshare(&key, &[admins[0].clone(), admins[3].clone()], &newer, 3).await.unwrap();
@@ -503,6 +509,9 @@ async fn complaints_are_checked_by_everyone() {
     let mut s = spec.clone();
     s.threshold = 4;
     assert!(round::check_spec(&s).is_err());
+    let mut s = spec.clone();
+    s.peers[0].identity = s.peers[0].identity.to_uppercase();
+    assert!(round::check_spec(&s).is_err(), "one spelling per key");
     let mut s = spec.clone();
     s.nonce = "cd".repeat(8);
     assert_ne!(s.id(), spec.id(), "the id covers the whole spec");
