@@ -1,6 +1,9 @@
 //! Everything on one machine: mock identity provider, issuer, directory and mock feed, each on its own
 //! port and each talking to the others only over HTTP, as they would when deployed apart.
-use crate::wiring::{self, IssuerFile, PlatformOpts};
+use crate::wiring::{self, IssuerFile, PlatformOpts, UniquenessFile};
+use pop_uniqueness::admin::{self, AdminEndpoint};
+use pop_uniqueness::{Operator, OperatorConfig, OperatorEndpoint, ThresholdConfig};
+use serde::{Deserialize, Serialize};
 use pop_crypto::{dates, SchemeConfig};
 use pop_directory::{Directory, DirectoryConfig};
 use pop_mock_idp::{MockClient, MockIdpConfig};
@@ -18,11 +21,21 @@ pub struct DevnetOpts {
     pub ports: [u16; 4],
     /// enrolments count at once (rollout window) instead of after nine months of probation
     pub rollout: bool,
+    pub uniqueness: UniquenessMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UniquenessMode {
+    /// single-operator keyed hash
+    Hmac,
+    /// `operators` operators with the given threshold, plus one standby operator that holds no share
+    /// until a reshare brings it in. Each is its own server on its own port.
+    Threshold { operators: u32, threshold: usize },
 }
 
 impl Default for DevnetOpts {
     fn default() -> Self {
-        DevnetOpts { scheme: SchemeConfig::default(), data_dir: None, ports: [4000, 4001, 4002, 4003], rollout: true }
+        DevnetOpts { scheme: SchemeConfig::default(), data_dir: None, ports: [4000, 4001, 4002, 4003], rollout: true, uniqueness: UniquenessMode::Hmac }
     }
 }
 
@@ -32,6 +45,111 @@ pub struct Devnet {
     pub idp_url: String,
     pub issuer_url: String,
     pub directory_url: String,
+    /// the threshold uniqueness operators, if any
+    pub uniqueness: Option<UniquenessCluster>,
+}
+
+/// What the devnet knows about its uniqueness operators: enough to run rounds against them.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UniquenessCluster {
+    /// group key Y (hex)
+    pub key: String,
+    pub threshold: usize,
+    /// operators that hold a share after key generation
+    pub members: Vec<AdminEndpoint>,
+    /// an operator that runs but holds no share yet
+    pub standby: AdminEndpoint,
+    eval_tokens: Vec<String>,
+    peer_token: String,
+    #[serde(skip)]
+    file: Option<std::path::PathBuf>,
+}
+
+fn token() -> String {
+    hex::encode(rand::random::<[u8; 24]>())
+}
+
+/// Start the operators and, on the first run, generate the key. With a data directory the tokens, the
+/// group key and every operator's shares survive a restart.
+async fn start_uniqueness(n: u32, threshold: usize, data_dir: Option<&std::path::Path>) -> anyhow::Result<(UniquenessCluster, ThresholdConfig)> {
+    let file = data_dir.map(|d| d.join("uniqueness-devnet.json"));
+    let saved: Option<UniquenessCluster> = match &file {
+        Some(f) if f.exists() => Some(serde_json::from_slice(&std::fs::read(f)?)?),
+        _ => None,
+    };
+    let total = n + 1;
+    let peer_token = saved.as_ref().map(|s| s.peer_token.clone()).unwrap_or_else(token);
+    let mut admins = vec![];
+    let mut endpoints = vec![];
+    let mut eval_tokens = vec![];
+    for index in 1..=total {
+        let old_admin = saved.as_ref().and_then(|s| s.members.iter().chain([&s.standby]).find(|m| m.index == index)).map(|m| m.admin_token.clone());
+        let old_eval = saved.as_ref().and_then(|s| s.eval_tokens.get(index as usize - 1).cloned());
+        let (admin_token, eval_token) = (old_admin.unwrap_or_else(token), old_eval.unwrap_or_else(token));
+        let op = Operator::new(OperatorConfig {
+            index,
+            eval_token: eval_token.clone(),
+            admin_token: admin_token.clone(),
+            peer_token: peer_token.clone(),
+            state_file: data_dir.map(|d| d.join(format!("uniqueness-operator-{index}.json"))),
+            max_evals_per_minute: 6000,
+            min_threshold: threshold.min(2),
+        })?;
+        let (l, url) = listen(0).await?;
+        serve(l, pop_uniqueness::router(op));
+        admins.push(AdminEndpoint { index, url: url.clone(), admin_token });
+        endpoints.push(OperatorEndpoint { index, url, token: eval_token.clone() });
+        eval_tokens.push(eval_token);
+    }
+    let by_index = |i: u32| admins.iter().find(|a| a.index == i).cloned();
+    let (key, members, standby) = match &saved {
+        // everyone keeps index, tokens and shares; only the ports are new
+        Some(s) => (
+            s.key.clone(),
+            s.members.iter().filter_map(|m| by_index(m.index)).collect::<Vec<_>>(),
+            by_index(s.standby.index).ok_or_else(|| anyhow::anyhow!("saved devnet has another number of operators"))?,
+        ),
+        None => {
+            let members = admins[..n as usize].to_vec();
+            (admin::dkg(&members, threshold).await?, members, admins[n as usize].clone())
+        }
+    };
+    let cluster = UniquenessCluster { key: key.clone(), threshold, members, standby, eval_tokens, peer_token, file };
+    cluster.save()?;
+    Ok((cluster, ThresholdConfig { operators: endpoints, keys: vec![key] }))
+}
+
+impl UniquenessCluster {
+    fn save(&self) -> anyhow::Result<()> {
+        let Some(f) = &self.file else { return Ok(()) };
+        if let Some(d) = f.parent() {
+            std::fs::create_dir_all(d)?;
+        }
+        std::fs::write(f, serde_json::to_vec_pretty(self)?)?;
+        Ok(())
+    }
+
+    /// Refresh: every member gets a new share of the same key and erases the old one.
+    pub async fn refresh(&self) -> anyhow::Result<u64> {
+        let epoch = admin::reshare(&self.key, &self.members, &self.members, self.threshold).await?;
+        admin::finalize(&self.key, epoch, &self.members, &[]).await?;
+        Ok(epoch)
+    }
+
+    /// Replace the last member by the standby operator: the remaining members and the newcomer get
+    /// new shares, the member that left erases its share.
+    pub async fn replace_last_member(&mut self) -> anyhow::Result<(u32, u32, u64)> {
+        let leaver = self.members.last().cloned().expect("members");
+        let mut new_set: Vec<AdminEndpoint> = self.members[..self.members.len() - 1].to_vec();
+        new_set.push(self.standby.clone());
+        let epoch = admin::reshare(&self.key, &self.members, &new_set, self.threshold).await?;
+        admin::finalize(&self.key, epoch, &new_set, std::slice::from_ref(&leaver)).await?;
+        let joined = self.standby.index;
+        self.standby = leaver.clone();
+        self.members = new_set;
+        self.save()?;
+        Ok((leaver.index, joined, epoch))
+    }
 }
 
 async fn listen(port: u16) -> anyhow::Result<(TcpListener, String)> {
@@ -67,12 +185,20 @@ pub async fn start(o: DevnetOpts) -> anyhow::Result<Devnet> {
 
     // a quarter start more than nine months back, so demo badges are "counted" at once
     let rollout = o.rollout.then(|| dates::fmt_day(dates::quarter_start(dates::quarter_of(dates::today()).saturating_sub(4))));
+    let (uniqueness, uniq_file) = match o.uniqueness {
+        UniquenessMode::Hmac => (None, UniquenessFile::Hmac),
+        UniquenessMode::Threshold { operators, threshold } => {
+            let (c, cfg) = start_uniqueness(operators, threshold, o.data_dir.as_deref()).await?;
+            (Some(c), UniquenessFile::Threshold(cfg))
+        }
+    };
     let issuer = wiring::build_issuer(&IssuerFile {
         data_dir: o.data_dir.clone(),
         scheme: o.scheme.clone(),
         oidc,
         provider_code: 1,
         rollout_certified: rollout,
+        uniqueness: uniq_file,
         uniqueness_key: None,
     })
     .await?;
@@ -88,7 +214,7 @@ pub async fn start(o: DevnetOpts) -> anyhow::Result<Devnet> {
     .await?;
     serve(l_dir, pop_directory::router(dir));
 
-    Ok(Devnet { feed_url, idp_url, issuer_url, directory_url })
+    Ok(Devnet { feed_url, idp_url, issuer_url, directory_url, uniqueness })
 }
 
 /// Complete the mock identity check without a browser: the mock IdP logs `subject` in at once when

@@ -31,7 +31,8 @@ cargo run --release -p pop-cli -- demo
 
 The first start takes about a minute (proof-system setup), then prints a walk-through: enrolment, a
 refused second enrolment, binding, a like farm of 40 bots against 1 verified like, an impostor copying
-a code, and blind renewal. The services keep running:
+a code, blind renewal, and the uniqueness operators refreshing their key shares and replacing one of
+their number while Alice stays recognised. The services keep running:
 
 | Service | Address |
 |---|---|
@@ -40,6 +41,7 @@ a code, and blind renewal. The services keep running:
 | Issuer | http://127.0.0.1:4002 |
 | Directory | http://127.0.0.1:4003 |
 | Alice's holder app (for the extension) | http://127.0.0.1:4010 |
+| Uniqueness operators (three with a share, one standby) | four free ports, printed at start |
 
 ![The mock feed with the extension: badges on two accounts, 40 likes but 1 verified on the farmed post](docs/img/mockfeed-with-extension.png)
 
@@ -87,6 +89,7 @@ crates/
   pop-protocol            the interfaces between the parts: API messages, Platform trait, ids
   pop-holder              the app on the person's device
   pop-issuer              issuing service        (uses: IdentityProvider, UniquenessService, Store)
+  pop-uniqueness          threshold uniqueness service: operators that share the deduplication key
   pop-directory           public list and counts (uses: IssuerApi, Platform, Store)
   pop-idp                 IdentityProvider trait + generic OpenID Connect client
   pop-storage             Store trait + memory and JSON-file stores
@@ -108,6 +111,7 @@ No part depends on another part's implementation, only on the interfaces in `pop
 |---|---|
 | Use a real identity provider (bank ID broker, EUDI wallet) | [docs/real-identity-provider.md](docs/real-identity-provider.md) |
 | Run real servers and storage | [docs/real-servers.md](docs/real-servers.md) |
+| Share the uniqueness key among operators, refresh it, rotate it | [docs/uniqueness.md](docs/uniqueness.md) |
 | Add a platform | [docs/adding-a-platform.md](docs/adding-a-platform.md) |
 | Change the proof system or understand the cryptography | [docs/crypto.md](docs/crypto.md) |
 | Know what was checked and what is still unsafe | [docs/security.md](docs/security.md) |

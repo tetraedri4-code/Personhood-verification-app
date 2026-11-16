@@ -16,6 +16,7 @@ pop-storage.workspace = true
 pop-idp.workspace = true
 pop-mock-idp.workspace = true
 pop-issuer.workspace = true
+pop-uniqueness.workspace = true
 pop-directory.workspace = true
 pop-mockfeed.workspace = true
 pop-platform-mockfeed.workspace = true

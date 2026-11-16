@@ -6,6 +6,8 @@
 //!   [`api::IssuerApi`] and [`api::DirectoryApi`] the holder app uses. [`http`] implements them over HTTP.
 //! * [`platform`]: the [`platform::Platform`] trait every social platform adapter implements.
 //! * [`ids`]: context ids, account references, binding codes.
+//! * [`uniqueness`]: the [`uniqueness::UniquenessService`] trait between the issuer and whoever holds the
+//!   deduplication key.
 //!
 //! This crate depends only on `pop-crypto`. Servers, identity providers and platform adapters depend on
 //! it, never on each other.
@@ -13,5 +15,6 @@ pub mod api;
 pub mod http;
 pub mod ids;
 pub mod platform;
+pub mod uniqueness;
 
 pub use ids::*;

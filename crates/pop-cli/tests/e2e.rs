@@ -24,6 +24,7 @@ async fn net() -> &'static Devnet {
                     data_dir: None,
                     ports: [0; 4],
                     rollout: true,
+                    uniqueness: devnet::UniquenessMode::Hmac,
                 })
                 .await
                 .unwrap();

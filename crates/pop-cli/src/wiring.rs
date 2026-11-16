@@ -4,7 +4,8 @@ use pop_crypto::{dates, ProofSystem, Scheme, SchemeConfig};
 use pop_holder::{Holder, WalletStore};
 use pop_idp::oidc::{OidcConfig, OidcProvider};
 use pop_idp::Loa;
-use pop_issuer::{HmacUniqueness, Issuer, IssuerConfig};
+use pop_issuer::{hmac_key_version, HmacUniqueness, Issuer, IssuerConfig, UniquenessService};
+use pop_uniqueness::{ThresholdConfig, ThresholdUniqueness};
 use pop_platform_bluesky::{Bluesky, BlueskyConfig};
 use pop_platform_mockfeed::MockFeed;
 use pop_protocol::http::HttpClient;
@@ -27,8 +28,25 @@ pub struct IssuerFile {
     pub provider_code: u32,
     /// "YYYY-MM-DD" quarter start: secrets enrolled now count as certified then (rollout window)
     pub rollout_certified: Option<String>,
-    /// hex, at least 32 bytes. Omit to generate one into `data_dir/uniqueness.key`.
+    /// Who computes the deduplication key. Omit for the single-operator keyed hash.
+    #[serde(default)]
+    pub uniqueness: UniquenessFile,
+    /// Keyed hash only: a key given in the configuration (hex, at least 32 bytes) instead of in
+    /// `data_dir/uniqueness-keys/`. It counts as the oldest key.
+    #[serde(default)]
     pub uniqueness_key: Option<String>,
+}
+
+/// The `uniqueness` section of the issuer configuration.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UniquenessFile {
+    /// One operator, HMAC-SHA256. Keys live in `data_dir/uniqueness-keys/NNNN.key`; the highest number
+    /// is the current key. `pop uniqueness rotate-key` adds one.
+    #[default]
+    Hmac,
+    /// t-of-n operators (`pop uniqueness operator`), see docs/real-servers.md.
+    Threshold(ThresholdConfig),
 }
 
 fn one() -> u32 {
@@ -48,22 +66,115 @@ fn parse_day(s: &str) -> anyhow::Result<u32> {
     Ok(dates::from_civil(p[0] as i32, p[1], p[2]))
 }
 
-fn uniqueness_key(f: &IssuerFile) -> anyhow::Result<Vec<u8>> {
-    if let Some(k) = &f.uniqueness_key {
-        return Ok(hex::decode(k)?);
+const KEY_DIR: &str = "uniqueness-keys";
+
+fn write_secret(p: &Path, content: &[u8]) -> anyhow::Result<()> {
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
     }
-    let fresh = || rand::random::<[u8; 32]>().to_vec();
-    match &f.data_dir {
-        None => Ok(fresh()),
-        Some(d) => {
-            std::fs::create_dir_all(d)?;
-            let p = d.join("uniqueness.key");
-            if let Ok(b) = std::fs::read(&p) {
-                return Ok(b);
+    let mut f = o.open(p).with_context(|| format!("cannot create {}", p.display()))?;
+    std::io::Write::write_all(&mut f, content)?;
+    f.sync_all()?;
+    Ok(())
+}
+
+/// The keyed-hash keys, oldest first: the key from the configuration, the single key file of the first
+/// prototype (`uniqueness.key`), then `uniqueness-keys/NNNN.key` in order. Returns the keys and the
+/// highest NNNN in use.
+fn hmac_keys(f: &IssuerFile) -> anyhow::Result<(Vec<Vec<u8>>, u32)> {
+    let mut keys = vec![];
+    let mut last = 0;
+    if let Some(k) = &f.uniqueness_key {
+        keys.push(hex::decode(k.trim()).context("uniqueness_key must be hex")?);
+    }
+    if let Some(d) = &f.data_dir {
+        match std::fs::read(d.join("uniqueness.key")) {
+            Ok(b) => keys.push(b),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).context("cannot read uniqueness.key"),
+        }
+        let dir = d.join(KEY_DIR);
+        let mut files: Vec<(u32, PathBuf)> = vec![];
+        match std::fs::read_dir(&dir) {
+            Ok(rd) => {
+                for ent in rd {
+                    let p = ent?.path();
+                    if p.extension().and_then(|e| e.to_str()) != Some("key") {
+                        continue;
+                    }
+                    let n: u32 = p.file_stem().and_then(|s| s.to_str()).and_then(|s| s.parse().ok()).with_context(|| format!("unexpected key file name {}", p.display()))?;
+                    files.push((n, p));
+                }
             }
-            let k = fresh();
-            std::fs::write(&p, &k)?;
-            Ok(k)
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).context("cannot read the uniqueness key directory"),
+        }
+        files.sort();
+        for (n, p) in files {
+            // a key file that cannot be read is an error, not a missing key
+            let text = std::fs::read_to_string(&p).with_context(|| format!("cannot read {}", p.display()))?;
+            keys.push(hex::decode(text.trim()).with_context(|| format!("{} is not hex", p.display()))?);
+            last = n;
+        }
+    }
+    Ok((keys, last))
+}
+
+fn new_hmac_key(f: &IssuerFile, number: u32) -> anyhow::Result<Vec<u8>> {
+    let k = rand::random::<[u8; 32]>().to_vec();
+    if let Some(d) = &f.data_dir {
+        let dir = d.join(KEY_DIR);
+        std::fs::create_dir_all(&dir)?;
+        write_secret(&dir.join(format!("{number:04}.key")), hex::encode(&k).as_bytes())?;
+    }
+    Ok(k)
+}
+
+/// Add a new keyed-hash key; it becomes the current one at the next start of the issuer. The older
+/// keys must stay in place: records under them are still matched, and moved to the new key when their
+/// owner next logs in. Returns (new version, all versions newest first).
+pub fn rotate_hmac_key(f: &IssuerFile) -> anyhow::Result<(String, Vec<String>)> {
+    anyhow::ensure!(matches!(f.uniqueness, UniquenessFile::Hmac), "this issuer uses the threshold service: make a new key with `pop uniqueness dkg` and append it to `uniqueness.keys`");
+    anyhow::ensure!(f.data_dir.is_some(), "rotation needs a data_dir to keep the keys in");
+    let (keys, last) = hmac_keys(f)?;
+    anyhow::ensure!(!keys.is_empty(), "there is no key yet; the issuer makes the first one when it starts");
+    let k = new_hmac_key(f, last + 1)?;
+    let mut versions: Vec<String> = keys.iter().map(|k| hmac_key_version(k)).collect();
+    versions.push(hmac_key_version(&k));
+    versions.reverse();
+    Ok((versions[0].clone(), versions))
+}
+
+/// Enrolment records per key version, straight from the store (no keys needed).
+pub async fn records_per_version(f: &IssuerFile) -> anyhow::Result<std::collections::BTreeMap<String, u64>> {
+    let mut m = std::collections::BTreeMap::new();
+    for (_, v) in store(f.data_dir.as_deref(), "issuer-db")?.list("enrolments").await? {
+        *m.entry(v["key_version"].as_str().unwrap_or("(none)").to_string()).or_default() += 1;
+    }
+    Ok(m)
+}
+
+async fn build_uniqueness(f: &IssuerFile, db: &SharedStore) -> anyhow::Result<Arc<dyn UniquenessService>> {
+    match &f.uniqueness {
+        UniquenessFile::Threshold(c) => Ok(Arc::new(ThresholdUniqueness::new(c.clone())?)),
+        UniquenessFile::Hmac => {
+            let (mut keys, last) = hmac_keys(f)?;
+            if keys.is_empty() {
+                // Fail closed: a first start has no records. Records without any key mean the key was
+                // lost; making a fresh one would let everybody enrol again.
+                let n = db.count("enrolments").await?;
+                anyhow::ensure!(
+                    n == 0,
+                    "refusing to start: {n} enrolment record(s) exist but no uniqueness key was found in the data directory. \
+                     Restore the key (docs/real-servers.md, \"Uniqueness keys\")."
+                );
+                keys.push(new_hmac_key(f, last + 1)?);
+            }
+            Ok(Arc::new(HmacUniqueness::new(keys)?))
         }
     }
 }
@@ -72,7 +183,8 @@ pub async fn build_issuer(f: &IssuerFile) -> anyhow::Result<Arc<Issuer>> {
     let scheme = Arc::new(Scheme::new(f.scheme.clone()));
     let min_loa = f.oidc.min_loa;
     let idp = Arc::new(OidcProvider::new(f.oidc.clone()));
-    let uniq = Arc::new(HmacUniqueness::new(uniqueness_key(f)?));
+    let db = store(f.data_dir.as_deref(), "issuer-db")?;
+    let uniq = build_uniqueness(f, &db).await?;
     let cfg = IssuerConfig {
         keys_dir: f.data_dir.as_ref().map(|d| d.join("keys")),
         provider_code: f.provider_code,
@@ -80,7 +192,7 @@ pub async fn build_issuer(f: &IssuerFile) -> anyhow::Result<Arc<Issuer>> {
         rollout_certified: f.rollout_certified.as_deref().map(parse_day).transpose()?,
         clock: None,
     };
-    Issuer::new(scheme, idp, uniq, store(f.data_dir.as_deref(), "issuer-db")?, cfg).await
+    Issuer::new(scheme, idp, uniq, db, cfg).await
 }
 
 /// Which platforms a process knows, from command-line options.

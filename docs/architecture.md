@@ -6,8 +6,11 @@
  person's device                      operator                         outside
 ┌────────────────────┐  IssuerApi   ┌───────────┐ IdentityProvider ┌──────────────────┐
 │ holder app         │─────────────▶│ issuer    │─────────────────▶│ ID provider      │
-│ (pop-holder)       │              │           │ UniquenessService│ (mock or broker) │
-│  secret, proofs    │              │           │ Store            └──────────────────┘
+│ (pop-holder)       │              │           │ UniquenessService┌──────────────────┐
+│  secret, proofs    │              │           │─────────────────▶│ uniqueness ops   │
+│                    │              │           │ Store            │ (t-of-n, or a    │
+│                    │              │           │                  │  keyed hash)     │
+│                    │              │           │                  └──────────────────┘
 │                    │ DirectoryApi ├───────────┤
 │                    │─────────────▶│ directory │ IssuerApi (public keys, revocation root)
 │                    │              │           │ Platform (read public bio, optional)
@@ -29,7 +32,7 @@
 | `IssuerApi`, `DirectoryApi` | `pop-protocol::api` | `HttpClient` | holder, directory |
 | `Platform` | `pop-protocol::platform` | `MockFeed`, `Bluesky` | holder, directory |
 | `IdentityProvider` | `pop-idp` | `OidcProvider`, `StaticProvider` | issuer |
-| `UniquenessService` | `pop-issuer::uniqueness` | `HmacUniqueness` | issuer |
+| `UniquenessService` | `pop-protocol::uniqueness` | `HmacUniqueness` (in `pop-issuer`), `ThresholdUniqueness` (in `pop-uniqueness`) | issuer |
 | `Store` | `pop-storage` | `MemoryStore`, `JsonFileStore` | issuer, directory |
 | `WalletStore` | `pop-holder::wallet` | `FileWallet`, `MemoryWallet` | holder |
 | proof system | `pop-crypto::ProofSystem` | LegoGroth16, Bulletproofs | everything, through `Scheme` |
@@ -48,7 +51,9 @@ These hold today (check with `cargo tree`), and a change that breaks one is a de
 5. Platform crates depend only on `pop-protocol`. They do not depend on each other.
 6. `pop-mock-idp` and `pop-mockfeed` depend on nothing in this repository. They are ordinary servers that
    happen to be fake.
-7. Only `pop-cli` names concrete implementations (`crates/pop-cli/src/wiring.rs`).
+7. `pop-uniqueness` depends only on `pop-crypto` and `pop-protocol`. The issuer does not depend on it:
+   it sees the `UniquenessService` trait and nothing else.
+8. Only `pop-cli` names concrete implementations (`crates/pop-cli/src/wiring.rs`).
 
 The extension follows the same split: `core.js` knows no site's markup, each file in `adapters/` knows
 one site and nothing about the directory or the holder app, and `background.js` is the only file that
@@ -79,7 +84,6 @@ request, signed with the guardian key.
 
 ## What the prototype leaves out
 
-Compared with design v2 and the voluntary-app report: recovery and backup, threshold issuer and
-uniqueness operators, the public witnessed log, delaying relays and cover traffic, the two-year re-check
+Compared with design v2 and the voluntary-app report: recovery and backup, a threshold issuer, the public witnessed log, delaying relays and cover traffic, the two-year re-check
 flow (the proof term exists, the eID step does not), hardware-wrapped secrets, phone apps, Bluesky labels
 and feed generator. Each has a seam where it would go; the docs name it.
