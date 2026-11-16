@@ -38,7 +38,26 @@ pub struct Params {
     pub providers: BTreeMap<u32, String>,
 }
 
-/// `POST /v1/enrol/start`
+/// What an identity check is for. One login serves exactly one purpose.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum Purpose {
+    /// first enrolment of a person
+    #[default]
+    Enrol,
+    /// the two-year identity re-check of an existing credential (same secret, same pseudonyms)
+    Recheck,
+    /// replace a lost or stolen secret by a new one (recovery level 2)
+    Replace,
+}
+
+/// `POST /v1/enrol/start` (an empty body means `enrol`)
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct EnrolStartRequest {
+    #[serde(default)]
+    pub purpose: Purpose,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EnrolStartResponse {
     pub session: String,
@@ -53,6 +72,8 @@ pub enum EnrolStatus {
     WaitingForLogin,
     Authenticated,
     AlreadyEnrolled,
+    /// a re-check or replacement was asked for a person with no enrolment record
+    NotEnrolled,
     Failed,
     Done,
 }
@@ -75,6 +96,9 @@ pub struct IssuanceResponse {
     pub signature: BlindSignature,
     pub attrs: IssuedAttrs,
     pub handle_signature: String,
+    /// one-time ticket that lets this holder create one encrypted backup (`PUT /v1/backup`)
+    #[serde(default)]
+    pub backup_ticket: Option<String>,
 }
 
 /// `POST /v1/renew`
@@ -90,6 +114,125 @@ pub struct RenewRequest {
 pub struct RenewResponse {
     pub signature: BlindSignature,
     pub new_expiry: Day,
+}
+
+/// `POST /v1/recheck`: the two-year identity re-check. The session comes from `enrol/start` with
+/// purpose `recheck`; the proof is a renewal proof that also shows the handle and the month of the
+/// last check, bound to the session.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RecheckRequest {
+    pub session: String,
+    pub confirm_code: String,
+    pub today: Day,
+    pub revocation_root: String,
+    pub handle: u64,
+    pub last_check: Day,
+    pub proof: RenewalProof,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RecheckResponse {
+    pub signature: BlindSignature,
+    pub new_expiry: Day,
+    pub new_check: Day,
+    /// see [`IssuanceResponse::backup_ticket`]
+    #[serde(default)]
+    pub backup_ticket: Option<String>,
+}
+
+/// `POST /v1/replace`: replace the secret after an identity check (session purpose `replace`).
+/// With a signature of the enrolment's current guardian key the new credential is issued at once.
+/// Without it the request waits (`replace_wait_days`), the old app can veto it, and the holder
+/// collects the credential later with `POST /v1/replace/claim`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReplaceRequest {
+    pub session: String,
+    pub confirm_code: String,
+    /// commitment to the NEW secret, bound to the session
+    pub blind_request: BlindRequest,
+    /// the new guardian key
+    pub guardian_public_key: String,
+    /// Ed25519 signature of the OLD guardian key over `replace_message(session, commitment, new guardian key)`
+    #[serde(default)]
+    pub old_guardian_signature: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "kebab-case")]
+pub enum ReplaceResponse {
+    Issued { issuance: IssuanceResponse },
+    /// the request is recorded; claim on or after `claim_after`, and no later than `claim_before`
+    Pending { claim_token: String, claim_after: Day, claim_before: Day },
+}
+
+pub fn replace_message(session: &str, commitment: &str, new_guardian: &str) -> Vec<u8> {
+    format!("pop-replace-v1|{session}|{commitment}|{new_guardian}").into_bytes()
+}
+
+/// `POST /v1/replace/claim`: collect the credential of a replacement that has waited long enough.
+/// The blind request is bound to `claim_session(claim_token)`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClaimRequest {
+    pub claim_token: String,
+    pub blind_request: BlindRequest,
+}
+
+pub fn claim_session(claim_token: &str) -> Vec<u8> {
+    format!("pop-replace-claim-v1|{claim_token}").into_bytes()
+}
+
+/// `GET /v1/replace/pending`: replacements that are waiting. A holder app looks for its own entry
+/// (`pending_id(handle)`) and warns the person; nobody else can tell whose an entry is.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PendingReplacements {
+    pub entries: Vec<PendingReplacement>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PendingReplacement {
+    pub id: String,
+    pub nonce: String,
+    pub requested_on: Day,
+    pub claim_after: Day,
+}
+
+/// Id of a pending replacement in the public list: a hash of the handle and the entry's nonce. The
+/// handle is known to the issuer and the holder only.
+pub fn pending_id(handle: u64, nonce: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(&Sha256::digest(format!("pop-replace-pending-v1|{handle}|{nonce}").as_bytes())[..16])
+}
+
+/// `POST /v1/replace/veto`: the old app refuses a pending replacement, signed with its guardian key
+/// over `veto_message(handle, nonce)`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VetoRequest {
+    pub handle: u64,
+    pub nonce: String,
+    pub signature: String,
+}
+
+pub fn veto_message(handle: u64, nonce: &str) -> Vec<u8> {
+    format!("pop-replace-veto-v1|{handle}|{nonce}").into_bytes()
+}
+
+/// `POST /v1/backup`: store an encrypted backup (recovery level 1). The server sees ciphertext only.
+/// A new backup needs a `ticket` (handed out at enrolment, re-check and replacement); replacing or
+/// deleting an existing one needs its `write_key`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BackupPut {
+    pub id: String,
+    pub write_key: String,
+    #[serde(default)]
+    pub ticket: Option<String>,
+    /// base64; empty deletes the backup
+    pub blob: String,
+}
+
+/// `GET /v1/backup/{id}`
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BackupBlob {
+    pub blob: String,
 }
 
 /// `GET /v1/revocations`: the full list, so a holder computes its path without revealing its handle.
@@ -211,12 +354,20 @@ pub struct CountsResponse {
 pub trait IssuerApi: Send + Sync {
     async fn params(&self) -> Result<Params, ApiError>;
     async fn lego_keys(&self, kind: StatementKind) -> Result<Vec<u8>, ApiError>;
-    async fn enrol_start(&self) -> Result<EnrolStartResponse, ApiError>;
+    async fn enrol_start(&self, purpose: Purpose) -> Result<EnrolStartResponse, ApiError>;
     async fn enrol_status(&self, session: &str) -> Result<EnrolStatus, ApiError>;
     async fn enrol_finish(&self, req: &EnrolFinishRequest) -> Result<IssuanceResponse, ApiError>;
     async fn renew(&self, req: &RenewRequest) -> Result<RenewResponse, ApiError>;
     async fn revocations(&self) -> Result<Revocations, ApiError>;
     async fn revoke(&self, req: &RevokeRequest) -> Result<(), ApiError>;
+    async fn identity_recheck(&self, req: &RecheckRequest) -> Result<RecheckResponse, ApiError>;
+    async fn replace(&self, req: &ReplaceRequest) -> Result<ReplaceResponse, ApiError>;
+    async fn replace_claim(&self, req: &ClaimRequest) -> Result<IssuanceResponse, ApiError>;
+    async fn replace_pending(&self) -> Result<PendingReplacements, ApiError>;
+    async fn replace_veto(&self, req: &VetoRequest) -> Result<(), ApiError>;
+    /// Returns a new ticket when the call deleted a backup.
+    async fn backup_put(&self, req: &BackupPut) -> Result<Option<String>, ApiError>;
+    async fn backup_get(&self, id: &str) -> Result<BackupBlob, ApiError>;
 }
 
 #[async_trait]

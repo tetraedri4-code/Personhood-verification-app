@@ -411,6 +411,28 @@ enum HolderCmd {
     Renew,
     /// Revoke your own credential with the guardian key
     Revoke,
+    /// The two-year identity re-check: log in again, keep the same secret and badges
+    Recheck {
+        #[arg(long)]
+        mock_login: Option<String>,
+    },
+    /// Make an encrypted backup and print its paper code (again: new code, old backup deleted)
+    Backup,
+    /// Restore a backup onto a device without a credential
+    Restore {
+        /// the paper code; dashes, spaces and case do not matter
+        code: String,
+    },
+    /// Replace a lost or stolen secret after an identity check. At once if this wallet still has the
+    /// old guardian key; otherwise it waits and the old app can refuse it
+    Replace {
+        #[arg(long)]
+        mock_login: Option<String>,
+    },
+    /// Collect the new credential of a replacement whose wait is over
+    Claim,
+    /// Refuse a replacement of this wallet's secret that someone else asked for
+    Veto,
     Status,
     /// Serve the local API for the browser extension
     Serve {
@@ -558,21 +580,26 @@ async fn demo(a: DevnetArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The identity check: with the mock provider it can run without a browser; otherwise the person
+/// opens the address and types the code the issuer's page shows.
+async fn login(url: &str, mock_login: Option<String>) -> anyhow::Result<String> {
+    Ok(match mock_login {
+        Some(id) => devnet::mock_login(url, &id).await?,
+        None => {
+            println!("Open this address in your own browser and log in:\n\n  {url}\n\nThen type the 6-digit code from that page here and press Enter.");
+            let mut s = String::new();
+            std::io::stdin().read_line(&mut s)?;
+            s
+        }
+    })
+}
+
 async fn holder_cmd(a: HolderArgs) -> anyhow::Result<()> {
     let wallet_dir = a.wallet.clone();
     let h = Arc::new(wiring::build_holder(&a.issuer_url, &a.directory_url, wiring::platforms(&a.platforms.into()), Arc::new(FileWallet::open(&a.wallet)?)));
     match a.cmd {
         HolderCmd::Enrol { mock_login } => {
-            let url = h.enrol_start().await?;
-            let code = match mock_login {
-                Some(id) => devnet::mock_login(&url, &id).await?,
-                None => {
-                    println!("Open this address in your own browser and log in:\n\n  {url}\n\nThen type the 6-digit code from that page here and press Enter.");
-                    let mut s = String::new();
-                    std::io::stdin().read_line(&mut s)?;
-                    s
-                }
-            };
+            let code = login(&h.enrol_start().await?, mock_login).await?;
             h.enrol_finish(&code).await?;
             println!("Enrolled. {}", serde_json::to_string_pretty(&h.status()?)?);
         }
@@ -597,7 +624,49 @@ async fn holder_cmd(a: HolderArgs) -> anyhow::Result<()> {
             h.revoke().await?;
             println!("Credential revoked.");
         }
-        HolderCmd::Status => println!("{}", serde_json::to_string_pretty(&h.status()?)?),
+        HolderCmd::Recheck { mock_login } => {
+            let code = login(&h.recheck_start().await?, mock_login).await?;
+            let next = h.recheck_finish(&code).await?;
+            println!("Identity re-checked. Same secret, same badges. Next re-check by {}.", dates::fmt_day(next));
+        }
+        HolderCmd::Backup => {
+            let code = h.backup_create().await?;
+            println!("Backup stored, encrypted. Write this code on paper and keep it away from this device:\n\n  {code}\n");
+            println!("It is shown this once and is not kept here. Whoever has it can restore your secret; without it nobody can read the backup.");
+        }
+        HolderCmd::Restore { code } => {
+            h.restore(&code).await?;
+            println!("Restored. {}", serde_json::to_string_pretty(&h.status()?)?);
+            println!("If the credential has expired, run `pop holder renew`.");
+        }
+        HolderCmd::Replace { mock_login } => {
+            let code = login(&h.replace_start().await?, mock_login).await?;
+            match h.replace_finish(&code).await? {
+                pop_holder::ReplaceOutcome::Issued { counted_from } => {
+                    println!("Secret replaced. The old secret is revoked; its badges run out with their leases.");
+                    println!("The new secret is in probation: bind your accounts again now, they and your likes count from {counted_from}.");
+                }
+                pop_holder::ReplaceOutcome::Waiting { claim_after, claim_before } => {
+                    println!("Request recorded. This wallet does not have the old guardian key, so the replacement waits.");
+                    println!("The app with the old secret can refuse it until then. Run `pop holder claim` between {claim_after} and {claim_before}.");
+                }
+            }
+        }
+        HolderCmd::Claim => println!("Secret replaced. Bind your accounts again; they and your likes count from {}.", h.replace_claim().await?),
+        HolderCmd::Veto => {
+            h.veto_replacement().await?;
+            println!("Replacement refused. If you did not ask for it, someone else can log in with your eID: contact your bank or eID provider.");
+        }
+        HolderCmd::Status => {
+            println!("{}", serde_json::to_string_pretty(&h.status()?)?);
+            if let Ok(Some(p)) = h.pending_replacement().await {
+                println!(
+                    "\nWARNING: on {} someone logged in with your eID and asked to REPLACE this wallet's secret. It takes effect from {}.\nIf that was not you, run `pop holder veto` now.",
+                    dates::fmt_day(p.requested_on),
+                    dates::fmt_day(p.claim_after)
+                );
+            }
+        }
         HolderCmd::Serve { listen, token } => {
             anyhow::ensure!(listen.ip().is_loopback(), "the local API must listen on a loopback address");
             let tf = wallet_dir.join("pairing-token");

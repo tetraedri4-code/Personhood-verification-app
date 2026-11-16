@@ -25,6 +25,7 @@ async fn net() -> &'static Devnet {
                     ports: [0; 4],
                     rollout: true,
                     uniqueness: devnet::UniquenessMode::Hmac,
+                    replace_wait_days: None,
                 })
                 .await
                 .unwrap();
@@ -148,7 +149,7 @@ async fn the_redirect_state_is_not_the_session() {
     // whoever sees the redirect (the identity provider, browser history) must not be able to finish
     let d = net().await;
     let issuer = HttpClient::new(&d.issuer_url);
-    let r = IssuerApi::enrol_start(&issuer).await.unwrap();
+    let r = IssuerApi::enrol_start(&issuer, Purpose::Enrol).await.unwrap();
     let state = reqwest::Url::parse(&r.authorize_url).unwrap().query_pairs().find(|(k, _)| k == "state").unwrap().1.to_string();
     assert_ne!(state, r.session);
     let e = issuer.enrol_status(&state).await.unwrap_err();
@@ -231,4 +232,88 @@ async fn a_false_claim_cannot_remove_someone_elses_badge() {
     let claims: Vec<_> = list.entries.iter().filter(|e| e.handle == "carol").collect();
     assert!(claims.iter().any(|e| e.code == real.entry.code && e.code_seen_on.is_some()), "Carol's confirmed claim is still there");
     assert!(claims.iter().any(|e| e.code == fake.entry.code && e.code_seen_on.is_none()));
+}
+
+#[tokio::test]
+async fn recheck_backup_and_restore_keep_the_same_person() {
+    let d = net().await;
+    let phone = enrolled(d, "carol", "T-BACKUP-1").await;
+    let out = phone.bind("mockfeed", "carol", 2, CodePlacement::Bio).await.unwrap();
+
+    // the two-year re-check: a new login, the same secret, the same code on the account
+    let url = phone.recheck_start().await.unwrap();
+    let code = devnet::mock_login(&url, "T-BACKUP-1").await.unwrap();
+    phone.recheck_finish(&code).await.unwrap();
+    assert_eq!(phone.bind("mockfeed", "carol", 2, CodePlacement::Bio).await.unwrap().entry.code, out.entry.code);
+    // someone else's login does not re-check this credential
+    let _other = enrolled(d, "bob", "T-BACKUP-2").await;
+    let url = phone.recheck_start().await.unwrap();
+    let code = devnet::mock_login(&url, "T-BACKUP-2").await.unwrap();
+    match phone.recheck_finish(&code).await {
+        Err(HolderError::Api(e)) => assert_eq!(status(&e), 403, "{e}"),
+        other => panic!("re-check with another person's login: {other:?}"),
+    }
+
+    let code = phone.backup_create().await.unwrap();
+    assert_eq!(code.replace('-', "").len(), 26);
+    assert!(phone.status().unwrap().backup);
+
+    // a new device with the paper code: same secret, so the same pseudonym and code
+    let tablet = holder(d, "carol");
+    assert!(matches!(tablet.restore("AAAAA-AAAAA-AAAAA-AAAAA-AAAAA-A").await, Err(HolderError::NoBackup)));
+    assert!(matches!(tablet.restore("not a code").await, Err(HolderError::NoBackup)));
+    tablet.restore(&code.to_lowercase().replace('-', " ")).await.unwrap();
+    let st = tablet.status().unwrap();
+    assert!(st.enrolled && st.bindings.len() == 1 && st.bindings[0].code == out.entry.code);
+    tablet.renew().await.unwrap();
+    assert_eq!(tablet.bind("mockfeed", "carol", 2, CodePlacement::Bio).await.unwrap().entry.code, out.entry.code);
+    // restoring onto a device that has a credential is refused
+    assert!(matches!(phone.restore(&code).await, Err(HolderError::AlreadyEnrolled)));
+
+    // a new code replaces the old one
+    let code2 = phone.backup_create().await.unwrap();
+    assert_ne!(code, code2);
+    assert!(matches!(holder(d, "carol").restore(&code).await, Err(HolderError::NoBackup)));
+    holder(d, "carol").restore(&code2).await.unwrap();
+
+    // revoking deletes the backup: there is nothing left to restore
+    phone.revoke().await.unwrap();
+    assert!(matches!(holder(d, "carol").restore(&code2).await, Err(HolderError::NoBackup)));
+}
+
+#[tokio::test]
+async fn replacing_the_secret() {
+    let d = net().await;
+    let phone = enrolled(d, "alice", "T-REPLACE-1").await;
+    phone.like("mockfeed", "p1").await.unwrap();
+
+    // a new device has only the eID: the request waits, and the old app sees it and refuses
+    let thief = holder(d, "bob");
+    let url = thief.replace_start().await.unwrap();
+    let code = devnet::mock_login(&url, "T-REPLACE-1").await.unwrap();
+    assert!(matches!(thief.replace_finish(&code).await.unwrap(), pop_holder::ReplaceOutcome::Waiting { .. }));
+    assert!(thief.status().unwrap().replacement_waits_until.is_some());
+    assert!(matches!(thief.replace_claim().await, Err(HolderError::ClaimTooEarly(_))));
+    assert!(phone.pending_replacement().await.unwrap().is_some(), "the old app is warned");
+    let stranger = enrolled(d, "carol", "T-REPLACE-2").await;
+    assert!(stranger.pending_replacement().await.unwrap().is_none(), "nobody else is");
+    assert!(matches!(stranger.veto_replacement().await, Err(HolderError::NoClaim)));
+    phone.veto_replacement().await.unwrap();
+    assert!(phone.pending_replacement().await.unwrap().is_none());
+    // the old secret was never touched
+    phone.renew().await.unwrap();
+
+    // the device that holds the guardian key replaces at once; the new secret starts probation
+    let url = phone.replace_start().await.unwrap();
+    let code = devnet::mock_login(&url, "T-REPLACE-1").await.unwrap();
+    assert!(matches!(phone.replace_finish(&code).await.unwrap(), pop_holder::ReplaceOutcome::Issued { .. }));
+    assert!(matches!(phone.like("mockfeed", "p1").await, Err(HolderError::Probation(_))));
+    let out = phone.bind("mockfeed", "alice", 1, CodePlacement::Bio).await.unwrap();
+    assert!(!out.entry.counted, "a replaced secret is not counted, rollout window or not");
+    phone.renew().await.unwrap();
+    // a person with no enrolment cannot replace anything
+    let nobody = holder(d, "bob");
+    let url = nobody.replace_start().await.unwrap();
+    let code = devnet::mock_login(&url, "T-REPLACE-NOBODY").await.unwrap();
+    assert!(matches!(nobody.replace_finish(&code).await, Err(HolderError::EnrolNotReady(EnrolStatus::NotEnrolled))));
 }

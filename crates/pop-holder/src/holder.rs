@@ -30,6 +30,18 @@ pub enum HolderError {
     KeyChanged,
     #[error("no binding for this account on this device")]
     NoBinding,
+    #[error("likes count from {0}: a new or replaced secret waits nine months first")]
+    Probation(String),
+    #[error("no backup found for this code")]
+    NoBackup,
+    #[error("the backup could not be decrypted: wrong code or damaged backup")]
+    BadBackup,
+    #[error("the issuer gave no backup ticket; a ticket comes with enrolment, re-check and replacement")]
+    NoBackupTicket,
+    #[error("no replacement is waiting")]
+    NoClaim,
+    #[error("the replacement waits until {0}")]
+    ClaimTooEarly(String),
     #[error(transparent)]
     Crypto(#[from] CryptoError),
     #[error(transparent)]
@@ -58,27 +70,33 @@ pub struct Status {
     pub enrolled: bool,
     pub expiry: Option<String>,
     pub counted_from: Option<String>,
+    /// the identity re-check must be done by this day, or the credential stops renewing
+    pub recheck_by: Option<String>,
+    /// an encrypted backup exists
+    pub backup: bool,
+    /// a replacement of the secret asked from this device waits until this day
+    pub replacement_waits_until: Option<String>,
     pub bindings: Vec<LocalBinding>,
     pub liked: usize,
     pub platforms: Vec<&'static str>,
 }
 
 /// Public state fetched from the issuer for one operation.
-struct Ctx {
-    scheme: Arc<Scheme>,
-    issuer_pk: IssuerPublicKey,
-    witness_pk: WitnessPublicKey,
-    today: Day,
+pub(crate) struct Ctx {
+    pub(crate) scheme: Arc<Scheme>,
+    pub(crate) issuer_pk: IssuerPublicKey,
+    pub(crate) witness_pk: WitnessPublicKey,
+    pub(crate) today: Day,
 }
 
 pub struct Holder {
-    issuer: Arc<dyn IssuerApi>,
+    pub(crate) issuer: Arc<dyn IssuerApi>,
     directory: Arc<dyn DirectoryApi>,
     platforms: PlatformRegistry,
-    wallet: Arc<dyn WalletStore>,
+    pub(crate) wallet: Arc<dyn WalletStore>,
     scheme: tokio::sync::OnceCell<(Arc<Scheme>, String, String)>,
     /// one proof at a time, and no interleaved wallet writes
-    busy: tokio::sync::Mutex<()>,
+    pub(crate) busy: tokio::sync::Mutex<()>,
 }
 
 fn nonce() -> String {
@@ -90,7 +108,7 @@ impl Holder {
         Holder { issuer, directory, platforms, wallet, scheme: tokio::sync::OnceCell::new(), busy: tokio::sync::Mutex::new(()) }
     }
 
-    async fn ctx(&self) -> Result<Ctx> {
+    pub(crate) async fn ctx(&self) -> Result<Ctx> {
         let p = self.issuer.params().await?;
         let (scheme, ipk, wpk) = self
             .scheme
@@ -98,7 +116,7 @@ impl Holder {
                 let scheme = Arc::new(Scheme::new(p.config.clone()));
                 for k in &p.statements {
                     // proving keys are public and large: cache them, keyed by the issuer key they belong to
-                    let name = format!("lego-{}-{}.bin", k.name(), pop_crypto::fingerprint(&p.issuer_public_key));
+                    let name = format!("lego2-{}-{}.bin", k.name(), pop_crypto::fingerprint(&p.issuer_public_key));
                     let bytes = match self.wallet.cache_get(&name) {
                         Some(b) => b,
                         None => {
@@ -123,11 +141,11 @@ impl Holder {
         Ok(Ctx { scheme: scheme.clone(), issuer_pk: IssuerPublicKey::from_hex(ipk)?, witness_pk: WitnessPublicKey::from_hex(wpk)?, today: p.today })
     }
 
-    fn credential(state: &WalletState) -> Result<Credential> {
+    pub(crate) fn credential(state: &WalletState) -> Result<Credential> {
         Ok(Credential::from_json(state.credential.as_ref().ok_or(HolderError::NotEnrolled)?)?)
     }
 
-    async fn tree(&self, cx: &Ctx) -> Result<(Arc<RevocationTree>, String)> {
+    pub(crate) async fn tree(&self, cx: &Ctx) -> Result<(Arc<RevocationTree>, String)> {
         let rv = self.issuer.revocations().await?;
         let scheme = cx.scheme.clone();
         let tree = tokio::task::spawn_blocking(move || scheme.revocation_tree(&rv.revoked)).await.map_err(|e| HolderError::Internal(e.to_string()))??;
@@ -148,10 +166,10 @@ impl Holder {
             return Err(HolderError::AlreadyEnrolled);
         }
         let cx = self.ctx().await?;
-        let r = self.issuer.enrol_start().await?;
+        let r = self.issuer.enrol_start(Purpose::Enrol).await?;
         // the secret is drawn here, on the device, before the issuer has seen anything
         let (secrets, _) = BlindRequest::new(&mut OsRng, &cx.scheme, r.session.as_bytes());
-        st.pending = Some(PendingEnrolment { session: r.session, rho: to_hex(&secrets.rho), s: to_hex(&secrets.s), delta: secrets.delta });
+        st.pending = Some(PendingEnrolment { session: r.session, rho: to_hex(&secrets.rho), s: to_hex(&secrets.s), delta: secrets.delta, purpose: Purpose::Enrol, new_guardian_pkcs8: None });
         self.wallet.save(&st)?;
         Ok(r.authorize_url)
     }
@@ -161,7 +179,7 @@ impl Holder {
     pub async fn enrol_finish(&self, confirm_code: &str) -> Result<()> {
         let _g = self.busy.lock().await;
         let mut st = self.wallet.load()?;
-        let p = st.pending.clone().ok_or(HolderError::NoPending)?;
+        let p = st.pending.clone().filter(|p| p.purpose == Purpose::Enrol).ok_or(HolderError::NoPending)?;
         let cx = self.ctx().await?;
         match self.issuer.enrol_status(&p.session).await? {
             EnrolStatus::Authenticated => {}
@@ -189,6 +207,7 @@ impl Holder {
         )?;
         st.credential = Some(cred.to_json());
         st.pending = None;
+        st.backup_ticket = resp.backup_ticket.or(st.backup_ticket.take());
         self.wallet.save(&st)?;
         Ok(())
     }
@@ -240,6 +259,7 @@ impl Holder {
         st.bindings.retain(|b| !(b.platform == platform && (b.account_id == account.account_id || b.slot == slot)));
         st.bindings.push(LocalBinding { platform: platform.into(), account_id: account.account_id, handle: account.handle, slot, code, lease_until: entry.lease_until });
         self.wallet.save(&st)?;
+        self.sync_backup(&st).await;
         Ok(BindOutcome { entry, code_published, publish_note })
     }
 
@@ -266,6 +286,7 @@ impl Holder {
         }
         st.bindings.retain(|x| x != &b);
         self.wallet.save(&st)?;
+        self.sync_backup(&st).await;
         Ok(())
     }
 
@@ -280,6 +301,10 @@ impl Holder {
         let p = self.platforms.get(platform).ok_or_else(|| HolderError::UnknownPlatform(platform.into()))?;
         let post = p.canonical_post_id(raw_post).await?;
         let cx = self.ctx().await?;
+        let counted_from = cred.attrs.certified + dates::PROBATION_DAYS;
+        if counted_from > cx.today {
+            return Err(HolderError::Probation(dates::fmt_day(counted_from)));
+        }
         let (tree, root) = self.tree(&cx).await?;
         let (scheme, ipk, wpk, today, ctx, post2) = (cx.scheme.clone(), cx.issuer_pk.clone(), cx.witness_pk.clone(), cx.today, context_id(platform), post.clone());
         let proof = tokio::task::spawn_blocking(move || scheme.prove_like(&mut OsRng, &cred, &tree, &ipk, &wpk, &ctx, &post2, today))
@@ -316,6 +341,7 @@ impl Holder {
         let new = cx.scheme.finish_renewal(&cx.issuer_pk, &cred, rho, &r.signature, r.new_expiry)?;
         st.credential = Some(new.to_json());
         self.wallet.save(&st)?;
+        self.sync_backup(&st).await;
         Ok(r.new_expiry)
     }
 
@@ -334,6 +360,8 @@ impl Holder {
         st.credential = None;
         st.bindings.clear();
         self.wallet.save(&st)?;
+        // the backup holds a credential that no longer works
+        self.delete_backup(&mut st).await;
         Ok(())
     }
 
@@ -344,6 +372,9 @@ impl Holder {
             enrolled: cred.is_some(),
             expiry: cred.as_ref().map(|c| dates::fmt_day(c.expiry())),
             counted_from: cred.as_ref().map(|c| dates::fmt_day(c.attrs.certified + dates::PROBATION_DAYS)),
+            recheck_by: cred.as_ref().map(|c| dates::fmt_day(c.attrs.last_check + dates::RECHECK_DAYS)),
+            backup: st.backup.is_some(),
+            replacement_waits_until: st.claim.as_ref().map(|c| dates::fmt_day(c.claim_after)),
             bindings: st.bindings,
             liked: st.liked.len(),
             platforms: self.platforms.ids(),

@@ -508,7 +508,12 @@ impl Scheme {
                     bases: vec![output_base("like", ctx, 0, post)],
                     hidden: vec![false],
                 }];
-                let r = vec![Range { label: "tau >= today", terms: vec![(A_TAU, 1)], constant: -(*today as i64) }];
+                // A like counts only from a secret that has passed probation. Without this, replacing
+                // the secret (recovery) would hand out a fresh set of like tags each time.
+                let r = vec![
+                    Range { label: "tau >= today", terms: vec![(A_TAU, 1)], constant: -(*today as i64) },
+                    Range { label: "gamma <= today - 9 months", terms: vec![(A_GAMMA, -1)], constant: *today as i64 - dates::PROBATION_DAYS as i64 },
+                ];
                 (h, r, *today, *root, bind.clone())
             }
             Stmt::Renewal { today, root, bind, .. } => {

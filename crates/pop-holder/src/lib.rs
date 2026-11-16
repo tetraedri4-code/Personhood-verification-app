@@ -17,7 +17,9 @@
 //! [`local_api`] exposes a small HTTP API on 127.0.0.1 for the browser extension.
 pub mod holder;
 pub mod local_api;
+pub mod recovery;
 pub mod wallet;
 
 pub use holder::{BindOutcome, Holder, HolderError, Status};
+pub use recovery::ReplaceOutcome;
 pub use wallet::{FileWallet, MemoryWallet, WalletStore};

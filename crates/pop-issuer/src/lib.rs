@@ -10,12 +10,18 @@
 //! 4. `POST /v1/renew`: blind renewal against a proof; `POST /v1/revoke`: the holder's own revocation,
 //!    signed with the guardian key; `GET /v1/revocations`: the revoked handles and the tree root.
 //!
+//! 5. `POST /v1/recheck`: the two-year identity re-check; `POST /v1/replace` (+ `/claim`, `/pending`,
+//!    `/veto`): replace a lost secret; `POST /v1/backup`, `GET /v1/backup/{id}`: encrypted backups
+//!    (docs/recovery.md).
+//!
 //! The issuer depends on three interfaces only: [`pop_idp::IdentityProvider`], [`UniquenessService`] and
 //! [`pop_storage::Store`]. Swap any of them without touching this crate.
 //!
 //! Enrolment records are keyed by d and carry the version of the uniqueness key d was made under. The
 //! issuer refuses to start if it holds records under a key the uniqueness service no longer has, and
 //! moves a record to the newest key when its owner logs in (docs/uniqueness.md).
+pub mod backup;
+pub mod recovery;
 pub mod service;
 pub mod uniqueness;
 

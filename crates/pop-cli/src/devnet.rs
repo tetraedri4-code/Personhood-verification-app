@@ -22,6 +22,8 @@ pub struct DevnetOpts {
     /// enrolments count at once (rollout window) instead of after nine months of probation
     pub rollout: bool,
     pub uniqueness: UniquenessMode,
+    /// days a replacement without the old guardian key waits (None = the issuer's default, 90)
+    pub replace_wait_days: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,7 +37,7 @@ pub enum UniquenessMode {
 
 impl Default for DevnetOpts {
     fn default() -> Self {
-        DevnetOpts { scheme: SchemeConfig::default(), data_dir: None, ports: [4000, 4001, 4002, 4003], rollout: true, uniqueness: UniquenessMode::Hmac }
+        DevnetOpts { scheme: SchemeConfig::default(), data_dir: None, ports: [4000, 4001, 4002, 4003], rollout: true, uniqueness: UniquenessMode::Hmac, replace_wait_days: None }
     }
 }
 
@@ -195,6 +197,7 @@ pub async fn start(o: DevnetOpts) -> anyhow::Result<Devnet> {
         rollout_certified: rollout,
         uniqueness: uniq_file,
         uniqueness_key: None,
+        replace_wait_days: o.replace_wait_days,
     })
     .await?;
     serve(l_iss, pop_issuer::router(issuer));

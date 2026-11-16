@@ -32,38 +32,45 @@ pub struct IssuerConfig {
     pub rollout_certified: Option<Day>,
     /// override "today" (tests)
     pub clock: Option<Clock>,
+    /// Recovery level 2 without the guardian key: days a replacement waits, during which the old app
+    /// can veto it (docs/recovery.md).
+    pub replace_wait_days: u32,
 }
 
 impl Default for IssuerConfig {
     fn default() -> Self {
-        IssuerConfig { keys_dir: None, provider_code: 1, min_loa: Loa::Substantial, rollout_certified: None, clock: None }
+        IssuerConfig { keys_dir: None, provider_code: 1, min_loa: Loa::Substantial, rollout_certified: None, clock: None, replace_wait_days: 90 }
     }
 }
 
-struct RevState {
-    epoch: u64,
-    revoked: Vec<u64>,
-    root: String,
-    previous_root: Option<String>,
-    tree: pop_crypto::revtree::RevocationTree,
+pub(crate) struct RevState {
+    pub(crate) epoch: u64,
+    pub(crate) revoked: Vec<u64>,
+    pub(crate) root: String,
+    pub(crate) previous_root: Option<String>,
+    pub(crate) tree: pop_crypto::revtree::RevocationTree,
 }
 
 pub struct Issuer {
-    scheme: Arc<Scheme>,
-    key: IssuerKey,
-    witness: WitnessKey,
+    pub(crate) scheme: Arc<Scheme>,
+    pub(crate) key: IssuerKey,
+    pub(crate) witness: WitnessKey,
     lego: HashMap<StatementKind, Vec<u8>>,
     idp: Arc<dyn IdentityProvider>,
-    uniq: Arc<dyn UniquenessService>,
-    store: SharedStore,
-    cfg: IssuerConfig,
-    rev: RwLock<RevState>,
-    rng: Mutex<ChaCha20Rng>,
+    pub(crate) uniq: Arc<dyn UniquenessService>,
+    pub(crate) store: SharedStore,
+    pub(crate) cfg: IssuerConfig,
+    pub(crate) rev: RwLock<RevState>,
+    pub(crate) rng: Mutex<ChaCha20Rng>,
+    /// Held while an enrolment record is read, decided on and written back (revoke, re-check,
+    /// replace, claim, veto), so two requests about one person cannot both act on the old record.
+    /// A deployment with several issuer processes needs compare-and-swap in its store instead.
+    pub(crate) records: tokio::sync::Mutex<()>,
 }
 
-const T_SESSIONS: &str = "enrol_sessions";
+pub(crate) const T_SESSIONS: &str = "enrol_sessions";
 const T_STATES: &str = "enrol_states";
-const T_ENROL: &str = "enrolments";
+pub(crate) const T_ENROL: &str = "enrolments";
 const T_REVOKED: &str = "revoked";
 
 /// An enrolment session lives this long; the identity check and the blind issuance must fit in it.
@@ -71,45 +78,54 @@ const SESSION_TTL_SECS: u64 = 15 * 60;
 const MAX_CONFIRM_ATTEMPTS: u32 = 5;
 const MAX_OPEN_SESSIONS: usize = 10_000;
 
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-struct Session {
+pub(crate) struct Session {
+    /// what the login is for; a session is good for that one endpoint only
+    #[serde(default)]
+    pub(crate) purpose: Purpose,
     /// `state` sent through the browser and the identity provider. It is NOT the session id: the
     /// session id is known only to the holder app, so neither the provider nor anyone who sees the
     /// redirect can finish the enrolment.
-    state: String,
-    created: u64,
+    pub(crate) state: String,
+    pub(crate) created: u64,
     /// shown in the browser after login, typed into the app
-    confirm_code: Option<String>,
-    attempts: u32,
-    nonce: String,
-    status: EnrolStatus,
-    dedup: Option<String>,
+    pub(crate) confirm_code: Option<String>,
+    pub(crate) attempts: u32,
+    pub(crate) nonce: String,
+    pub(crate) status: EnrolStatus,
+    pub(crate) dedup: Option<String>,
     /// uniqueness key version `dedup` was computed under
     #[serde(default)]
-    dedup_version: Option<String>,
-    country: Option<u32>,
-    error: Option<String>,
+    pub(crate) dedup_version: Option<String>,
+    pub(crate) country: Option<u32>,
+    pub(crate) error: Option<String>,
 }
 
 /// Enrolment record d ↦ (r, guardian key, status). The identity code itself is never stored.
 #[derive(Serialize, Deserialize, Clone)]
-struct Enrolment {
-    handle: u64,
-    guardian: String,
-    status: String,
-    enrolled_on: Day,
+pub(crate) struct Enrolment {
+    pub(crate) handle: u64,
+    pub(crate) guardian: String,
+    pub(crate) status: String,
+    pub(crate) enrolled_on: Day,
+    /// day of the last replacement of the secret, if any
+    #[serde(default)]
+    pub(crate) replaced_on: Option<Day>,
+    /// a replacement that waits for its veto period to pass
+    #[serde(default)]
+    pub(crate) pending: Option<crate::recovery::PendingReplace>,
     /// Version of the uniqueness key the record's key d was computed under. d is only comparable with
     /// values made under the same key, so a record without its key is a record nobody can match.
     #[serde(default)]
-    key_version: String,
+    pub(crate) key_version: String,
 }
 
 fn load_or<T>(dir: &Option<PathBuf>, name: &str, make: impl FnOnce() -> (T, Vec<u8>), parse: impl FnOnce(&[u8]) -> Option<T>) -> T {
@@ -143,7 +159,7 @@ impl Issuer {
         let mut lego = HashMap::new();
         if scheme.config.proof_system == pop_crypto::ProofSystem::LegoGroth16 {
             for kind in StatementKind::ALL {
-                let name = format!("lego-{}-d{}.bin", kind.name(), scheme.config.tree_depth);
+                let name = format!("lego2-{}-d{}.bin", kind.name(), scheme.config.tree_depth);
                 let sch = scheme.clone();
                 let bytes = load_or(
                     &cfg.keys_dir,
@@ -163,14 +179,14 @@ impl Issuer {
         let tree = scheme.revocation_tree(&revoked)?;
         check_key_versions(&*uniq, &store).await?;
         let rev = RevState { epoch: 0, root: root_to_hex(&tree.root()), previous_root: None, revoked, tree };
-        Ok(Arc::new(Issuer { scheme, key, witness, lego, idp, uniq, store, cfg, rev: RwLock::new(rev), rng: Mutex::new(rng) }))
+        Ok(Arc::new(Issuer { scheme, key, witness, lego, idp, uniq, store, cfg, rev: RwLock::new(rev), rng: Mutex::new(rng), records: tokio::sync::Mutex::new(()) }))
     }
 
     pub fn today(&self) -> Day {
         self.cfg.clock.as_ref().map(|c| c()).unwrap_or_else(dates::today)
     }
 
-    fn rand_hex(&self, n: usize) -> String {
+    pub(crate) fn rand_hex(&self, n: usize) -> String {
         let mut b = vec![0u8; n];
         self.rng.lock().unwrap().fill_bytes(&mut b);
         hex::encode(b)
@@ -189,11 +205,26 @@ impl Issuer {
         }
     }
 
-    fn attrs_for(&self, handle: u64) -> IssuedAttrs {
+    /// Expiry of a credential issued today: the end of this quarter, or of the next one if fewer
+    /// than 30 days remain.
+    pub(crate) fn expiry_from(today: Day) -> Day {
+        let q = dates::quarter_of(today);
+        if dates::quarter_end(q) - today < 30 { dates::quarter_end(q + 1) } else { dates::quarter_end(q) }
+    }
+
+    pub(crate) fn new_handle(&self) -> u64 {
+        loop {
+            let h = (self.rng.lock().unwrap().next_u64() >> 1).max(1);
+            if !self.rev.read().unwrap().revoked.contains(&h) {
+                break h;
+            }
+        }
+    }
+
+    pub(crate) fn attrs_for(&self, handle: u64) -> IssuedAttrs {
         let today = self.today();
         let q = dates::quarter_of(today);
-        // valid to the end of this quarter, or of the next one if fewer than 30 days remain
-        let expiry = if dates::quarter_end(q) - today < 30 { dates::quarter_end(q + 1) } else { dates::quarter_end(q) };
+        let expiry = Self::expiry_from(today);
         let certified = self.cfg.rollout_certified.unwrap_or_else(|| dates::quarter_start(q));
         IssuedAttrs {
             handle,
@@ -206,7 +237,7 @@ impl Issuer {
         }
     }
 
-    async fn revoke_handle(&self, handle: u64) -> anyhow::Result<()> {
+    pub(crate) async fn revoke_handle(&self, handle: u64) -> anyhow::Result<()> {
         self.store.put(T_REVOKED, &handle.to_string(), json!({"on": self.today()})).await?;
         let mut rv = self.rev.write().unwrap();
         if rv.revoked.contains(&handle) {
@@ -260,9 +291,10 @@ async fn check_key_versions(uniq: &dyn UniquenessService, store: &SharedStore) -
 }
 
 /// Outcome of looking a person up under every live key version.
-enum Lookup {
+pub(crate) enum Lookup {
     New(DedupKey),
-    Enrolled,
+    /// the person's record, under the newest key
+    Enrolled(DedupKey),
 }
 
 impl Issuer {
@@ -291,7 +323,7 @@ impl Issuer {
                 self.store.delete(T_ENROL, &k.d).await?;
                 tracing::info!("migrated an enrolment record from key version {from} to {}", current.version);
             }
-            return Ok(Lookup::Enrolled);
+            return Ok(Lookup::Enrolled(current));
         }
         Ok(Lookup::New(current))
     }
@@ -312,7 +344,7 @@ impl Issuer {
 
 // ------------------------------------------------------------------ HTTP
 
-pub struct ApiErr(StatusCode, String);
+pub struct ApiErr(pub(crate) StatusCode, pub(crate) String);
 
 impl IntoResponse for ApiErr {
     fn into_response(self) -> Response {
@@ -326,11 +358,11 @@ impl<E: std::fmt::Display> From<E> for ApiErr {
     }
 }
 
-fn err(code: StatusCode, msg: impl Into<String>) -> ApiErr {
+pub(crate) fn err(code: StatusCode, msg: impl Into<String>) -> ApiErr {
     ApiErr(code, msg.into())
 }
 
-type St = Arc<Issuer>;
+pub(crate) type St = Arc<Issuer>;
 
 pub fn router(issuer: Arc<Issuer>) -> Router {
     Router::new()
@@ -343,6 +375,13 @@ pub fn router(issuer: Arc<Issuer>) -> Router {
         .route("/v1/renew", post(renew))
         .route("/v1/revocations", get(revocations))
         .route("/v1/revoke", post(revoke))
+        .route("/v1/recheck", post(crate::recovery::recheck))
+        .route("/v1/replace", post(crate::recovery::replace))
+        .route("/v1/replace/claim", post(crate::recovery::claim))
+        .route("/v1/replace/pending", get(crate::recovery::pending))
+        .route("/v1/replace/veto", post(crate::recovery::veto))
+        .route("/v1/backup", post(crate::backup::put))
+        .route("/v1/backup/:id", get(crate::backup::get))
         .with_state(issuer)
 }
 
@@ -356,7 +395,7 @@ async fn lego(State(s): State<St>, Path(name): Path<String>) -> Result<Response,
     Ok(([(header::CONTENT_TYPE, "application/octet-stream")], b.clone()).into_response())
 }
 
-async fn drop_session(s: &Issuer, id: &str, sess: &Session) -> Result<(), ApiErr> {
+pub(crate) async fn drop_session(s: &Issuer, id: &str, sess: &Session) -> Result<(), ApiErr> {
     s.store.delete(T_STATES, &sess.state).await?;
     s.store.delete(T_SESSIONS, id).await?;
     Ok(())
@@ -376,7 +415,9 @@ async fn sweep_sessions(s: &Issuer) -> Result<usize, ApiErr> {
     Ok(live)
 }
 
-async fn enrol_start(State(s): State<St>) -> Result<Json<EnrolStartResponse>, ApiErr> {
+async fn enrol_start(State(s): State<St>, body: axum::body::Bytes) -> Result<Json<EnrolStartResponse>, ApiErr> {
+    // an empty body is the plain enrolment of older clients
+    let purpose = if body.iter().all(|b| b.is_ascii_whitespace()) { Purpose::Enrol } else { serde_json::from_slice::<EnrolStartRequest>(&body)?.purpose };
     if sweep_sessions(&s).await? >= MAX_OPEN_SESSIONS {
         return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many enrolments in progress; try again in a few minutes"));
     }
@@ -384,7 +425,7 @@ async fn enrol_start(State(s): State<St>) -> Result<Json<EnrolStartResponse>, Ap
     let state = s.rand_hex(16);
     let nonce = s.rand_hex(16);
     let url = s.idp.authorization_url(&state, &nonce).await?;
-    let sess = Session { state: state.clone(), created: now_secs(), confirm_code: None, attempts: 0, nonce, status: EnrolStatus::WaitingForLogin, dedup: None, dedup_version: None, country: None, error: None };
+    let sess = Session { purpose, state: state.clone(), created: now_secs(), confirm_code: None, attempts: 0, nonce, status: EnrolStatus::WaitingForLogin, dedup: None, dedup_version: None, country: None, error: None };
     s.store.put(T_SESSIONS, &session, serde_json::to_value(sess)?).await?;
     s.store.put(T_STATES, &state, json!(session)).await?;
     Ok(Json(EnrolStartResponse { session, authorize_url: url }))
@@ -397,7 +438,7 @@ struct CallbackQ {
     error: Option<String>,
 }
 
-async fn load_session(s: &Issuer, id: &str) -> Result<Session, ApiErr> {
+pub(crate) async fn load_session(s: &Issuer, id: &str) -> Result<Session, ApiErr> {
     let v = s.store.get(T_SESSIONS, id).await?.ok_or_else(|| err(StatusCode::NOT_FOUND, "unknown session"))?;
     let sess: Session = serde_json::from_value(v)?;
     if now_secs().saturating_sub(sess.created) > SESSION_TTL_SECS {
@@ -432,20 +473,30 @@ async fn enrol_callback(State(s): State<St>, Query(q): Query<CallbackQ>) -> Resu
         Ok(id) => {
             // d is all we keep; `id.subject` goes out of scope here
             let found = s.lookup_and_migrate(id.country, &id.subject).await?;
-            let exists = matches!(found, Lookup::Enrolled);
-            sess.status = if exists { EnrolStatus::AlreadyEnrolled } else { EnrolStatus::Authenticated };
-            if let Lookup::New(k) = found {
+            let (exists, k) = match found {
+                Lookup::New(k) => (false, k),
+                Lookup::Enrolled(k) => (true, k),
+            };
+            sess.country = Some(id.country);
+            // enrolment needs a new person; a re-check or a replacement needs an enrolled one
+            if exists == (sess.purpose != Purpose::Enrol) {
+                sess.status = EnrolStatus::Authenticated;
                 sess.dedup = Some(k.d);
                 sess.dedup_version = Some(k.version);
-            }
-            sess.country = Some(id.country);
-            if exists {
-                "This person is already enrolled. Use your existing device."
-            } else {
                 let code = format!("{:06}", s.rng.lock().unwrap().next_u32() % 1_000_000);
                 sess.confirm_code = Some(code.clone());
                 shown = Some(code);
-                "Identity checked."
+                match sess.purpose {
+                    Purpose::Enrol => "Identity checked.",
+                    Purpose::Recheck => "Identity checked for the two-year re-check.",
+                    Purpose::Replace => "Identity checked. You asked to REPLACE your secret: the old app and its badges stop working. If you did not ask for this, close this page.",
+                }
+            } else if exists {
+                sess.status = EnrolStatus::AlreadyEnrolled;
+                "This person is already enrolled. Use your existing device, restore your backup, or ask the app to replace a lost secret."
+            } else {
+                sess.status = EnrolStatus::NotEnrolled;
+                "This person is not enrolled yet. Enrol first."
             }
         }
         Err(e) => {
@@ -469,41 +520,10 @@ async fn enrol_status(State(s): State<St>, Query(q): Query<StatusQ>) -> Result<J
 }
 
 async fn enrol_finish(State(s): State<St>, Json(req): Json<EnrolFinishRequest>) -> Result<Json<IssuanceResponse>, ApiErr> {
-    let mut sess = load_session(&s, &req.session).await?;
-    match sess.status {
-        EnrolStatus::Authenticated => {}
-        EnrolStatus::AlreadyEnrolled => return Err(err(StatusCode::CONFLICT, "already enrolled")),
-        _ => return Err(err(StatusCode::CONFLICT, format!("session not ready: {:?}", sess.status))),
-    }
-    sess.attempts += 1;
-    if sess.attempts > MAX_CONFIRM_ATTEMPTS {
-        drop_session(&s, &req.session, &sess).await?;
-        return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many wrong codes; start again"));
-    }
-    s.store.put(T_SESSIONS, &req.session, serde_json::to_value(&sess)?).await?;
-    if !ct_eq(sess.confirm_code.as_deref().unwrap_or_default().as_bytes(), req.confirm_code.trim().as_bytes()) || sess.confirm_code.is_none() {
-        return Err(err(StatusCode::FORBIDDEN, "wrong confirmation code"));
-    }
-    let g = hex::decode(&req.guardian_public_key)?;
-    if g.len() != 32 {
-        return Err(err(StatusCode::BAD_REQUEST, "guardian key must be an Ed25519 public key"));
-    }
-    let (Some(d), Some(key_version)) = (sess.dedup.clone(), sess.dedup_version.clone()) else {
-        return Err(err(StatusCode::CONFLICT, "session has no deduplication key; start again"));
-    };
-    // the key may have been rotated between login and finish; a record under a retired key would be
-    // an orphan, so the person starts again under the current key
-    if s.uniq.versions().await.ok().and_then(|v| v.first().cloned()).as_deref() != Some(key_version.as_str()) {
-        drop_session(&s, &req.session, &sess).await?;
-        return Err(err(StatusCode::CONFLICT, "the uniqueness key changed during enrolment; start again"));
-    }
-    let handle = loop {
-        let h = (s.rng.lock().unwrap().next_u64() >> 1).max(1);
-        if !s.rev.read().unwrap().revoked.contains(&h) {
-            break h;
-        }
-    };
-    let rec = Enrolment { handle, guardian: req.guardian_public_key.clone(), status: "active".into(), enrolled_on: s.today(), key_version };
+    let (sess, d, key_version) = authenticated_session(&s, &req.session, Purpose::Enrol, &req.confirm_code).await?;
+    check_guardian_key(&req.guardian_public_key)?;
+    let handle = s.new_handle();
+    let rec = Enrolment { handle, guardian: req.guardian_public_key.clone(), status: "active".into(), enrolled_on: s.today(), replaced_on: None, pending: None, key_version };
     // atomic: two sessions of one person cannot both get through
     if !s.store.insert_new(T_ENROL, &d, serde_json::to_value(&rec)?).await? {
         return Err(err(StatusCode::CONFLICT, "already enrolled"));
@@ -524,21 +544,67 @@ async fn enrol_finish(State(s): State<St>, Json(req): Json<EnrolFinishRequest>) 
     // the session held the deduplication key; nothing links this enrolment to a login after this
     drop_session(&s, &req.session, &sess).await?;
     tracing::info!("enrolled a new person (handle logged, identity not stored)");
-    Ok(Json(IssuanceResponse { signature: sig, attrs, handle_signature: hs.to_hex() }))
+    let backup_ticket = Some(crate::backup::new_ticket(&s).await?);
+    Ok(Json(IssuanceResponse { signature: sig, attrs, handle_signature: hs.to_hex(), backup_ticket }))
+}
+
+pub(crate) fn check_guardian_key(hex_key: &str) -> Result<(), ApiErr> {
+    if hex::decode(hex_key)?.len() != 32 {
+        return Err(err(StatusCode::BAD_REQUEST, "guardian key must be an Ed25519 public key"));
+    }
+    Ok(())
+}
+
+/// Load a session that passed its identity check for `purpose`, count the attempt and check the
+/// confirmation code. Returns the session, the person's deduplication key and its key version.
+pub(crate) async fn authenticated_session(s: &Issuer, id: &str, purpose: Purpose, confirm_code: &str) -> Result<(Session, String, String), ApiErr> {
+    let mut sess = load_session(s, id).await?;
+    if sess.purpose != purpose {
+        return Err(err(StatusCode::CONFLICT, format!("this session was opened for {:?}, not {:?}", sess.purpose, purpose)));
+    }
+    match sess.status {
+        EnrolStatus::Authenticated => {}
+        EnrolStatus::AlreadyEnrolled => return Err(err(StatusCode::CONFLICT, "already enrolled")),
+        EnrolStatus::NotEnrolled => return Err(err(StatusCode::CONFLICT, "not enrolled")),
+        _ => return Err(err(StatusCode::CONFLICT, format!("session not ready: {:?}", sess.status))),
+    }
+    sess.attempts += 1;
+    if sess.attempts > MAX_CONFIRM_ATTEMPTS {
+        drop_session(s, id, &sess).await?;
+        return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many wrong codes; start again"));
+    }
+    s.store.put(T_SESSIONS, id, serde_json::to_value(&sess)?).await?;
+    if sess.confirm_code.is_none() || !ct_eq(sess.confirm_code.as_deref().unwrap_or_default().as_bytes(), confirm_code.trim().as_bytes()) {
+        return Err(err(StatusCode::FORBIDDEN, "wrong confirmation code"));
+    }
+    let (Some(d), Some(key_version)) = (sess.dedup.clone(), sess.dedup_version.clone()) else {
+        return Err(err(StatusCode::CONFLICT, "session has no deduplication key; start again"));
+    };
+    // the key may have been rotated between login and now; a record under a retired key would be
+    // an orphan, so the person starts again under the current key
+    if s.uniq.versions().await.ok().and_then(|v| v.first().cloned()).as_deref() != Some(key_version.as_str()) {
+        drop_session(s, id, &sess).await?;
+        return Err(err(StatusCode::CONFLICT, "the uniqueness key changed in the meantime; start again"));
+    }
+    Ok((sess, d, key_version))
+}
+
+/// A proof's date must be within a day of the issuer's, and its revocation root the current or the
+/// previous one.
+pub(crate) fn check_date_and_root(s: &Issuer, proof_today: Day, proof_root: &str, current_only: bool) -> Result<pop_crypto::params::Fr, ApiErr> {
+    if proof_today.abs_diff(s.today()) > 1 {
+        return Err(err(StatusCode::BAD_REQUEST, "date out of window"));
+    }
+    let rv = s.rev.read().unwrap();
+    if proof_root != rv.root && (current_only || Some(proof_root) != rv.previous_root.as_deref()) {
+        return Err(err(StatusCode::CONFLICT, "stale revocation root; fetch /v1/revocations"));
+    }
+    Ok(pop_crypto::root_from_hex(proof_root)?)
 }
 
 async fn renew(State(s): State<St>, Json(req): Json<RenewRequest>) -> Result<Json<RenewResponse>, ApiErr> {
     let today = s.today();
-    if req.today.abs_diff(today) > 1 {
-        return Err(err(StatusCode::BAD_REQUEST, "date out of window"));
-    }
-    {
-        let rv = s.rev.read().unwrap();
-        if req.revocation_root != rv.root && Some(&req.revocation_root) != rv.previous_root.as_ref() {
-            return Err(err(StatusCode::CONFLICT, "stale revocation root; fetch /v1/revocations"));
-        }
-    }
-    let root = pop_crypto::root_from_hex(&req.revocation_root)?;
+    let root = check_date_and_root(&s, req.today, &req.revocation_root, false)?;
     let new_expiry = dates::quarter_end(dates::quarter_of(today) + 1);
     let vc = VerifyCtx { issuer: &s.key.public, witness: &s.witness.public, today: req.today, revocation_root: root };
     let sig: BlindSignature = {
@@ -553,6 +619,7 @@ async fn revocations(State(s): State<St>) -> Json<Revocations> {
 }
 
 async fn revoke(State(s): State<St>, Json(req): Json<RevokeRequest>) -> Result<Json<serde_json::Value>, ApiErr> {
+    let _g = s.records.lock().await;
     let found = s
         .store
         .list(T_ENROL)
@@ -567,6 +634,7 @@ async fn revoke(State(s): State<St>, Json(req): Json<RevokeRequest>) -> Result<J
         .map_err(|_| err(StatusCode::UNAUTHORIZED, "bad guardian signature"))?;
     let mut rec: Enrolment = serde_json::from_value(v)?;
     rec.status = "revoked".into();
+    // the holder gave the secret up; a waiting replacement stays, it is how the person comes back
     s.store.put(T_ENROL, &d, serde_json::to_value(rec)?).await?;
     s.revoke_handle(req.handle).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(json!({"revoked": true})))

@@ -24,3 +24,6 @@ ring.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+reqwest.workspace = true

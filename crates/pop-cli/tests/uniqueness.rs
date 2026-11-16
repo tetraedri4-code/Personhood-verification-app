@@ -13,7 +13,7 @@ fn scheme() -> SchemeConfig {
 }
 
 fn opts(dir: &Path, uniqueness: UniquenessMode) -> DevnetOpts {
-    DevnetOpts { scheme: scheme(), data_dir: Some(dir.to_path_buf()), ports: [0; 4], rollout: true, uniqueness }
+    DevnetOpts { scheme: scheme(), data_dir: Some(dir.to_path_buf()), ports: [0; 4], rollout: true, uniqueness, replace_wait_days: None }
 }
 
 fn tmp(name: &str) -> PathBuf {
@@ -46,6 +46,7 @@ fn issuer_file(dir: &Path) -> IssuerFile {
         rollout_certified: None,
         uniqueness: UniquenessFile::Hmac,
         uniqueness_key: None,
+        replace_wait_days: None,
     }
 }
 

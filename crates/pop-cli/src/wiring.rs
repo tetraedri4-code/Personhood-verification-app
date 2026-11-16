@@ -35,6 +35,10 @@ pub struct IssuerFile {
     /// `data_dir/uniqueness-keys/`. It counts as the oldest key.
     #[serde(default)]
     pub uniqueness_key: Option<String>,
+    /// Days a replacement of a lost secret waits when the old guardian key did not sign it; the old
+    /// app can refuse it in that time. Default 90.
+    #[serde(default)]
+    pub replace_wait_days: Option<u32>,
 }
 
 /// The `uniqueness` section of the issuer configuration.
@@ -191,6 +195,7 @@ pub async fn build_issuer(f: &IssuerFile) -> anyhow::Result<Arc<Issuer>> {
         min_loa,
         rollout_certified: f.rollout_certified.as_deref().map(parse_day).transpose()?,
         clock: None,
+        replace_wait_days: f.replace_wait_days.unwrap_or(90),
     };
     Issuer::new(scheme, idp, uniq, db, cfg).await
 }

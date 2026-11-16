@@ -66,8 +66,8 @@ impl IssuerApi for HttpClient {
     async fn lego_keys(&self, kind: StatementKind) -> Result<Vec<u8>, ApiError> {
         self.get_bytes(&format!("/v1/params/lego/{}", kind.name())).await
     }
-    async fn enrol_start(&self) -> Result<EnrolStartResponse, ApiError> {
-        self.post("/v1/enrol/start", &serde_json::json!({})).await
+    async fn enrol_start(&self, purpose: Purpose) -> Result<EnrolStartResponse, ApiError> {
+        self.post("/v1/enrol/start", &EnrolStartRequest { purpose }).await
     }
     async fn enrol_status(&self, session: &str) -> Result<EnrolStatus, ApiError> {
         self.get(&format!("/v1/enrol/status?session={}", enc(session))).await
@@ -84,6 +84,29 @@ impl IssuerApi for HttpClient {
     async fn revoke(&self, req: &RevokeRequest) -> Result<(), ApiError> {
         let _: serde_json::Value = self.post("/v1/revoke", req).await?;
         Ok(())
+    }
+    async fn identity_recheck(&self, req: &RecheckRequest) -> Result<RecheckResponse, ApiError> {
+        self.post("/v1/recheck", req).await
+    }
+    async fn replace(&self, req: &ReplaceRequest) -> Result<ReplaceResponse, ApiError> {
+        self.post("/v1/replace", req).await
+    }
+    async fn replace_claim(&self, req: &ClaimRequest) -> Result<IssuanceResponse, ApiError> {
+        self.post("/v1/replace/claim", req).await
+    }
+    async fn replace_pending(&self) -> Result<PendingReplacements, ApiError> {
+        self.get("/v1/replace/pending").await
+    }
+    async fn replace_veto(&self, req: &VetoRequest) -> Result<(), ApiError> {
+        let _: serde_json::Value = self.post("/v1/replace/veto", req).await?;
+        Ok(())
+    }
+    async fn backup_put(&self, req: &BackupPut) -> Result<Option<String>, ApiError> {
+        let v: serde_json::Value = self.post("/v1/backup", req).await?;
+        Ok(v["ticket"].as_str().map(String::from))
+    }
+    async fn backup_get(&self, id: &str) -> Result<BackupBlob, ApiError> {
+        self.get(&format!("/v1/backup/{}", enc(id))).await
     }
 }
 
