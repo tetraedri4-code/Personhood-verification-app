@@ -1,0 +1,26 @@
+[package]
+name = "pop-issuer"
+description = "Issuer service: enrolment through an identity provider, uniqueness check, blind issuance, renewal, revocation list"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pop-crypto.workspace = true
+pop-protocol.workspace = true
+pop-storage.workspace = true
+pop-idp.workspace = true
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+hex.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+ring.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true

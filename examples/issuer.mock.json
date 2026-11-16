@@ -1,0 +1,19 @@
+{
+  "data_dir": "./data/issuer",
+  "scheme": { "proof_system": "LegoGroth16", "tree_depth": 8, "slots": 3, "bp_gens_log2": 14 },
+  "provider_code": 1,
+  "rollout_certified": "2025-10-01",
+  "oidc": {
+    "name": "mock-idp",
+    "issuer": "http://127.0.0.1:4001",
+    "client_id": "pop-issuer",
+    "client_secret": "mock-secret",
+    "redirect_uri": "http://127.0.0.1:4002/v1/enrol/callback",
+    "scopes": "openid",
+    "subject_claim": "hetu",
+    "country": 246,
+    "acr_map": { "mock:loa:high": "high" },
+    "acr_values": null,
+    "min_loa": "substantial"
+  }
+}

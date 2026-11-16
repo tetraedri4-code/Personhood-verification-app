@@ -1,0 +1,19 @@
+[package]
+name = "pop-mock-idp"
+description = "Local mock identity provider speaking OpenID Connect, with fake Finnish test identities"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+jsonwebtoken.workspace = true
+ring.workspace = true
+base64.workspace = true
+url.workspace = true
+rand.workspace = true
+hex.workspace = true
+sha2.workspace = true

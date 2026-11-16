@@ -1,0 +1,18 @@
+[package]
+name = "pop-directory"
+description = "Directory service: verifies binding and like proofs, publishes the list of verified accounts and like counts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pop-crypto.workspace = true
+pop-protocol.workspace = true
+pop-storage.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+anyhow.workspace = true

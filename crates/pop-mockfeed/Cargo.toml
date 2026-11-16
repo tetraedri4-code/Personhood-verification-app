@@ -1,0 +1,14 @@
+[package]
+name = "pop-mockfeed"
+description = "A tiny local social network (mock feed) with bios, posts, likes and a simulated like farm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+rand.workspace = true

@@ -1,0 +1,19 @@
+{
+  "data_dir": "/var/lib/pop/issuer",
+  "scheme": { "proof_system": "LegoGroth16", "tree_depth": 12, "slots": 3, "bp_gens_log2": 14 },
+  "provider_code": 2,
+  "rollout_certified": null,
+  "oidc": {
+    "name": "ftn-broker",
+    "issuer": "https://REPLACE-with-the-brokers-issuer-url",
+    "client_id": "REPLACE",
+    "client_secret": "REPLACE-and-keep-this-file-private",
+    "redirect_uri": "https://issuer.example.org/v1/enrol/callback",
+    "scopes": "openid REPLACE-with-the-scope-for-the-identity-code",
+    "subject_claim": "REPLACE-with-the-claim-that-holds-the-identity-code",
+    "country": 246,
+    "acr_map": { "REPLACE-with-the-brokers-acr-value": "substantial" },
+    "acr_values": null,
+    "min_loa": "substantial"
+  }
+}

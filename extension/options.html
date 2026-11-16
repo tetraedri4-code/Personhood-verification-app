@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Personhood badges: options</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 34rem; margin: 2rem auto; padding: 0 1rem; }
+  label { display: block; margin: 1rem 0 .25rem; font-weight: 600; }
+  input[type=text], input[type=password] { width: 100%; padding: .45rem; font: inherit; box-sizing: border-box; }
+  .check { display: flex; gap: .6rem; align-items: flex-start; font-weight: 400; }
+  p.note { color: GrayText; margin: .25rem 0 0; font-size: .9em; }
+  button { margin-top: 1.2rem; padding: .5rem 1.2rem; font: inherit; }
+  #out { margin-top: 1rem; white-space: pre-wrap; }
+</style>
+<h1>Personhood badges</h1>
+<label for="directoryUrl">Directory address</label>
+<input type="text" id="directoryUrl">
+<p class="note">The public list of verified accounts and like counts. Downloaded whole; the directory is never asked about a single account or post.</p>
+<label for="holderUrl">Holder app address</label>
+<input type="text" id="holderUrl">
+<p class="note">Your own app on this computer. It holds your secret; this extension does not.</p>
+<label for="token">Pairing token</label>
+<input type="password" id="token" autocomplete="off">
+<p class="note">Shown by the holder app when it starts.</p>
+<label class="check"><input type="checkbox" id="reportLikes"><span>Report my likes with a one-per-person tag.
+  <span class="note">Off by default. A report shows that some enrolled person liked the post. It carries no account and no pseudonym, and reports for different posts cannot be linked to each other. A like can reveal opinions, so this needs your explicit choice.</span></span></label>
+<button id="save">Save</button> <button id="test">Test holder app</button>
+<div id="out" role="status"></div>
+<script src="options.js"></script>
+</html>

@@ -1,0 +1,21 @@
+[package]
+name = "pop-holder"
+description = "The holder app core: keeps the secret, enrols, binds accounts, reports likes. Independent of the identity provider, the servers and the platforms"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pop-crypto.workspace = true
+pop-protocol.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+rand.workspace = true
+hex.workspace = true
+ring.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
