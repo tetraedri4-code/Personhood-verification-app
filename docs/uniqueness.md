@@ -79,11 +79,13 @@ the older files. The issuer will not start without them while records remain und
 `uniqueness.keys` in the issuer configuration (last entry = current), restart the issuer. The operators
 keep their shares of the old key.
 
-**When can an old key be retired?** When `pop uniqueness records` shows no records under it. People only
-log in when they enrol a new device, so records of people who never come back stay under the old key.
-In the full design the two-year identity re-check brings everyone back; this prototype has no re-check
-yet, so in practice old keys stay. Rotating a key is for a suspected leak, not routine. For routine
-hygiene of a shared key use a **refresh** (below), which changes every share and no d.
+**When can an old key be retired?** When `pop uniqueness records` shows no records under it. A record moves
+when its owner logs in.
+The two-year identity re-check ([recovery.md](recovery.md) §1) brings every active person back within
+two years, and their record moves then. Records of people who never return stay under the old key, so
+keep it; `pop uniqueness records` shows how many are left. Rotating a key is for a suspected leak, not
+routine. For routine hygiene of a shared key use a **refresh** (below), which changes every share and
+no d.
 
 ## 3. The threshold service
 
@@ -122,14 +124,13 @@ answers 503 for everyone and enrols nobody twice.
 
 ### Running it
 
-Each operator is its own server with its own share file and three tokens:
+Each operator is its own server with its own state file and two tokens:
 
 ```json
 {
   "index": 1,
   "eval_token": "…the issuer's token for this operator…",
   "admin_token": "…this operator's administrator…",
-  "peer_token": "…shared by the operators…",
   "state_file": "/var/lib/pop/uniqueness/shares.json",
   "max_evals_per_minute": 120,
   "min_threshold": 2
@@ -143,19 +144,42 @@ pop uniqueness operator --config operator1.json --listen 127.0.0.1:4101
 `index` is the operator's number in the sharing (1, 2, 3, …); it never changes and is never reused.
 Put each operator behind a TLS reverse proxy. The clients refuse plain http except on loopback.
 
-The administrator's side takes a **cluster file**, a JSON list of `{ "index", "url", "admin_token" }`:
+At its first start an operator makes an **identity key** and keeps it in the state file next to its
+shares. `GET /v1/public` shows the public half. Operators have no shared secret: a message between
+operators counts only if it is signed with the identity key that the round names for its sender, and
+a sub-share is encrypted to the identity key of the operator it is for. Give the other administrators
+your operator's identity key over a channel you trust (it is 192 hex characters), and pin theirs.
+
+**Operators with different administrators.** Nobody needs anyone else's admin token.
+
+```sh
+# one administrator writes the round and sends the file to the others
+pop uniqueness round new-dkg     --members members.json --threshold 2 --out round.json
+pop uniqueness round new-reshare --key <Y> --from members.json --to new-members.json --threshold 2 --out round.json
+
+# every administrator reads it, then joins with their own operator
+pop uniqueness round show --spec round.json
+pop uniqueness round join --spec round.json --operator my-operator.json
+```
+
+`members.json` is a list of `{ "index", "url", "identity" }`. With `identity` left out, the key the
+operator publishes at that address is taken on trust. `my-operator.json` is `{ "index", "url",
+"admin_token" }` of your own operator. `join` approves the round at your operator and keeps it moving;
+it returns when the round is done at your operator, has failed (and says who is at fault, if the
+evidence names someone), or the timeout passes. `new-reshare` with the same members in `--from` and
+`--to` is a refresh.
+
+**One party runs every operator** (the demo, tests, a first deployment). A **cluster file** is a list
+of `{ "index", "url", "admin_token" }`:
 
 ```sh
 pop uniqueness dkg      --cluster ops.json --threshold 2          # new key; prints the group key Y
 pop uniqueness status   --cluster ops.json                        # epochs, thresholds, evaluation counts
 pop uniqueness refresh  --cluster ops.json --key <Y>              # new shares, old ones erased
 pop uniqueness reshare  --key <Y> --from ops.json --to new-ops.json --threshold 2
-pop uniqueness finalize --key <Y> --epoch <n> --cluster new-ops.json --leavers old-ops.json
 ```
 
-`reshare` erases the old shares at the operators named in `--from` and `--to` once the new epoch is
-verified. If you dealt with fewer than all holders, name the rest under `finalize --leavers`.
-`--keep-old` skips the erasing.
+These run the same round as `round join`, for all operators at once.
 
 Issuer configuration:
 
@@ -179,54 +203,76 @@ operator, and a second enrolment refused afterwards. `pop demo --uniqueness hmac
 
 ### How a round works
 
-A round is run by the administrators and is all-or-nothing.
+A round is described by a **spec**: kind (key generation or reshare), dealers, receivers, their
+addresses and identity keys, the new threshold, and for a reshare the group key, the epoch dealt from
+and the dealers' verification keys. The round's id is a hash of the spec, and every message is signed
+over that id. An operator takes part only in a round its own administrator approved, and checks the
+spec against its own records first. A newcomer, which has no records, checks that the dealers'
+verification keys combine to Y.
 
-1. `start`: every participant gets the same description of the round. Each checks it against its own
-   records. A newcomer, which has no records, checks that the dealers' public verification keys combine
-   to Y.
-2. `deal`: every dealer picks a random polynomial, sends each receiver its value at the receiver's
-   index, and publishes commitments to the coefficients (Feldman). In a reshare the constant term is
-   the dealer's current share, and its commitment must equal the dealer's published verification key.
-   In key generation the constant term is random.
-3. Each receiver checks its value against the commitments.
-4. `status`: the administrators compare what every receiver saw. A dealer who sent different
-   commitments to different receivers, or anyone who dealt in a dealer's name, shows up here and the
-   round is aborted.
-5. `commit`: each receiver adds up its values into a new share, computes everyone's new verification
-   key, checks that Y did not change, and writes the share to disk. The old share is still there.
-6. The administrator checks from public data that the new epoch is complete and combines to Y.
-7. `finalize`: older shares are erased. This is the only step that cannot be undone, and an operator
-   refuses it for an epoch it does not hold unless told it is leaving.
+1. **Commit.** Every dealer picks a random polynomial and sends everyone a hash of its Feldman
+   commitments. Nobody shows anything else until it holds every dealer's hash, so no dealer can choose
+   its contribution after seeing the others'.
+2. **Deal.** Every dealer sends each receiver the commitments and the polynomial's value at the
+   receiver's index, encrypted to the receiver, with a proof that the dealer made the ciphertext
+   itself. The receiver checks the hash, the value against the commitments, and
+   - key generation: a proof that the dealer knows its contribution (no "rogue key");
+   - reshare: that the constant term's commitment is the dealer's published verification key, so the
+     dealer shares its real share.
+3. **Complaint.** A receiver that gets a bad deal publishes the dealer's signed commit and deal, and
+   opens the ciphertext with a proof that it used its own key. Every operator checks the evidence for
+   itself. Either the dealer is convicted, or the complaint does not hold and the complainer is. A
+   ciphertext that is malformed convicts its dealer as it stands, and the receiver opens nothing.
+4. **Ready.** A receiver whose deals all check out says so, with a hash over every dealer's commit and
+   the signed commits themselves. If two operators hold different commits from one dealer, both now
+   have the two signatures and name that dealer. A ready message whose hash its own evidence does
+   not explain convicts its sender.
+5. **Store.** When every receiver is ready with the same hash, each adds up its values into a new
+   share, computes everyone's new verification key, checks that Y did not change, writes the share to
+   disk and says so.
+6. **Erase.** When every receiver has confirmed that its new share is on disk, each operator erases
+   its older shares of the key by itself. An operator that left erases its last one.
 
-If a commit fails part-way, the receivers that committed discard the new epoch and everything is as
-before. Between commit and finalize operators answer under both epochs, so evaluations never stop.
+A round that fails or stalls before step 5 changes nothing. One that stalls after step 5 leaves the
+new epoch at some operators: nothing was erased, the old epoch still works everywhere, operators
+answer under both, and the next successful round supersedes the leftover. A failure that names an
+operator says `operator N is at fault; run the round again without it`.
+
+After an operator **restarts in the middle of a round**, start a new round. A round lives in memory;
+an operator that came back would commit to a new polynomial under the old round's id and be named as
+having signed two commits.
 
 ### Tests
 
 `cargo test -p pop-uniqueness` runs real operators on loopback ports: d unchanged through refresh,
 operator replacement and a new threshold; fewer than t operators fail; an unreachable or lying operator
-is tolerated; a forged deal aborts the round; a failed commit is undone; shares survive a restart; every
+is tolerated; messages need the sender's signature; a round runs with each administrator driving only
+their own operator; a dealer that sends a wrong value, a receiver that complains falsely, a dealer
+that shows two receivers different polynomials, a receiver that lies about what it saw and a dealer
+that copies a ciphertext are each named; a stalled round loses nothing; shares survive a restart; every
 endpoint refuses the wrong token. `cargo test -p pop-cli --test uniqueness` covers the issuer: refusal
 to start, rotation with migration, and the threshold service behind a full enrolment.
 
 ## 4. Limits of this prototype
 
-- **One coordinator holds every admin token** in the `pop uniqueness` commands. Operators that distrust
-  each other should each run the steps against their own operator and compare the transcripts of step 4
-  themselves. The operator API allows it; the command line does not do it yet.
-- **Key generation is the simple Feldman scheme.** A dealer can bias the key (not learn it), and there
-  is no complaint phase: a misbehaving dealer can only make rounds fail. A production service would use
-  a DKG with complaints and proofs of possession.
-- **Sub-shares travel under TLS only.** Whoever terminates TLS for an operator sees its sub-shares, which
-  is that operator's own share and no more.
-- **The peer token is shared.** An operator can deal in another's name; the transcript comparison
-  catches it, at the cost of a failed round.
+- **A dealer can stop a key generation after seeing the result.** Commitments are fixed before anyone
+  deals, so a dealer cannot steer the key; but it can refuse to finish a round whose key it does not
+  like, and try again. It is named each time. For this key that gains nothing (any random key is as
+  good as another).
+- **Blame is evidence for the administrators, not an automatic exclusion.** The round fails and says
+  who; the administrators run it again without that operator.
+- **Identity keys are pinned by the administrators.** If `identity` is left out of the members file,
+  the key published at the operator's address is trusted. Within a key's lifetime an operator refuses
+  a spec that names another identity key for an operator it already knows.
+- **The identity key sits in the state file** with the shares (mode 0600), and neither is wiped from
+  memory. Use a hardware module for more.
 - **The rate limit is the only brake on guessing.** Identity codes are guessable. Whoever holds the
   issuer's evaluation tokens can test guesses against the enrolment table at `max_evals_per_minute`.
   Set the limit close to the real enrolment rate and watch the evaluation counts in `status`.
 - **The issuer still sees the identity code** for the moment of the login, as before. The threshold
   service takes the *key* away from the issuer, not the login.
 - **t colluding operators can recompute K.** That is what the threshold means.
-- **Shares sit in a plain file** (mode 0600) and are not wiped from memory. Use a hardware module for
-  more.
 - **`/v1/public` is open** and shows verification keys, epochs and evaluation counts.
+- **Migration to a new key happens when a person logs in** (enrolment attempt, re-check or
+  replacement). With the two-year re-check every active record moves within two years; records of
+  people who never come back stay under the old key, which must be kept for them.

@@ -31,8 +31,9 @@ cargo run --release -p pop-cli -- demo
 
 The first start takes about a minute (proof-system setup), then prints a walk-through: enrolment, a
 refused second enrolment, binding, a like farm of 40 bots against 1 verified like, an impostor copying
-a code, blind renewal, and the uniqueness operators refreshing their key shares and replacing one of
-their number while Alice stays recognised. The services keep running:
+a code, blind renewal, the uniqueness operators refreshing their key shares and replacing one of
+their number while Alice stays recognised, the two-year identity re-check, a backup restored on a new
+device with a paper code, and a lost secret being replaced. The services keep running:
 
 | Service | Address |
 |---|---|
@@ -57,6 +58,10 @@ pop holder enrol                             # terminal 2: opens the mock bank I
 pop holder --mockfeed-url http://127.0.0.1:4000 --mockfeed-as alice bind mockfeed alice
 pop holder --mockfeed-url http://127.0.0.1:4000 like mockfeed p3
 pop holder serve                             # local API for the extension
+pop holder recheck                           # the two-year identity re-check
+pop holder backup                            # encrypted backup; prints a paper code
+pop holder restore                           # on a new device: asks for the paper code
+pop holder replace                           # lost or stolen secret: a new one after an eID login
 ```
 
 (`pop` is `cargo run --release -p pop-cli --`.)
@@ -112,6 +117,7 @@ No part depends on another part's implementation, only on the interfaces in `pop
 | Use a real identity provider (bank ID broker, EUDI wallet) | [docs/real-identity-provider.md](docs/real-identity-provider.md) |
 | Run real servers and storage | [docs/real-servers.md](docs/real-servers.md) |
 | Share the uniqueness key among operators, refresh it, rotate it | [docs/uniqueness.md](docs/uniqueness.md) |
+| Understand the two-year re-check, backups and replacing a lost secret | [docs/recovery.md](docs/recovery.md) |
 | Add a platform | [docs/adding-a-platform.md](docs/adding-a-platform.md) |
 | Change the proof system or understand the cryptography | [docs/crypto.md](docs/crypto.md) |
 | Know what was checked and what is still unsafe | [docs/security.md](docs/security.md) |

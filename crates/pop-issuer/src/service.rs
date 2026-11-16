@@ -155,6 +155,7 @@ impl Issuer {
         store: SharedStore,
         cfg: IssuerConfig,
     ) -> anyhow::Result<Arc<Self>> {
+        anyhow::ensure!(cfg.replace_wait_days <= 3650, "replace_wait_days must be at most 3650");
         let mut rng = ChaCha20Rng::from_entropy();
         let key = load_or(&cfg.keys_dir, "issuer.key", || { let k = IssuerKey::generate(&mut rng); let b = k.to_bytes(); (k, b) }, |b| IssuerKey::from_bytes(b).ok());
         let witness = load_or(&cfg.keys_dir, "witness.key", || { let k = WitnessKey::generate(&mut rng); let b = k.to_bytes(); (k, b) }, |b| WitnessKey::from_bytes(b).ok());
@@ -592,12 +593,12 @@ pub(crate) async fn authenticated_session(s: &Issuer, id: &str, purpose: Purpose
 
 /// A proof's date must be within a day of the issuer's, and its revocation root the current or the
 /// previous one.
-pub(crate) fn check_date_and_root(s: &Issuer, proof_today: Day, proof_root: &str, current_only: bool) -> Result<pop_crypto::params::Fr, ApiErr> {
+pub(crate) fn check_date_and_root(s: &Issuer, proof_today: Day, proof_root: &str) -> Result<pop_crypto::params::Fr, ApiErr> {
     if proof_today.abs_diff(s.today()) > 1 {
         return Err(err(StatusCode::BAD_REQUEST, "date out of window"));
     }
     let rv = s.rev.read().unwrap();
-    if proof_root != rv.root && (current_only || Some(proof_root) != rv.previous_root.as_deref()) {
+    if proof_root != rv.root && Some(proof_root) != rv.previous_root.as_deref() {
         return Err(err(StatusCode::CONFLICT, "stale revocation root; fetch /v1/revocations"));
     }
     Ok(pop_crypto::root_from_hex(proof_root)?)
@@ -605,7 +606,7 @@ pub(crate) fn check_date_and_root(s: &Issuer, proof_today: Day, proof_root: &str
 
 async fn renew(State(s): State<St>, Json(req): Json<RenewRequest>) -> Result<Json<RenewResponse>, ApiErr> {
     let today = s.today();
-    let root = check_date_and_root(&s, req.today, &req.revocation_root, false)?;
+    let root = check_date_and_root(&s, req.today, &req.revocation_root)?;
     let new_expiry = dates::quarter_end(dates::quarter_of(today) + 1);
     let vc = VerifyCtx { issuer: &s.key.public, witness: &s.witness.public, today: req.today, revocation_root: root };
     let sig: BlindSignature = {

@@ -95,7 +95,7 @@ With `data_dir` set, the issuer writes to `data_dir/keys/` (and the uniqueness k
 | `issuer.key` | BBS signing key | credentials can be forged |
 | `witness.key` | signs revocation handles | with the issuer key: forged credentials pass |
 | `uniqueness-keys/NNNN.key` | keys the deduplication hash (single-operator mode) | enrolment records can be tested against known identity codes |
-| `lego-*.bin` | proving keys | public; but see below |
+| `lego2-*.bin` | proving keys | public; but see below |
 
 For anything beyond a demo:
 
@@ -112,6 +112,18 @@ For anything beyond a demo:
   proving keys alone, and whoever ran the setup can forge proofs. See [crypto.md](crypto.md).
 - Back up `enrolments` and the uniqueness keys together. Without the key of its records nobody can be
   recognised as already enrolled, so the issuer refuses to start ([uniqueness.md](uniqueness.md) §1).
+
+### Recovery settings
+
+`replace_wait_days` in the issuer configuration (default 90) is how long a replacement of a lost secret
+waits when the old guardian key did not sign it ([recovery.md](recovery.md) §3). The two backup routes
+can be served from another host than the issuer; they share only the `backup_tickets` table with it
+([recovery.md](recovery.md) §2). Changes to an enrolment record (revoke, re-check, replace, claim) are
+serialised by a lock inside the issuer process: run one issuer process, or move that into your
+database as a compare-and-swap on the record.
+
+The proving-key files are named `lego2-*.bin` since the like statement changed; older `lego-*.bin`
+files are unused and can be deleted.
 
 ## 4. Revocation list
 

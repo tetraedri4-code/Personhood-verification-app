@@ -80,7 +80,7 @@ pub(crate) async fn recheck(State(s): State<St>, Json(req): Json<RecheckRequest>
     if rec.handle != req.handle {
         return Err(err(StatusCode::FORBIDDEN, "this credential does not belong to the person who logged in"));
     }
-    let root = check_date_and_root(&s, req.today, &req.revocation_root, false)?;
+    let root = check_date_and_root(&s, req.today, &req.revocation_root)?;
     let today = s.today();
     let new_check = dates::month_start(today);
     let new_expiry = dates::quarter_end(dates::quarter_of(today) + 1);

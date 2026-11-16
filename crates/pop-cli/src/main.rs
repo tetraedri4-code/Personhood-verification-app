@@ -76,7 +76,7 @@ enum Cmd {
 enum UniqCmd {
     /// Run one operator of the threshold service
     Operator {
-        /// JSON: index, eval_token, admin_token, peer_token, state_file, max_evals_per_minute, min_threshold
+        /// JSON: index, eval_token, admin_token, state_file, max_evals_per_minute, min_threshold
         #[arg(long)]
         config: PathBuf,
         #[arg(long, default_value = "127.0.0.1:4100")]
@@ -420,8 +420,9 @@ enum HolderCmd {
     Backup,
     /// Restore a backup onto a device without a credential
     Restore {
-        /// the paper code; dashes, spaces and case do not matter
-        code: String,
+        /// the paper code; dashes, spaces and case do not matter. Leave it out to be asked for it:
+        /// a code on the command line ends up in the shell history
+        code: Option<String>,
     },
     /// Replace a lost or stolen secret after an identity check. At once if this wallet still has the
     /// old guardian key; otherwise it waits and the old app can refuse it
@@ -530,6 +531,13 @@ async fn demo(a: DevnetArgs) -> anyhow::Result<()> {
     bob.bind("mockfeed", "bob", 1, CodePlacement::Bio).await?;
 
     step(5, "The like farm put 40 likes on post p2. Verified people like: Alice p3 (twice), Bob p3, Carol p3 and p2.");
+    if a.no_rollout {
+        match alice.like("mockfeed", "p3").await {
+            Err(e) => println!("    refused on the device: {e}"),
+            Ok(_) => anyhow::bail!("a secret in probation reported a like"),
+        }
+        println!("    (started with --no-rollout: every secret is new, so the like steps are skipped; run without it to see them)");
+    } else {
     let r = alice.like("mockfeed", "p3").await?;
     println!("    Alice likes p3: new person = {}, verified count = {}", r.new, r.count);
     let r = alice.like("mockfeed", "p3").await?;
@@ -544,6 +552,7 @@ async fn demo(a: DevnetArgs) -> anyhow::Result<()> {
     .await?;
     println!("    p2: 40 platform likes, {} from verified people", c.counts["p2"]);
     println!("    p3:  6 platform likes, {} from verified people", c.counts["p3"]);
+    }
 
     step(6, "@dailytruth copies Alice's code into its own bio. The code commits to Alice's account, so no badge appears.");
     let http = reqwest::Client::new();
@@ -667,6 +676,15 @@ async fn holder_cmd(a: HolderArgs) -> anyhow::Result<()> {
             println!("It is shown this once and is not kept here. Whoever has it can restore your secret; without it nobody can read the backup.");
         }
         HolderCmd::Restore { code } => {
+            let code = match code {
+                Some(c) => c,
+                None => {
+                    println!("Type the backup code from your paper and press Enter.");
+                    let mut s = String::new();
+                    std::io::stdin().read_line(&mut s)?;
+                    s
+                }
+            };
             h.restore(&code).await?;
             println!("Restored. {}", serde_json::to_string_pretty(&h.status()?)?);
             println!("If the credential has expired, run `pop holder renew`.");
@@ -715,6 +733,13 @@ async fn holder_cmd(a: HolderArgs) -> anyhow::Result<()> {
                     }
                 },
             };
+            if let Ok(Some(p)) = h.pending_replacement().await {
+                println!(
+                    "WARNING: on {} someone logged in with your eID and asked to REPLACE this wallet's secret (from {}). If that was not you, run `pop holder veto`.",
+                    dates::fmt_day(p.requested_on),
+                    dates::fmt_day(p.claim_after)
+                );
+            }
             println!("Holder app listening on http://{listen}\nPairing token for the extension: {token}");
             serve(listen, local_api::router(h, token)).await?;
         }

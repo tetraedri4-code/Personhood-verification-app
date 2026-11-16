@@ -270,7 +270,9 @@ impl Holder {
         st.bindings.retain(|b| !(b.platform == platform && (b.account_id == account.account_id || b.slot == slot)));
         st.bindings.push(LocalBinding { platform: platform.into(), account_id: account.account_id, handle: account.handle, slot, code, lease_until: entry.lease_until });
         self.wallet.save(&st)?;
-        self.sync_backup(&st).await;
+        // No backup update here. The backup host can know whose backup it is; an update at the
+        // moment of a binding would tell it which account that person just bound. The list of bound
+        // accounts reaches the backup with the next renewal.
         Ok(BindOutcome { entry, code_published, publish_note })
     }
 
@@ -297,7 +299,6 @@ impl Holder {
         }
         st.bindings.retain(|x| x != &b);
         self.wallet.save(&st)?;
-        self.sync_backup(&st).await;
         Ok(())
     }
 

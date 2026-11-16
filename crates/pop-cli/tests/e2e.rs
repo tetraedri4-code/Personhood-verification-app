@@ -270,6 +270,17 @@ async fn recheck_backup_and_restore_keep_the_same_person() {
     // restoring onto a device that has a credential is refused
     assert!(matches!(phone.restore(&code).await, Err(HolderError::AlreadyEnrolled)));
 
+    // Binding an account does not touch the backup (its host must not see when a known person
+    // binds); the new binding reaches the backup with the next renewal.
+    phone.bind("mockfeed", "bob", 3, CodePlacement::Bio).await.unwrap();
+    let probe = holder(d, "carol");
+    probe.restore(&code).await.unwrap();
+    assert_eq!(probe.status().unwrap().bindings.len(), 1);
+    phone.renew().await.unwrap();
+    let probe = holder(d, "carol");
+    probe.restore(&code).await.unwrap();
+    assert_eq!(probe.status().unwrap().bindings.len(), 2);
+
     // a new code replaces the old one
     let code2 = phone.backup_create().await.unwrap();
     assert_ne!(code, code2);

@@ -42,8 +42,9 @@ Checked and found sound:
 - **A missing answer is never "not enrolled".** If any live key version cannot be evaluated the issuer
   answers 503. If records exist under a key the service does not hold, the issuer does not start.
 - **Operators never see identities**: the request is blinded with a fresh random scalar.
-- **Each token opens one door**: evaluation, administration and peer tokens are separate, at least 24
-  characters, compared in constant time, and must differ.
+- **Each token opens one door**: evaluation and administration tokens are separate, at least 24
+  characters, compared in constant time, and must differ. (The shared peer token of the first version
+  is gone: operators sign.)
 - **Deals are checked**: against the dealer's commitments, against the dealer's published verification
   key in a reshare, and across receivers before commit. A forged deal (tested) aborts the round.
 - **The group key cannot change in a reshare**: every receiver recomputes it.
@@ -52,6 +53,69 @@ Checked and found sound:
 - **Plain http is refused** by the issuer's client, the coordinator and the dealers except on loopback.
 
 What remains open for the threshold service is listed in [uniqueness.md](uniqueness.md) §4.
+
+### Review of recovery, re-checks and the operator rounds, 16 November 2026
+
+This change added the two-year re-check, backups, replacement of the secret, identity keys for the
+uniqueness operators and a round protocol without a coordinator. Rows 12 and 13 above describe steps
+(`discard`, `finalize`) that no longer exist: operators now erase old shares themselves once every
+receiver has confirmed its new one, and a stalled round erases nothing.
+
+The review was repeated until a pass found nothing with a reasonable fix: four passes, each a fresh
+read of every new handler and message with the question "who controls this input, and what do they
+gain", followed by fixes and tests.
+
+**Pass 1**
+
+| # | Problem | What an attacker could do | Fix | Test |
+|---|---|---|---|---|
+| 15 | A receiver that complained about a bad deal revealed its Diffie–Hellman value for whatever point E the dealer had sent | A cheating dealer that had seen an honest dealer's ciphertext (on the network) could resend that E in its own deal, provoke the complaint, and decrypt the honest dealer's sub-share from the opening | The dealer must prove it knows the exponent of E, bound to round, dealer and receiver. A receiver never raises its key on a ciphertext without that proof; such a deal convicts its dealer as it stands | `sign_seal_open`, `complaints_are_checked_by_everyone`, `two_faced_dealers_and_lying_receivers_are_named` |
+| 16 | A dealer that showed different commitments to different receivers, or a receiver that sent a made-up "ready" hash, ended the round with nobody named | Stop every refresh and key generation for free, without being identified | Ready messages carry the dealers' signed commits. Two signatures of one dealer on different commits convict the dealer; a hash the sender's own evidence does not explain convicts the sender | same |
+| 17 | An operator that found such a conflict failed the round before telling the others | The other operators waited until the timeout and never saw the evidence | It sends its own ready message, with its evidence, before stopping | same |
+| 18 | The round id was a 128-bit hash of the spec | With about 2^64 work, two different specs with one id: administrators would approve one and operators run another | The id is the full SHA-256 | `complaints_are_checked_by_everyone` (id covers the spec) |
+| 19 | The guardian key alone could refuse a waiting replacement | Whoever stole the phone could refuse its owner's replacement again and again and keep the stolen secret for good | Refusing takes a re-check: eID and old secret together. The guardian-key veto was removed | `replacement_without_the_guardian_key_waits_and_can_be_refused`, `replacing_the_secret` |
+| 20 | Like proofs did not require a secret past probation | With replacement, a person could replace the secret and like every post again at once, each time | The like statement now proves that the secret was certified at least nine months ago | `replacement_with_the_guardian_key`, `replacing_the_secret` |
+| 21 | The holder accepted any quarter end as the new expiry of a renewed or re-checked credential | The issuer could give one person an unusual expiry and recognise them by it later | The holder refuses an expiry other than the end of the current or the next quarter, and a re-check month other than the current one | covered by the renewal and re-check tests |
+| 22 | Backup writes shared the lock that serialises changes to enrolment records | Anyone uploading backups could slow re-checks and replacements | Backups have their own lock | `backup_storage_rules` |
+
+**Pass 2**
+
+| # | Problem | What an attacker could do | Fix | Test |
+|---|---|---|---|---|
+| 23 | `pop holder restore` took the paper code only as a command-line argument | The code, which is as good as the secret, ended up in the shell history and the process list | Without an argument the command asks for the code | manual |
+
+**Pass 3**
+
+| # | Problem | What an attacker could do | Fix | Test |
+|---|---|---|---|---|
+| 24 | The app updated its backup right after every binding and unbinding | The backup host can tell whose a backup is (through the ticket). An update at the moment of a binding, next to the public list's new entry, told it which account that person had just bound | The backup is updated only after renewal, re-check and replacement; bindings reach it with the next renewal | `recheck_backup_and_restore_keep_the_same_person` |
+| 25 | `replace_wait_days` was unchecked | A typo in the configuration (a huge number) wrapped the date arithmetic and made waits end at once | The issuer refuses values above ten years at start | start-up check |
+
+**Pass 4** found nothing new with a reasonable fix. What it weighed and left is in "Known and not
+fixed" below and in [recovery.md](recovery.md) §4 and [uniqueness.md](uniqueness.md) §4.
+
+Checked and found sound in this change:
+
+- **A login serves one purpose.** A session opened for a re-check cannot finish an enrolment or a
+  replacement, and so on (tested). Enrolment needs a person without a record; re-check and replacement
+  need one with a record.
+- **A re-check proof is bound** to the session, the handle and the month it shows. Tested: another
+  session, a wrong month, a plain renewal proof, another person's login.
+- **Replacement never leaves two live secrets.** The old handle is revoked before the record changes;
+  record changes are serialised; a claim works once; a blind request bound to another token is refused.
+- **The new secret cannot be steered by the issuer**: it is drawn on the device and signed blindly, as
+  at enrolment.
+- **Backups**: the server stores ciphertext under an id it cannot connect to the code; the three
+  derived values are independent; a tampered or wrongly keyed backup is refused; ids, sizes and
+  characters are checked before anything is stored; a ticket pays for one backup (tested).
+- **Operator messages** are signed over the round id, the sender and the exact bytes; an operator
+  accepts them only for a round its own administrator approved, and only from the identity key that
+  round names. A message in another operator's name is refused (tested).
+- **A complaint cannot frame an honest dealer.** It needs the dealer's own signatures on a commit and a
+  deal that do not fit together, for this round and this receiver. Tested with the right evidence from
+  the wrong complainer, an opening for another message and a self-made deal.
+- **Nothing is revealed before every dealer has committed**, and no share is erased before every
+  receiver has confirmed its new one on disk.
 
 ### Checked and found sound
 
@@ -87,9 +151,7 @@ These are limits of the prototype, in rough order of weight:
 2. **One operator holds the issuer key and the witness key** in one process. The design splits these
    so that no single party can mint people ([real-servers.md](real-servers.md) §3). The uniqueness key
    can be split among operators (threshold service), but in the default single-operator mode it sits
-   with the issuer too. The threshold service has limits of its own: simple key generation without a
-   complaint phase, one coordinator holding the admin tokens, a shared peer token, sub-shares protected
-   by TLS only ([uniqueness.md](uniqueness.md) §4).
+   with the issuer too. The threshold service has limits of its own ([uniqueness.md](uniqueness.md) §4).
 3. **The secret is in a plain file** (`wallet.json`, mode 0600). Anything running as the same user can
    copy it and become that person. A real app wraps it with a hardware key.
 4. **Not constant-time.** Timing side channels on the proving device are possible.
@@ -109,8 +171,12 @@ These are limits of the prototype, in rough order of weight:
 9. **A count is self-reported.** It says an enrolled person's app reported a like, not that the like
    exists on the platform.
 10. **No rate limiting in the issuer and the directory.** Put it in the reverse proxy. (The uniqueness
-    operators do limit evaluations per minute.)
-11. **No recovery.** A lost wallet is a lost identity in this prototype: the person cannot enrol again.
+    operators do limit evaluations per minute.) Some issuer endpoints that need no login scan the
+    record table (`/v1/revoke`, `/v1/replace/claim`, `/v1/replace/pending`).
+11. **Recovery has edges** ([recovery.md](recovery.md) §4): during the 90-day wait a stolen phone keeps
+    working; a replaced secret can like old posts again after its probation; whoever holds the eID and
+    the current secret together wins every dispute; the backup host can link a backup to an enrolment
+    record.
 12. **The mock services have no security at all** by design: the mock identity provider logs anyone in
     as anyone, the mock feed has no passwords. They listen on loopback. Never expose them.
 13. **The 6-digit enrolment code** stops link-based hijacking unless the victim also reads the code to

@@ -2,7 +2,6 @@
   "index": 1,
   "eval_token": "REPLACE-with-24-or-more-random-characters-given-to-the-issuer",
   "admin_token": "REPLACE-with-24-or-more-random-characters-kept-by-this-operators-administrator",
-  "peer_token": "REPLACE-with-24-or-more-random-characters-shared-by-the-operators",
   "state_file": "/var/lib/pop/uniqueness/shares.json",
   "max_evals_per_minute": 120,
   "min_threshold": 2

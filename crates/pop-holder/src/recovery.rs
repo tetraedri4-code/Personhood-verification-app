@@ -219,7 +219,8 @@ impl Holder {
     }
 
     /// Bring the stored backup up to date. Best effort: a failure leaves the older backup in place,
-    /// and an older backup still restores (it renews itself) for about a year.
+    /// and an older backup still restores (it renews itself) for about a year. Called only after
+    /// renewal, re-check and replacement, never after a binding or a like (see `Holder::bind`).
     pub(crate) async fn sync_backup(&self, st: &WalletState) -> bool {
         let (Some(keys), Ok(file)) = (&st.backup, Self::backup_file(st)) else { return false };
         let Ok(blob) = seal(keys, &file) else { return false };
