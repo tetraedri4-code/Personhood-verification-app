@@ -1,0 +1,20 @@
+/* Deliberately unlike any platform's own verification mark: a green ring, not a blue tick. */
+.pop-badge {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 1.7em; height: 1.7em; margin-left: .45em; vertical-align: .1em;
+  border-radius: 50%; border: 2px solid #1b8a5a; color: #1b8a5a;
+  font: 700 .62em/1 system-ui, sans-serif; cursor: help; box-sizing: border-box; background: transparent;
+}
+.pop-badge.pop-probation { border-style: dashed; }
+.pop-count {
+  display: inline-flex; align-items: center; gap: .3em; margin-left: .6em; padding: .15em .6em;
+  border: 1px solid #1b8a5a; border-radius: 999px; color: #1b8a5a;
+  font: 600 .8rem/1.3 system-ui, sans-serif; cursor: help; white-space: nowrap;
+}
+.pop-count.pop-zero { border-color: #8a8f98; color: #8a8f98; font-weight: 500; }
+.pop-count.pop-mine { background: #1b8a5a; color: #fff; }
+@media (prefers-color-scheme: dark) {
+  .pop-badge { border-color: #4fd39a; color: #4fd39a; }
+  .pop-count { border-color: #4fd39a; color: #4fd39a; }
+  .pop-count.pop-mine { background: #4fd39a; color: #06281a; }
+}

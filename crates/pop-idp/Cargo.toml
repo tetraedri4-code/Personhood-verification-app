@@ -1,0 +1,16 @@
+[package]
+name = "pop-idp"
+description = "Identity provider interface and a generic OpenID Connect implementation (works with the mock IdP and with real brokers)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+reqwest.workspace = true
+jsonwebtoken.workspace = true
+url.workspace = true
+tokio.workspace = true

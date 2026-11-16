@@ -1,0 +1,68 @@
+[workspace]
+resolver = "2"
+members = ["crates/pop-crypto", "crates/pop-protocol", "crates/pop-storage", "crates/pop-idp", "crates/pop-mock-idp", "crates/pop-issuer", "crates/pop-directory", "crates/pop-mockfeed", "crates/pop-platform-mockfeed", "crates/pop-platform-bluesky", "crates/pop-holder", "crates/pop-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+ark-bls12-381 = "0.4"
+ark-ec = "0.4"
+ark-ff = { version = "0.4", features = ["asm"] }
+ark-serialize = "0.4"
+ark-std = "0.4"
+ark-crypto-primitives = { version = "0.4", default-features = false, features = ["sponge"] }
+ark-bulletproofs = "=4.1.1"
+merlin = "3"
+legogroth16 = { version = "=0.18.0", default-features = false }
+ark-relations = "0.4"
+ark-r1cs-std = "0.4"
+sha2 = "0.10"
+hmac = "0.12"
+rand = "0.8"
+rand_chacha = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+hex = "0.4"
+base64 = "0.22"
+async-trait = "0.1"
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+jsonwebtoken = "9"
+ring = "0.17"
+url = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+time = { version = "0.3", features = ["serde", "macros", "formatting", "parsing"] }
+
+pop-crypto = { path = "crates/pop-crypto" }
+pop-protocol = { path = "crates/pop-protocol" }
+pop-storage = { path = "crates/pop-storage" }
+pop-issuer = { path = "crates/pop-issuer" }
+pop-directory = { path = "crates/pop-directory" }
+pop-idp = { path = "crates/pop-idp" }
+pop-mock-idp = { path = "crates/pop-mock-idp" }
+pop-mockfeed = { path = "crates/pop-mockfeed" }
+pop-platform-mockfeed = { path = "crates/pop-platform-mockfeed" }
+pop-platform-bluesky = { path = "crates/pop-platform-bluesky" }
+pop-holder = { path = "crates/pop-holder" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.test]
+opt-level = 3

@@ -1,0 +1,8 @@
+# `cargo audit` configuration. Every ignored advisory needs a reason here.
+[advisories]
+ignore = [
+    # tracing-subscriber 0.2.25 (ANSI escapes in logged input) comes in through ark-relations 0.4, which
+    # uses only its span-tracking layer for constraint debugging. Its log formatter is never installed:
+    # the binary logs through tracing-subscriber 0.3. No fixed arkworks 0.4 release exists.
+    "RUSTSEC-2025-0055",
+]

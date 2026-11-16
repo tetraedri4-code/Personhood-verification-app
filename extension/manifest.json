@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Personhood badges (prototype)",
+  "version": "0.1.0",
+  "description": "Shows which accounts belong to one enrolled person, and how many likes come from enrolled people. Research prototype.",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "http://localhost/*",
+    "https://public.api.bsky.app/*"
+  ],
+  "background": { "service_worker": "src/background.js" },
+  "options_ui": { "page": "options.html", "open_in_tab": true },
+  "content_scripts": [
+    {
+      "matches": ["http://127.0.0.1:4000/*", "http://localhost:4000/*", "https://bsky.app/*"],
+      "js": ["src/core.js", "src/adapters/mockfeed.js", "src/adapters/bluesky.js", "src/main.js"],
+      "css": ["src/badge.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}

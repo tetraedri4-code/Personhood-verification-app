@@ -1,0 +1,26 @@
+[package]
+name = "pop-crypto"
+description = "Cryptographic core: blind BBS credential, per-platform pseudonyms, badge and like tags, revocation tree, pluggable proof system (LegoGroth16 or Bulletproofs)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ark-bls12-381.workspace = true
+ark-ec.workspace = true
+ark-ff.workspace = true
+ark-serialize.workspace = true
+ark-std.workspace = true
+ark-crypto-primitives.workspace = true
+ark-bulletproofs.workspace = true
+merlin.workspace = true
+legogroth16.workspace = true
+ark-relations.workspace = true
+ark-r1cs-std.workspace = true
+sha2.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+hex.workspace = true

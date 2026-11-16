@@ -1,0 +1,18 @@
+[package]
+name = "pop-protocol"
+description = "Wire types, ids and the interfaces (traits) between the holder app, the servers and platform adapters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pop-crypto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+hex.workspace = true
+url.workspace = true

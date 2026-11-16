@@ -1,0 +1,94 @@
+// Background worker: the only part of the extension that talks to the network.
+//  * directory (public, no credentials): the list of verified accounts and the table of counts
+//  * holder app on 127.0.0.1 (pairing token): report a like, read which posts this person liked
+// Settings live in chrome.storage.local.
+const DEFAULTS = { directoryUrl: "http://127.0.0.1:4003", holderUrl: "http://127.0.0.1:4010", token: "", reportLikes: false };
+const TTL_MS = 60_000;
+const cache = new Map();
+
+async function settings() {
+  return { ...DEFAULTS, ...(await chrome.storage.local.get(Object.keys(DEFAULTS))) };
+}
+
+// Only loopback and https servers are accepted, so a mistyped setting cannot send data in clear text.
+function base(url) {
+  const u = new URL(url);
+  const loopback = u.hostname === "127.0.0.1" || u.hostname === "localhost";
+  if (u.protocol !== "https:" && !(u.protocol === "http:" && loopback)) throw new Error("server address must be https, or http on this computer");
+  return u.origin;
+}
+
+async function cached(key, load) {
+  const hit = cache.get(key);
+  if (hit && Date.now() - hit.at < TTL_MS) return hit.value;
+  const value = await load();
+  cache.set(key, { at: Date.now(), value });
+  return value;
+}
+
+async function getJson(url, init) {
+  const r = await fetch(url, { credentials: "omit", cache: "no-store", ...init });
+  if (!r.ok) throw new Error(`${r.status}`);
+  return r.json();
+}
+
+async function holder(s, path, body) {
+  // the holder app must be on this computer: the token must never go anywhere else
+  const u = new URL(s.holderUrl);
+  if (u.protocol !== "http:" || !(u.hostname === "127.0.0.1" || u.hostname === "localhost")) throw new Error("holder app must be on this computer");
+  if (!s.token) throw new Error("no pairing token set");
+  return getJson(u.origin + path, {
+    method: body ? "POST" : "GET",
+    headers: { "content-type": "application/json", "x-pop-token": s.token },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+}
+
+const PLATFORM_RE = /^[a-z0-9-]{1,32}$/;
+
+async function handle(msg) {
+  const s = await settings();
+  if (msg.type === "data") {
+    if (!PLATFORM_RE.test(msg.platform)) throw new Error("bad platform");
+    const dir = base(s.directoryUrl);
+    const list = await cached(`list|${dir}|${msg.platform}`, () => getJson(`${dir}/v1/bindings?platform=${msg.platform}`));
+    const table = await cached(`counts|${dir}|${msg.platform}`, () => getJson(`${dir}/v1/likes/table?platform=${msg.platform}`));
+    const seen = (await chrome.storage.local.get("seen")).seen || {};
+    return { settings: { reportLikes: !!s.reportLikes }, today: list.today, entries: list.entries, counts: table.counts, seen: seen[msg.platform] || {} };
+  }
+  if (msg.type === "seen") {
+    const all = (await chrome.storage.local.get("seen")).seen || {};
+    (all[msg.platform] ||= {})[msg.accountId] = msg.code;
+    await chrome.storage.local.set({ seen: all });
+    return {};
+  }
+  if (msg.type === "like") {
+    if (!s.reportLikes) throw new Error("like reporting is off");
+    const r = await holder(s, "/v1/like", { platform: msg.platform, post: msg.post });
+    cache.delete(`counts|${base(s.directoryUrl)}|${msg.platform}`);
+    const mine = (await chrome.storage.local.get("liked")).liked || {};
+    const arr = (mine[msg.platform] ||= []);
+    if (!arr.includes(msg.post)) arr.push(msg.post);
+    await chrome.storage.local.set({ liked: mine });
+    return r;
+  }
+  if (msg.type === "status") {
+    return { liked: (await chrome.storage.local.get("liked")).liked || {} };
+  }
+  if (msg.type === "holder-status") {
+    return holder(s, "/v1/status");
+  }
+  if (msg.type === "bluesky-resolve") {
+    if (!/^[a-z0-9.-]{3,253}$/.test(msg.handle)) throw new Error("bad handle");
+    return cached(`did|${msg.handle}`, () =>
+      getJson(`https://public.api.bsky.app/xrpc/com.atproto.identity.resolveHandle?handle=${encodeURIComponent(msg.handle)}`));
+  }
+  throw new Error("unknown message");
+}
+
+chrome.runtime.onMessage.addListener((msg, sender, reply) => {
+  // messages are accepted only from this extension's own scripts
+  if (sender.id !== chrome.runtime.id) return false;
+  handle(msg).then(reply, (e) => reply({ error: String(e && e.message ? e.message : e) }));
+  return true;
+});
