@@ -9,13 +9,13 @@
 //!   pseudonyms stay.
 //! * `POST /v1/replace`: the secret is gone or stolen. A new secret is certified, the old handle is
 //!   revoked, and the new secret starts a fresh probation. With a signature of the old guardian key
-//!   this happens at once; without it the request waits and the old app can veto it.
+//!   this happens at once; without it the request waits, and a re-check with the old secret
+//!   cancels it.
 use crate::service::{authenticated_session, check_date_and_root, check_guardian_key, drop_session, err, ApiErr, Enrolment, Issuer, St, T_ENROL};
 use axum::{extract::State, http::StatusCode, Json};
 use pop_crypto::{dates, BlindRequest, Day, VerifyCtx};
 use pop_protocol::api::*;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use sha2::{Digest, Sha256};
 
 /// A person can replace the secret at most this often. Each replacement puts one more handle on the
@@ -30,7 +30,7 @@ pub(crate) struct PendingReplace {
     pub(crate) requested_on: Day,
     /// SHA-256 of the claim token
     pub(crate) claim_hash: String,
-    /// published with the pending entry; the veto signs it
+    /// published with the pending entry, so that only the holder of the handle recognises it
     pub(crate) nonce: String,
     /// the new guardian key
     pub(crate) guardian: String,
@@ -155,7 +155,7 @@ pub(crate) async fn replace(State(s): State<St>, Json(req): Json<ReplaceRequest>
         return Ok(Json(ReplaceResponse::Issued { issuance }));
     }
     // No proof of the old device: the eID alone asks. Wait, publish the request so the old app can
-    // refuse it, and hand out the credential only afterwards. A newer request replaces an older one
+    // warn its owner (who refuses it with a re-check), and hand out the credential only afterwards. A newer request replaces an older one
     // and starts the wait again.
     let claim_token = s.rand_hex(24);
     rec.pending = Some(PendingReplace { requested_on: today, claim_hash: sha_hex(&claim_token), nonce: s.rand_hex(16), guardian: req.guardian_public_key.clone() });
@@ -172,7 +172,7 @@ pub(crate) async fn claim(State(s): State<St>, Json(req): Json<ClaimRequest>) ->
     let _g = s.records.lock().await;
     let hash = sha_hex(&req.claim_token);
     let found = records(&s).await?.into_iter().find(|(_, r)| r.pending.as_ref().map(|p| p.claim_hash == hash).unwrap_or(false));
-    let (d, mut rec) = found.ok_or_else(|| err(StatusCode::NOT_FOUND, "no waiting replacement for this token (it may have been refused by the old app, or replaced by a newer request)"))?;
+    let (d, mut rec) = found.ok_or_else(|| err(StatusCode::NOT_FOUND, "no waiting replacement for this token (it may have been refused with the old app, or replaced by a newer request)"))?;
     let p = rec.pending.clone().expect("found by its pending entry");
     let today = s.today();
     let claim_after = p.requested_on + s.cfg.replace_wait_days;
@@ -205,15 +205,4 @@ pub(crate) async fn pending(State(s): State<St>) -> Result<Json<PendingReplaceme
         })
         .collect();
     Ok(Json(PendingReplacements { entries }))
-}
-
-pub(crate) async fn veto(State(s): State<St>, Json(req): Json<VetoRequest>) -> Result<Json<serde_json::Value>, ApiErr> {
-    let _g = s.records.lock().await;
-    let found = records(&s).await?.into_iter().find(|(_, r)| r.handle == req.handle && r.pending.as_ref().map(|p| p.nonce == req.nonce).unwrap_or(false));
-    let (d, mut rec) = found.ok_or_else(|| err(StatusCode::NOT_FOUND, "no waiting replacement for this handle"))?;
-    verify_guardian(&rec.guardian, &veto_message(req.handle, &req.nonce), &req.signature)?;
-    rec.pending = None;
-    s.store.put(T_ENROL, &d, serde_json::to_value(&rec)?).await?;
-    tracing::warn!("a waiting replacement was refused by the old app");
-    Ok(Json(json!({"vetoed": true})))
 }

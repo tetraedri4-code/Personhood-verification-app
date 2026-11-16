@@ -431,8 +431,12 @@ enum HolderCmd {
     },
     /// Collect the new credential of a replacement whose wait is over
     Claim,
-    /// Refuse a replacement of this wallet's secret that someone else asked for
-    Veto,
+    /// Refuse a replacement of this wallet's secret that someone else asked for. This is an identity
+    /// re-check: your eID together with this wallet's secret outranks the eID alone
+    Veto {
+        #[arg(long)]
+        mock_login: Option<String>,
+    },
     Status,
     /// Serve the local API for the browser extension
     Serve {
@@ -569,6 +573,34 @@ async fn demo(a: DevnetArgs) -> anyhow::Result<()> {
         println!("    Alice's identity code is still recognised: a second enrolment is refused as before");
     }
 
+    step(9, "Bob does the two-year identity re-check: he logs in again, his secret and badge stay.");
+    let url = bob.recheck_start().await?;
+    let code = devnet::mock_login(&url, "020285-901B").await?;
+    let next = bob.recheck_finish(&code).await?;
+    println!("    re-checked; the next one is due by {}", dates::fmt_day(next));
+
+    step(10, "Bob makes an encrypted backup, loses his phone, and restores on a new one with the paper code.");
+    let paper = bob.backup_create().await?;
+    println!("    paper code: {paper}  (the server stores ciphertext it cannot read)");
+    let bob2 = Arc::new(holder_for(tmp.join("wallet-bob-new"), &d, "bob")?);
+    let _ = std::fs::remove_file(tmp.join("wallet-bob-new/wallet.json"));
+    bob2.restore(&paper).await?;
+    let again = bob2.bind("mockfeed", "bob", 1, CodePlacement::Bio).await?;
+    println!("    restored: same secret, same code on @bob ({})", again.entry.code);
+
+    step(11, "Carol lost her phone and has no backup. With only her eID the replacement waits; a re-check with the old app would cancel it.");
+    let carol2 = Arc::new(holder_for(tmp.join("wallet-carol-new"), &d, "carol")?);
+    let _ = std::fs::remove_file(tmp.join("wallet-carol-new/wallet.json"));
+    let url = carol2.replace_start().await?;
+    let code = devnet::mock_login(&url, "030375-902C").await?;
+    if let pop_holder::ReplaceOutcome::Waiting { claim_after, .. } = carol2.replace_finish(&code).await? {
+        println!("    request recorded; the new secret can be collected from {claim_after}");
+    }
+    if let Some(p) = carol.pending_replacement().await? {
+        println!("    Carol's old app sees the request (made on {}); whoever has it AND her eID could refuse", dates::fmt_day(p.requested_on));
+    }
+    println!("    had she kept her guardian key (it is in the backup), the new secret would come at once, with nine months of probation");
+
     let token = std::env::var("POP_PAIRING_TOKEN").ok().filter(|t| t.len() >= 16).unwrap_or_else(local_api::new_token);
     let l = tokio::net::TcpListener::bind("127.0.0.1:4010").await?;
     println!("\nServices keep running. To see badges and counts in a browser:");
@@ -648,20 +680,22 @@ async fn holder_cmd(a: HolderArgs) -> anyhow::Result<()> {
                 }
                 pop_holder::ReplaceOutcome::Waiting { claim_after, claim_before } => {
                     println!("Request recorded. This wallet does not have the old guardian key, so the replacement waits.");
-                    println!("The app with the old secret can refuse it until then. Run `pop holder claim` between {claim_after} and {claim_before}.");
+                    println!("Until then it can be refused from the app with the old secret, which takes your eID as well. Run `pop holder claim` between {claim_after} and {claim_before}.");
                 }
             }
         }
         HolderCmd::Claim => println!("Secret replaced. Bind your accounts again; they and your likes count from {}.", h.replace_claim().await?),
-        HolderCmd::Veto => {
-            h.veto_replacement().await?;
+        HolderCmd::Veto { mock_login } => {
+            anyhow::ensure!(h.pending_replacement().await?.is_some(), "nobody is waiting to replace this wallet's secret");
+            let code = login(&h.recheck_start().await?, mock_login).await?;
+            h.recheck_finish(&code).await?;
             println!("Replacement refused. If you did not ask for it, someone else can log in with your eID: contact your bank or eID provider.");
         }
         HolderCmd::Status => {
             println!("{}", serde_json::to_string_pretty(&h.status()?)?);
             if let Ok(Some(p)) = h.pending_replacement().await {
                 println!(
-                    "\nWARNING: on {} someone logged in with your eID and asked to REPLACE this wallet's secret. It takes effect from {}.\nIf that was not you, run `pop holder veto` now.",
+                    "\nWARNING: on {} someone logged in with your eID and asked to REPLACE this wallet's secret. It takes effect from {}.\nIf that was not you, run `pop holder veto` now (it asks you to log in).",
                     dates::fmt_day(p.requested_on),
                     dates::fmt_day(p.claim_after)
                 );

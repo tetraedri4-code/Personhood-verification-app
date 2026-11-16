@@ -359,6 +359,66 @@ async fn cheaters_are_named() {
     assert_eq!(v.blamed, Some(3), "{}", v.reason);
 }
 
+/// Run a key generation among `admins` until operator `observer` reports a failure.
+async fn failure_seen_by(admins: &[AdminEndpoint], observer: u32) -> Failure {
+    let spec = admin::spec_dkg(&members(admins), 2).await.unwrap();
+    for a in admins {
+        admin::approve(&spec, a).await.unwrap();
+    }
+    for _ in 0..50 {
+        let mut seen = None;
+        for a in admins {
+            let st: RoundStatus = reqwest::Client::new().post(format!("{}/v1/admin/round/advance", a.url)).bearer_auth(&a.admin_token).json(&RoundId { round_id: spec.id() }).send().await.unwrap().json().await.unwrap();
+            assert!(!st.done, "the round must not succeed");
+            if a.index == observer && st.failed.is_some() {
+                seen = st.failed;
+            }
+        }
+        if let Some(f) = seen {
+            return f;
+        }
+    }
+    let mut last = vec![];
+    for a in admins {
+        let st: RoundStatus = reqwest::Client::new().post(format!("{}/v1/admin/round/advance", a.url)).bearer_auth(&a.admin_token).json(&RoundId { round_id: spec.id() }).send().await.unwrap().json().await.unwrap();
+        last.push(format!("{}: {} {:?} {:?}", a.index, st.phase, st.waiting_for, st.failed));
+    }
+    panic!("operator {observer} saw no failure: {last:#?}");
+}
+
+async fn with_fault(index: u32, fault: Fault) -> AdminEndpoint {
+    let mut c = cfg(index);
+    c.test_fault = Some(fault);
+    spawn_with(c).await.0
+}
+
+/// Faults that used to end a round without naming anyone, or could have leaked a sub-share.
+#[tokio::test]
+async fn two_faced_dealers_and_lying_receivers_are_named() {
+    // operator 2 commits and deals one polynomial to operator 3 and another to operator 1; each of
+    // the two honest operators learns it from the other's ready message, which carries the signed commit
+    let admins = [spawn(1).await.0, with_fault(2, Fault::EquivocateTo(3)).await, spawn(3).await.0];
+    for observer in [1, 3] {
+        let f = failure_seen_by(&admins, observer).await;
+        assert_eq!(f.blamed, Some(2), "{}", f.reason);
+        assert!(f.reason.contains("two different commits"), "{}", f.reason);
+    }
+    // operator 3 sends a ready hash that its own evidence does not explain
+    let admins = [spawn(1).await.0, spawn(2).await.0, with_fault(3, Fault::LyingReady).await];
+    let f = failure_seen_by(&admins, 1).await;
+    assert_eq!(f.blamed, Some(3), "{}", f.reason);
+    // operator 1 sends operator 2 a ciphertext with a copied E: operator 2 does not open it, and
+    // operator 3 convicts operator 1 from the signed deal alone
+    let admins = [with_fault(1, Fault::CopiedCiphertextTo(2)).await, spawn(2).await.0, spawn(3).await.0];
+    for observer in [2, 3] {
+        let f = failure_seen_by(&admins, observer).await;
+        assert_eq!(f.blamed, Some(1), "{}", f.reason);
+    }
+    for a in &admins {
+        assert!(admin::public(&a.url).await.unwrap().keys.is_empty(), "nothing was stored");
+    }
+}
+
 /// The complaint check on its own: evidence is judged by anyone holding the spec.
 #[tokio::test]
 async fn complaints_are_checked_by_everyone() {
@@ -397,26 +457,41 @@ async fn complaints_are_checked_by_everyone() {
     // a good deal: the complaint does not hold
     let (sealed, good) = deal(eval_poly(&poly, 2));
     let opening = keys[1].reveal(&ctx, &sealed).unwrap();
-    assert!(round::verify_complaint(&spec, &checked, 2, &good, &commit_env, &opening).is_err());
+    assert!(round::verify_complaint(&spec, &checked, 2, &good, &commit_env, Some(&opening)).is_err());
     // a bad value: the dealer is at fault
     let (sealed, bad) = deal(eval_poly(&poly, 2) + Fr::from(1u64));
     let opening = keys[1].reveal(&ctx, &sealed).unwrap();
-    assert_eq!(round::verify_complaint(&spec, &checked, 2, &bad, &commit_env, &opening), Ok(1));
+    assert_eq!(round::verify_complaint(&spec, &checked, 2, &bad, &commit_env, Some(&opening)), Ok(1));
     // the right evidence from the wrong complainer, an opening for another message, a deal the
     // complainer made up itself: none of them pins anything on the dealer
-    assert!(round::verify_complaint(&spec, &checked, 3, &bad, &commit_env, &opening).is_err());
+    assert!(round::verify_complaint(&spec, &checked, 3, &bad, &commit_env, Some(&opening)).is_err());
     let (other_sealed, _) = deal(eval_poly(&poly, 2));
-    assert!(round::verify_complaint(&spec, &checked, 2, &bad, &commit_env, &keys[1].reveal(&ctx, &other_sealed).unwrap()).is_err());
+    assert!(round::verify_complaint(&spec, &checked, 2, &bad, &commit_env, Some(&keys[1].reveal(&ctx, &other_sealed).unwrap())).is_err());
     let (_, self_made) = {
         let sealed = ident::seal(&keys[1].public, &ctx, &Fr::from(7u64));
         (sealed.clone(), sign(&keys[1], 1, &Body::Deal { to: 2, commitments: commitments.clone(), pok: pok.clone(), sealed }))
     };
-    assert!(round::verify_complaint(&spec, &checked, 2, &self_made, &commit_env, &opening).is_err());
+    assert!(round::verify_complaint(&spec, &checked, 2, &self_made, &commit_env, Some(&opening)).is_err());
     // a deal that differs from the commitment is the dealer's fault without any decryption
     let other_commit = sign(&keys[0], 1, &Body::Commit { hash: "11".repeat(32) });
     let (sealed, good2) = deal(eval_poly(&poly, 2));
     let opening = keys[1].reveal(&ctx, &sealed).unwrap();
-    assert_eq!(round::verify_complaint(&spec, &checked, 2, &good2, &other_commit, &opening), Ok(1));
+    assert_eq!(round::verify_complaint(&spec, &checked, 2, &good2, &other_commit, Some(&opening)), Ok(1));
+
+    // A ciphertext whose E the dealer copied from somewhere (here: from its own earlier message, to
+    // have the receiver reveal that message's pad) carries no valid proof of e. The receiver refuses
+    // to open it, and the signed deal convicts the dealer without an opening.
+    let (victim, _) = deal(eval_poly(&poly, 2));
+    let mut copied = ident::seal(&keys[1].public, &ctx, &Fr::from(1u64));
+    copied.e = victim.e.clone();
+    copied.pok = victim.pok.clone();
+    let replay_ctx = round::seal_context(&id, 3, 2);
+    assert!(keys[1].reveal(&replay_ctx, &copied).is_err(), "the proof of e is bound to dealer and receiver");
+    let from3 = sign(&keys[2], 3, &Body::Deal { to: 2, commitments: commitments.clone(), pok: pok.clone(), sealed: copied });
+    let commit3 = sign(&keys[2], 3, &Body::Commit { hash: round::commit_hash(&commitments, &pok) });
+    assert_eq!(round::verify_complaint(&spec, &checked, 2, &from3, &commit3, None), Ok(3));
+    // ... while a complaint without an opening about a well-formed deal falls back on the complainer
+    assert!(round::verify_complaint(&spec, &checked, 2, &good, &commit_env, None).is_err());
 
     // spec checks
     let mut s = spec.clone();

@@ -97,10 +97,6 @@ impl IssuerApi for HttpClient {
     async fn replace_pending(&self) -> Result<PendingReplacements, ApiError> {
         self.get("/v1/replace/pending").await
     }
-    async fn replace_veto(&self, req: &VetoRequest) -> Result<(), ApiError> {
-        let _: serde_json::Value = self.post("/v1/replace/veto", req).await?;
-        Ok(())
-    }
     async fn backup_put(&self, req: &BackupPut) -> Result<Option<String>, ApiError> {
         let v: serde_json::Value = self.post("/v1/backup", req).await?;
         Ok(v["ticket"].as_str().map(String::from))

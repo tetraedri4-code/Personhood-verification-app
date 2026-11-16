@@ -6,6 +6,10 @@
 //! * Encryption: ElGamal-style. The sender picks e, sends E = g2^e and value XOR KDF(pk^e). The pad is
 //!   used once (fresh e per message). Integrity comes from the sender's signature over the message and
 //!   from checking the decrypted value against the sender's public commitments.
+//!   The sender also proves that it knows e, bound to the message's context. A receiver never raises
+//!   its key on a point without that proof: otherwise a cheating dealer could resend the E of an
+//!   honest dealer's ciphertext, provoke a complaint, and read the honest dealer's sub-share from the
+//!   opening.
 //! * Opening for a complaint: the receiver publishes pk^e = E^sk with a Chaum–Pedersen proof that it
 //!   used its own key, so anyone can decrypt that one message and check it.
 use ark_ec::{pairing::Pairing, AffineRepr, CurveGroup, Group};
@@ -70,11 +74,17 @@ impl IdentityKey {
     }
 
     pub fn open(&self, context: &[u8], sealed: &Sealed) -> Result<Fr, String> {
+        if !sealed_ok(context, sealed) {
+            return Err("the ciphertext is malformed or its sender did not prove it made it".into());
+        }
         unpad(&self.shared(sealed)?, context, sealed)
     }
 
     /// Reveal the shared point of one ciphertext, with a proof that it was computed with this key.
     pub fn reveal(&self, context: &[u8], sealed: &Sealed) -> Result<Opening, String> {
+        if !sealed_ok(context, sealed) {
+            return Err("refusing to open a ciphertext whose sender did not prove it made it".into());
+        }
         let e = point(&sealed.e)?;
         let shared = (e * self.sk).into_affine();
         let k = Fr::rand(&mut rand::thread_rng());
@@ -94,6 +104,21 @@ pub fn verify(public: &G2A, msg: &[u8], sig: &str) -> bool {
 pub struct Sealed {
     pub e: String,
     pub ct: String,
+    /// proof that the sender knows e, bound to the context
+    #[serde(default)]
+    pub pok: Option<Pok>,
+}
+
+fn seal_pok_context(context: &[u8]) -> Vec<u8> {
+    [b"seal|".as_slice(), context].concat()
+}
+
+/// Is this a ciphertext a receiver may open: E is a valid point, the sender proved it knows e for
+/// this very context, and the ciphertext has the right length. Anyone can check this, so a deal
+/// that fails it convicts its (signing) dealer without any opening.
+pub fn sealed_ok(context: &[u8], sealed: &Sealed) -> bool {
+    let (Ok(e), Some(pok)) = (point(&sealed.e), &sealed.pok) else { return false };
+    sealed.ct.len() == 64 && hex::decode(&sealed.ct).is_ok() && pok_verify(&e, &seal_pok_context(context), pok)
 }
 
 /// What a receiver publishes to let others decrypt one message addressed to it.
@@ -122,7 +147,7 @@ pub fn seal(to: &G2A, context: &[u8], value: &Fr) -> Sealed {
     let p = pad(&shared, &big_e, context);
     let v = ser(value);
     let ct: Vec<u8> = v.iter().zip(p.iter()).map(|(a, b)| a ^ b).collect();
-    Sealed { e: to_hex(&big_e), ct: hex::encode(ct) }
+    Sealed { e: to_hex(&big_e), ct: hex::encode(ct), pok: Some(pok_prove(&e, &seal_pok_context(context))) }
 }
 
 fn unpad(shared: &G2A, context: &[u8], sealed: &Sealed) -> Result<Fr, String> {
@@ -145,8 +170,13 @@ fn dleq_challenge(pk: &G2A, e: &G2A, shared: &G2A, a1: &G2A, a2: &G2A, context: 
 }
 
 /// Decrypt with a revealed shared point, after checking the receiver's proof.
-/// `Err` = the opening itself is invalid; `Ok(Err)` = valid opening, but the content is no scalar.
-pub fn open_with(receiver: &G2A, context: &[u8], sealed: &Sealed, o: &Opening) -> Result<Result<Fr, String>, String> {
+/// `Err` = the opening is missing or invalid (the receiver's fault); `Ok(Err)` = the ciphertext is
+/// malformed or holds no scalar (the sender's fault).
+pub fn open_with(receiver: &G2A, context: &[u8], sealed: &Sealed, o: Option<&Opening>) -> Result<Result<Fr, String>, String> {
+    if !sealed_ok(context, sealed) {
+        return Ok(Err("the ciphertext is malformed or its sender did not prove it made it".into()));
+    }
+    let o = o.ok_or("a well-formed ciphertext needs an opening")?;
     let (e, shared, a1, a2) = (point(&sealed.e)?, point(&o.shared)?, point(&o.a1)?, point(&o.a2)?);
     let z: Fr = from_hex(&o.z).map_err(|e| e.to_string())?;
     let c = dleq_challenge(receiver, &e, &shared, &a1, &a2, context);
@@ -206,12 +236,27 @@ mod tests {
 
         // a third party decrypts with the receiver's opening, and only with a correct one
         let o = b.reveal(b"ctx", &s).unwrap();
-        assert_eq!(open_with(&b.public, b"ctx", &s, &o).unwrap().unwrap(), v);
-        assert!(open_with(&a.public, b"ctx", &s, &o).is_err());
+        assert_eq!(open_with(&b.public, b"ctx", &s, Some(&o)).unwrap().unwrap(), v);
+        assert!(open_with(&a.public, b"ctx", &s, Some(&o)).is_err());
+        assert!(open_with(&b.public, b"ctx", &s, None).is_err());
         let mut bad = o.clone();
         bad.shared = to_hex(&G2::generator().into_affine());
-        assert!(open_with(&b.public, b"ctx", &s, &bad).is_err(), "a made-up shared point is refused");
-        assert!(open_with(&b.public, b"ctx", &s2, &o).is_err(), "an opening fits one ciphertext");
+        assert!(open_with(&b.public, b"ctx", &s, Some(&bad)).is_err(), "a made-up shared point is refused");
+        assert!(open_with(&b.public, b"ctx", &s2, Some(&o)).is_err(), "an opening fits one ciphertext");
+
+        // A ciphertext is opened only if its sender proved it knows e for this context. Someone who
+        // copies E from another message (to have the receiver reveal that message's pad) cannot.
+        let mut copied = seal(&b.public, b"mine", &v);
+        copied.e = s.e.clone();
+        assert!(!sealed_ok(b"mine", &copied));
+        assert!(b.open(b"mine", &copied).is_err() && b.reveal(b"mine", &copied).is_err());
+        let mut replayed = s.clone();
+        assert!(sealed_ok(b"ctx", &replayed) && !sealed_ok(b"other", &replayed));
+        assert!(b.reveal(b"other", &replayed).is_err());
+        replayed.pok = None;
+        assert!(b.reveal(b"ctx", &replayed).is_err());
+        // such a message convicts its sender without an opening
+        assert!(matches!(open_with(&b.public, b"mine", &copied, None), Ok(Err(_))));
 
         let p = pok_prove(&v, b"c");
         let pv = (G2::generator() * v).into_affine();

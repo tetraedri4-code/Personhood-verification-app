@@ -38,7 +38,7 @@
 //! A round that stalls after step 5 leaves the new epoch at some operators. Nothing was erased, the
 //! old epoch still works everywhere, and the next successful round erases the leftover.
 use crate::ident::{self, IdentityKey};
-use crate::round::{self, check_deal, check_spec, commit_hash, commitments_hash, pok_context, seal_context, Checked};
+use crate::round::{self, check_deal, check_spec, commit_hash, pok_context, seal_context, Checked};
 use crate::shamir::{commit, commitment_at, eval_poly, lagrange_at_zero};
 use crate::wire::*;
 use ark_ec::{AffineRepr, CurveGroup, Group};
@@ -55,7 +55,6 @@ use pop_crypto::codec::{from_hex, to_hex};
 use pop_crypto::params::{Fr, G1A, G2, G2A};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -89,6 +88,12 @@ pub enum Fault {
     BadShareTo(u32),
     /// as a receiver, complain about this dealer's (good) deal
     FalseComplaintAgainst(u32),
+    /// as a dealer, commit and deal one polynomial to this receiver and another to everyone else
+    EquivocateTo(u32),
+    /// as a receiver, send a ready message with a made-up hash
+    LyingReady,
+    /// as a dealer, send this receiver a ciphertext that copies its E from elsewhere (no proof of e)
+    CopiedCiphertextTo(u32),
 }
 
 impl OperatorConfig {
@@ -126,7 +131,6 @@ struct Persisted {
 struct GoodDeal {
     commitments: Vec<G2A>,
     value: Fr,
-    hash: String,
 }
 
 struct Out {
@@ -145,7 +149,8 @@ struct Round {
     commits: BTreeMap<u32, (String, Envelope)>,
     /// dealer ↦ its deal to me, checked
     deals: BTreeMap<u32, GoodDeal>,
-    readys: BTreeMap<u32, String>,
+    /// receiver ↦ (transcript hash, the signed commits it showed)
+    readys: BTreeMap<u32, (String, Vec<Envelope>)>,
     committed: BTreeMap<u32, (String, u64)>,
     outbox: Vec<Out>,
     /// my deals, made when I committed and held back until every dealer has committed
@@ -435,22 +440,47 @@ impl Operator {
             let (commitments, pok) = self.my_deal(r);
             // the proof of knowledge is randomized; fix it now so the committed hash matches the deal
             let hash = commit_hash(&commitments, &pok);
-            let env = queue(r, &Body::Commit { hash: hash.clone() }, &everyone);
+            let poly = r.poly.clone().expect("dealer");
+            // (test fault) a second polynomial with the same secret, shown to one receiver only
+            let two_faced = match self.cfg.test_fault {
+                Some(Fault::EquivocateTo(x)) if x != me => {
+                    let mut p2 = poly.clone();
+                    if let Some(c) = p2.last_mut() {
+                        *c += Fr::from(1u64);
+                    }
+                    let c2: Vec<String> = commit(&p2).iter().map(to_hex).collect();
+                    Some((x, p2, c2))
+                }
+                _ => None,
+            };
+            let others: Vec<u32> = everyone.iter().copied().filter(|t| two_faced.as_ref().is_none_or(|(x, ..)| x != t)).collect();
+            let env = queue(r, &Body::Commit { hash: hash.clone() }, &others);
+            if let Some((x, _, c2)) = &two_faced {
+                queue(r, &Body::Commit { hash: commit_hash(c2, &pok) }, &[*x]);
+            }
             r.commits.insert(me, (hash, env));
             r.sent_commit = true;
             // keep the exact deal that was committed to
-            let poly = r.poly.clone().expect("dealer");
             let mut deals = vec![];
             for to in r.spec.receivers.clone() {
-                let mut value = eval_poly(&poly, to);
+                let (poly, commitments) = match &two_faced {
+                    Some((x, p2, c2)) if *x == to => (p2, c2),
+                    _ => (&poly, &commitments),
+                };
+                let mut value = eval_poly(poly, to);
                 if self.cfg.test_fault == Some(Fault::BadShareTo(to)) {
                     value += Fr::from(1u64);
                 }
                 if to == me {
-                    let c: Vec<G2A> = commit(&poly);
-                    r.deals.insert(me, GoodDeal { hash: commitments_hash(&c), commitments: c, value });
+                    let c: Vec<G2A> = commit(poly);
+                    r.deals.insert(me, GoodDeal { commitments: c, value });
                 } else {
-                    let sealed = ident::seal(&r.checked.peers[&to].1, &seal_context(id, me, to), &value);
+                    let ctx = seal_context(id, me, to);
+                    let mut sealed = ident::seal(&r.checked.peers[&to].1, &ctx, &value);
+                    if self.cfg.test_fault == Some(Fault::CopiedCiphertextTo(to)) {
+                        // an E this dealer did not make for this message
+                        sealed.e = ident::seal(&r.checked.peers[&to].1, b"elsewhere", &value).e;
+                    }
                     deals.push((to, Body::Deal { to, commitments: commitments.clone(), pok: pok.clone(), sealed }));
                 }
             }
@@ -465,20 +495,21 @@ impl Operator {
         }
         // 4. ready
         if am_receiver && !r.sent_ready && r.spec.dealers.iter().all(|d| r.deals.contains_key(d)) {
-            let mut h = Sha256::new();
-            h.update(id.as_bytes());
-            for (d, deal) in &r.deals {
-                h.update(d.to_be_bytes());
-                h.update(deal.hash.as_bytes());
+            let mut transcript = round::transcript(id, r.commits.iter().map(|(d, (h, _))| (*d, h.as_str())));
+            let conflict = r.readys.iter().find(|(_, (t, _))| *t != transcript).map(|(other, (_, shown))| ready_conflict(r, *other, shown));
+            let commits: Vec<Envelope> = r.commits.values().map(|(_, e)| e.clone()).collect();
+            if self.cfg.test_fault == Some(Fault::LyingReady) {
+                transcript = round::transcript(id, std::iter::empty());
             }
-            let transcript = hex::encode(h.finalize());
-            if let Some((other, _)) = r.readys.iter().find(|(_, t)| **t != transcript) {
-                r.failed = Some(Failure { reason: format!("operator {other} saw other commitments than this operator: a dealer sent different deals"), blamed: None });
+            // sent even when this operator already knows the round has failed: its commits are the
+            // evidence the others need to reach the same verdict
+            queue(r, &Body::Ready { transcript: transcript.clone(), commits: commits.clone() }, &everyone);
+            r.readys.insert(me, (transcript, commits));
+            r.sent_ready = true;
+            if conflict.is_some() {
+                r.failed = conflict;
                 return Ok(());
             }
-            queue(r, &Body::Ready { transcript: transcript.clone() }, &everyone);
-            r.readys.insert(me, transcript);
-            r.sent_ready = true;
         }
         // 5. store the new share
         if am_receiver && r.sent_ready && r.stored.is_none() && r.spec.receivers.iter().all(|x| r.readys.contains_key(x)) {
@@ -534,9 +565,12 @@ impl Operator {
         }
         // 6. erase the older shares, once every receiver has its new share on disk
         if !r.done && r.spec.receivers.iter().all(|x| r.committed.contains_key(x)) {
-            let first = r.committed.values().next().cloned().expect("receivers");
-            if r.committed.values().any(|c| *c != first) {
-                r.failed = Some(Failure { reason: "operators stored different keys or epochs".into(), blamed: None });
+            // every receiver that agreed on the transcript computed the same key; this operator's own
+            // result, if it has one, says who did not
+            let first = r.stored.clone().unwrap_or_else(|| r.committed.values().next().cloned().expect("receivers"));
+            if let Some((who, _)) = r.committed.iter().find(|(_, c)| **c != first) {
+                let blamed = r.stored.is_some().then_some(*who);
+                r.failed = Some(Failure { reason: format!("operator {who} says it stored another key or epoch than the round produced"), blamed });
                 return Ok(());
             }
             let (key, epoch) = first;
@@ -666,16 +700,19 @@ impl Operator {
                     return Err(err(StatusCode::CONFLICT, "not every dealer has committed yet"));
                 }
                 let ctx = seal_context(&r.checked.id, from, me);
+                // `open` refuses a ciphertext whose sender did not prove it made it
                 let value = self.identity.open(&ctx, &sealed);
                 let verdict = check_deal(&r.spec, &r.checked.id, from, me, &commitments, &pok, value, &hash);
                 let verdict = if self.cfg.test_fault == Some(Fault::FalseComplaintAgainst(from)) { Err("test fault".to_string()) } else { verdict };
                 match verdict {
                     Ok((c, v)) => {
-                        r.deals.insert(from, GoodDeal { hash: commitments_hash(&c), commitments: c, value: v });
+                        r.deals.insert(from, GoodDeal { commitments: c, value: v });
                     }
                     Err(why) => {
                         // publish the evidence; every operator judges it for itself
-                        let opening = self.identity.reveal(&ctx, &sealed).map_err(bad)?;
+                        // a malformed ciphertext convicts the dealer as it stands; this operator's key
+                        // is raised only on a well-formed one
+                        let opening = if ident::sealed_ok(&ctx, &sealed) { Some(self.identity.reveal(&ctx, &sealed).map_err(bad)?) } else { None };
                         let body = Body::Complaint { deal: Box::new(env), commit: Box::new(commit_env), opening };
                         let complaint = self.envelope(&r.checked.id, &body);
                         for t in r.checked.peers.keys().copied().filter(|t| *t != me).collect::<Vec<_>>() {
@@ -685,19 +722,22 @@ impl Operator {
                     }
                 }
             }
-            Body::Ready { transcript } => {
+            Body::Ready { transcript, commits } => {
                 if !is_receiver {
                     return Err(bad("not a receiver"));
                 }
-                let mine = r.readys.get(&me).cloned();
+                if commits.len() > round::MAX_OPERATORS {
+                    return Err(bad("too many commits"));
+                }
+                let mine = r.readys.get(&me).map(|(t, _)| t.clone());
                 match r.readys.get(&from) {
-                    Some(t) if *t == transcript => {}
+                    Some((t, _)) if *t == transcript => {}
                     Some(_) => r.failed = Some(Failure { reason: format!("operator {from} sent two different ready messages"), blamed: Some(from) }),
                     None => {
                         if mine.is_some_and(|m| m != transcript) {
-                            r.failed = Some(Failure { reason: format!("operator {from} saw other commitments than this operator: a dealer sent different deals"), blamed: None });
+                            r.failed = Some(ready_conflict(r, from, &commits));
                         } else {
-                            r.readys.insert(from, transcript);
+                            r.readys.insert(from, (transcript, commits));
                         }
                     }
                 }
@@ -713,7 +753,7 @@ impl Operator {
                 }
             }
             Body::Complaint { deal, commit, opening } => {
-                r.failed = Some(match round::verify_complaint(&r.spec, &r.checked, from, &deal, &commit, &opening) {
+                r.failed = Some(match round::verify_complaint(&r.spec, &r.checked, from, &deal, &commit, opening.as_ref()) {
                     Ok(dealer) => Failure { reason: format!("operator {dealer} sent operator {from} a bad deal (proven by {from}'s complaint)"), blamed: Some(dealer) },
                     Err(why) => Failure { reason: format!("operator {from} made a complaint that does not hold: {why}"), blamed: Some(from) },
                 });
@@ -721,6 +761,23 @@ impl Operator {
         }
         Ok(())
     }
+}
+
+/// Operator `other`'s ready hash differs from this operator's. The commits it showed decide who is
+/// at fault: a dealer that signed two different commits, or `other` itself.
+fn ready_conflict(r: &Round, other: u32, shown: &[Envelope]) -> Failure {
+    for env in shown {
+        let Some((mine, _)) = r.commits.get(&env.from) else { continue };
+        if let Ok(Body::Commit { hash }) = round::open_envelope(env, &r.spec, &r.checked) {
+            if r.spec.dealers.contains(&env.from) && hash != *mine {
+                return Failure {
+                    reason: format!("operator {} signed two different commits: one to this operator and one to operator {other}", env.from),
+                    blamed: Some(env.from),
+                };
+            }
+        }
+    }
+    Failure { reason: format!("operator {other} sent a ready message that the commits it shows do not explain"), blamed: Some(other) }
 }
 
 type St = Arc<Operator>;

@@ -110,10 +110,16 @@ pub fn commit_hash(commitments: &[String], pok: &Option<Pok>) -> String {
     hex::encode(h.finalize())
 }
 
-pub fn commitments_hash(c: &[G2A]) -> String {
+/// What a receiver that accepted every deal has seen: each dealer's committed hash. Two receivers
+/// with the same transcript hold the same commitments from every dealer.
+pub fn transcript<'a>(round_id: &str, commits: impl Iterator<Item = (u32, &'a str)>) -> String {
     let mut h = Sha256::new();
-    for p in c {
-        h.update(ser(p));
+    h.update(b"pop-uniqueness-ready-v2");
+    h.update(round_id.as_bytes());
+    for (dealer, hash) in commits {
+        h.update(dealer.to_be_bytes());
+        h.update((hash.len() as u64).to_be_bytes());
+        h.update(hash.as_bytes());
     }
     hex::encode(h.finalize())
 }
@@ -180,7 +186,7 @@ pub fn open_envelope(env: &Envelope, spec: &RoundSpec, checked: &Checked) -> Res
 
 /// Is `complainer`'s complaint justified? `Ok(dealer)` = the dealer is proven to have sent a bad
 /// deal; `Err` = the complaint does not hold (and the complainer signed it).
-pub fn verify_complaint(spec: &RoundSpec, checked: &Checked, complainer: u32, deal: &Envelope, commit: &Envelope, opening: &Opening) -> Result<u32, String> {
+pub fn verify_complaint(spec: &RoundSpec, checked: &Checked, complainer: u32, deal: &Envelope, commit: &Envelope, opening: Option<&Opening>) -> Result<u32, String> {
     let dealer = deal.from;
     if commit.from != dealer || !spec.dealers.contains(&dealer) || !spec.receivers.contains(&complainer) {
         return Err("the evidence is not a dealer's commit and deal".into());
@@ -197,7 +203,7 @@ pub fn verify_complaint(spec: &RoundSpec, checked: &Checked, complainer: u32, de
     }
 }
 
-fn opened(checked: &Checked, round_id: &str, dealer: u32, complainer: u32, sealed: &Sealed, opening: &Opening) -> Result<Result<Fr, String>, String> {
+fn opened(checked: &Checked, round_id: &str, dealer: u32, complainer: u32, sealed: &Sealed, opening: Option<&Opening>) -> Result<Result<Fr, String>, String> {
     let (_, key) = checked.peers.get(&complainer).ok_or("complainer is not part of the round")?;
     ident::open_with(key, &seal_context(round_id, dealer, complainer), sealed, opening)
 }

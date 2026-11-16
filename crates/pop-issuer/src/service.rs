@@ -32,8 +32,8 @@ pub struct IssuerConfig {
     pub rollout_certified: Option<Day>,
     /// override "today" (tests)
     pub clock: Option<Clock>,
-    /// Recovery level 2 without the guardian key: days a replacement waits, during which the old app
-    /// can veto it (docs/recovery.md).
+    /// Recovery level 2 without the guardian key: days a replacement waits, during which a re-check
+    /// with the old app cancels it (docs/recovery.md).
     pub replace_wait_days: u32,
 }
 
@@ -62,6 +62,8 @@ pub struct Issuer {
     pub(crate) cfg: IssuerConfig,
     pub(crate) rev: RwLock<RevState>,
     pub(crate) rng: Mutex<ChaCha20Rng>,
+    /// one backup write at a time (a ticket must not pay for two backups)
+    pub(crate) backups: tokio::sync::Mutex<()>,
     /// Held while an enrolment record is read, decided on and written back (revoke, re-check,
     /// replace, claim, veto), so two requests about one person cannot both act on the old record.
     /// A deployment with several issuer processes needs compare-and-swap in its store instead.
@@ -179,7 +181,7 @@ impl Issuer {
         let tree = scheme.revocation_tree(&revoked)?;
         check_key_versions(&*uniq, &store).await?;
         let rev = RevState { epoch: 0, root: root_to_hex(&tree.root()), previous_root: None, revoked, tree };
-        Ok(Arc::new(Issuer { scheme, key, witness, lego, idp, uniq, store, cfg, rev: RwLock::new(rev), rng: Mutex::new(rng), records: tokio::sync::Mutex::new(()) }))
+        Ok(Arc::new(Issuer { scheme, key, witness, lego, idp, uniq, store, cfg, rev: RwLock::new(rev), rng: Mutex::new(rng), records: tokio::sync::Mutex::new(()), backups: tokio::sync::Mutex::new(()) }))
     }
 
     pub fn today(&self) -> Day {
@@ -379,7 +381,6 @@ pub fn router(issuer: Arc<Issuer>) -> Router {
         .route("/v1/replace", post(crate::recovery::replace))
         .route("/v1/replace/claim", post(crate::recovery::claim))
         .route("/v1/replace/pending", get(crate::recovery::pending))
-        .route("/v1/replace/veto", post(crate::recovery::veto))
         .route("/v1/backup", post(crate::backup::put))
         .route("/v1/backup/:id", get(crate::backup::get))
         .with_state(issuer)

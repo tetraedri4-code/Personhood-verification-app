@@ -141,6 +141,17 @@ impl Holder {
         Ok(Ctx { scheme: scheme.clone(), issuer_pk: IssuerPublicKey::from_hex(ipk)?, witness_pk: WitnessPublicKey::from_hex(wpk)?, today: p.today })
     }
 
+    /// A renewed credential runs to the end of this quarter or the next. Any other date would be a
+    /// value the issuer picked for this one person, and a mark it could recognise them by later.
+    pub(crate) fn check_new_expiry(today: Day, new_expiry: Day) -> Result<()> {
+        let q = dates::quarter_of(today);
+        if (q.saturating_sub(1)..=q + 2).any(|x| dates::quarter_end(x) == new_expiry) && new_expiry + 1 >= today {
+            Ok(())
+        } else {
+            Err(HolderError::Internal("the issuer set an unexpected expiry date".into()))
+        }
+    }
+
     pub(crate) fn credential(state: &WalletState) -> Result<Credential> {
         Ok(Credential::from_json(state.credential.as_ref().ok_or(HolderError::NotEnrolled)?)?)
     }
@@ -338,6 +349,7 @@ impl Holder {
             .await
             .map_err(|e| HolderError::Internal(e.to_string()))??;
         let r = self.issuer.renew(&RenewRequest { nonce: n, today: cx.today, revocation_root: root, proof }).await?;
+        Self::check_new_expiry(cx.today, r.new_expiry)?;
         let new = cx.scheme.finish_renewal(&cx.issuer_pk, &cred, rho, &r.signature, r.new_expiry)?;
         st.credential = Some(new.to_json());
         self.wallet.save(&st)?;

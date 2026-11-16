@@ -297,9 +297,12 @@ async fn replacing_the_secret() {
     assert!(phone.pending_replacement().await.unwrap().is_some(), "the old app is warned");
     let stranger = enrolled(d, "carol", "T-REPLACE-2").await;
     assert!(stranger.pending_replacement().await.unwrap().is_none(), "nobody else is");
-    assert!(matches!(stranger.veto_replacement().await, Err(HolderError::NoClaim)));
-    phone.veto_replacement().await.unwrap();
+    // she refuses with a re-check: her eID and the old secret together
+    let url = phone.recheck_start().await.unwrap();
+    let code = devnet::mock_login(&url, "T-REPLACE-1").await.unwrap();
+    phone.recheck_finish(&code).await.unwrap();
     assert!(phone.pending_replacement().await.unwrap().is_none());
+    assert!(thief.replace_claim().await.is_err());
     // the old secret was never touched
     phone.renew().await.unwrap();
 

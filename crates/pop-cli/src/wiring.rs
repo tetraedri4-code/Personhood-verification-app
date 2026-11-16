@@ -35,8 +35,8 @@ pub struct IssuerFile {
     /// `data_dir/uniqueness-keys/`. It counts as the oldest key.
     #[serde(default)]
     pub uniqueness_key: Option<String>,
-    /// Days a replacement of a lost secret waits when the old guardian key did not sign it; the old
-    /// app can refuse it in that time. Default 90.
+    /// Days a replacement of a lost secret waits when the old guardian key did not sign it; a
+    /// re-check with the old app cancels it in that time. Default 90.
     #[serde(default)]
     pub replace_wait_days: Option<u32>,
 }

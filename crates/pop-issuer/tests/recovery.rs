@@ -255,6 +255,7 @@ async fn replacement_with_the_guardian_key() {
 async fn replacement_without_the_guardian_key_waits_and_can_be_refused() {
     let w = world(90).await;
     let mut alice = w.enrol("alice").await;
+    let _ = &alice.guardian;
     let handle = alice.cred.handle();
 
     let (secrets, _, r) = w.replace("alice", None).await.unwrap();
@@ -276,19 +277,18 @@ async fn replacement_without_the_guardian_key_waits_and_can_be_refused() {
     w.advance(89);
     assert_eq!(status(&w.claim(&claim_token, &secrets).await.err().unwrap()), 409);
 
-    // a veto needs the guardian key of the old secret
-    let nonce = list[0].nonce.clone();
-    let bad = hex::encode(World::guardian().sign(&veto_message(handle, &nonce)).as_ref());
-    assert_eq!(status(&w.api.replace_veto(&VetoRequest { handle, nonce: nonce.clone(), signature: bad }).await.unwrap_err()), 401);
-    let sig = hex::encode(alice.guardian.sign(&veto_message(handle, &nonce)).as_ref());
-    w.api.replace_veto(&VetoRequest { handle, nonce: nonce.clone(), signature: sig.clone() }).await.unwrap();
+    // Refusing takes the eID and the old secret together: a re-check. Someone else's re-check, or
+    // a plain renewal with the old secret, changes nothing.
+    let mut bob = w.enrol("bob").await;
+    w.recheck(&mut bob, "bob").await.unwrap();
+    w.renew(&mut alice).await.unwrap();
+    assert_eq!(w.api.replace_pending().await.unwrap().entries.len(), 1);
+    w.recheck(&mut alice, "alice").await.unwrap();
     assert!(w.api.replace_pending().await.unwrap().entries.is_empty());
     w.advance(1);
     assert_eq!(status(&w.claim(&claim_token, &secrets).await.err().unwrap()), 404, "a refused replacement is gone");
-    // a veto is good for one request: the same signature does not refuse the next one
     let (s1, _, r1) = w.replace("alice", None).await.unwrap();
     let ReplaceResponse::Pending { claim_token: t1, .. } = r1 else { panic!() };
-    assert_eq!(status(&w.api.replace_veto(&VetoRequest { handle, nonce, signature: sig }).await.unwrap_err()), 404);
 
     // a newer request takes the place of the older one and starts the wait again
     w.advance(50);

@@ -47,7 +47,7 @@ pub(crate) async fn put(State(s): State<St>, Json(req): Json<BackupPut>) -> Resu
     }
     let key_hash = sha_hex(&req.write_key);
     // one writer at a time: a ticket must not pay for two backups
-    let _g = s.records.lock().await;
+    let _g = s.backups.lock().await;
     match s.store.get(T_BACKUPS, &req.id).await? {
         Some(old) => {
             if !ct_eq(old["write_key_hash"].as_str().unwrap_or_default().as_bytes(), key_hash.as_bytes()) {

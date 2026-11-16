@@ -7,8 +7,8 @@
 //!   same secret, so nothing changes for the person's accounts.
 //! * **Replacement (level 2)**: no backup, or the secret was stolen. After an eID login a new secret
 //!   is certified and the old one revoked. If this device still has the old guardian key that happens
-//!   at once; otherwise it waits and the old app can refuse it. The new secret starts a fresh
-//!   nine-month probation and has new pseudonyms.
+//!   at once; otherwise it waits, and the person can refuse it by doing a re-check with the old
+//!   app. The new secret starts a fresh nine-month probation and has new pseudonyms.
 use crate::holder::{Holder, HolderError};
 use crate::wallet::{BackupKeys, LocalBinding, PendingClaim, PendingEnrolment, WalletState};
 use base64::Engine;
@@ -30,7 +30,8 @@ type Result<T> = std::result::Result<T, HolderError>;
 pub enum ReplaceOutcome {
     /// the new secret is certified; likes and badges count from `counted_from`
     Issued { counted_from: String },
-    /// the old guardian key was not available: claim between these days, unless the old app refuses
+    /// the old guardian key was not available: claim between these days, unless a re-check with
+    /// the old app cancels it
     Waiting { claim_after: String, claim_before: String },
 }
 
@@ -173,6 +174,7 @@ impl Holder {
         if r.new_check != dates::month_start(cx.today) && r.new_check != dates::month_start(dates::today()) {
             return Err(HolderError::Internal("the issuer set an unexpected re-check month".into()));
         }
+        Self::check_new_expiry(cx.today, r.new_expiry)?;
         let new = cx.scheme.finish_recheck(&cx.issuer_pk, &cred, rho, &r.signature, r.new_expiry, r.new_check)?;
         st.credential = Some(new.to_json());
         st.pending = None;
@@ -383,24 +385,15 @@ impl Holder {
     }
 
     /// Is someone waiting to replace THIS device's secret? The app asks at every start and warns the
-    /// person: unless they asked for it themselves on a new device, they should refuse it.
+    /// person. Unless they asked for it themselves on a new device, they refuse it by doing the
+    /// identity re-check (`recheck_start`, `recheck_finish`): the eID and this device's secret
+    /// together outrank the eID alone. The guardian key alone refuses nothing, so a thief of the
+    /// phone cannot keep its owner from replacing the secret.
     pub async fn pending_replacement(&self) -> Result<Option<PendingReplacement>> {
         let st = self.wallet.load()?;
         let Ok(cred) = Self::credential(&st) else { return Ok(None) };
         let list = self.issuer.replace_pending().await?;
         Ok(list.entries.into_iter().find(|e| e.id == pending_id(cred.handle(), &e.nonce)))
-    }
-
-    /// Refuse the waiting replacement of this device's secret, signed with the guardian key.
-    pub async fn veto_replacement(&self) -> Result<()> {
-        let _g = self.busy.lock().await;
-        let st = self.wallet.load()?;
-        let cred = Self::credential(&st)?;
-        let entry = self.issuer.replace_pending().await?.entries.into_iter().find(|e| e.id == pending_id(cred.handle(), &e.nonce)).ok_or(HolderError::NoClaim)?;
-        let g = guardian_of(&st).ok_or(HolderError::NotEnrolled)?;
-        let signature = hex::encode(g.sign(&veto_message(cred.handle(), &entry.nonce)).as_ref());
-        self.issuer.replace_veto(&VetoRequest { handle: cred.handle(), nonce: entry.nonce, signature }).await?;
-        Ok(())
     }
 }
 

@@ -142,8 +142,10 @@ pub struct RecheckResponse {
 
 /// `POST /v1/replace`: replace the secret after an identity check (session purpose `replace`).
 /// With a signature of the enrolment's current guardian key the new credential is issued at once.
-/// Without it the request waits (`replace_wait_days`), the old app can veto it, and the holder
-/// collects the credential later with `POST /v1/replace/claim`.
+/// Without it the request waits (`replace_wait_days`) and the holder collects the credential later
+/// with `POST /v1/replace/claim`. In that time the person refuses it by doing a re-check
+/// (`POST /v1/recheck`) with the old app: that takes the eID and the old secret together, so neither
+/// a thief of the phone nor a thief of the eID can refuse or force a replacement alone.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReplaceRequest {
     pub session: String,
@@ -182,7 +184,7 @@ pub fn claim_session(claim_token: &str) -> Vec<u8> {
 }
 
 /// `GET /v1/replace/pending`: replacements that are waiting. A holder app looks for its own entry
-/// (`pending_id(handle)`) and warns the person; nobody else can tell whose an entry is.
+/// (`pending_id(handle, nonce)`) and warns the person; nobody else can tell whose an entry is.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PendingReplacements {
     pub entries: Vec<PendingReplacement>,
@@ -201,19 +203,6 @@ pub struct PendingReplacement {
 pub fn pending_id(handle: u64, nonce: &str) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(&Sha256::digest(format!("pop-replace-pending-v1|{handle}|{nonce}").as_bytes())[..16])
-}
-
-/// `POST /v1/replace/veto`: the old app refuses a pending replacement, signed with its guardian key
-/// over `veto_message(handle, nonce)`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct VetoRequest {
-    pub handle: u64,
-    pub nonce: String,
-    pub signature: String,
-}
-
-pub fn veto_message(handle: u64, nonce: &str) -> Vec<u8> {
-    format!("pop-replace-veto-v1|{handle}|{nonce}").into_bytes()
 }
 
 /// `POST /v1/backup`: store an encrypted backup (recovery level 1). The server sees ciphertext only.
@@ -364,7 +353,6 @@ pub trait IssuerApi: Send + Sync {
     async fn replace(&self, req: &ReplaceRequest) -> Result<ReplaceResponse, ApiError>;
     async fn replace_claim(&self, req: &ClaimRequest) -> Result<IssuanceResponse, ApiError>;
     async fn replace_pending(&self) -> Result<PendingReplacements, ApiError>;
-    async fn replace_veto(&self, req: &VetoRequest) -> Result<(), ApiError>;
     /// Returns a new ticket when the call deleted a backup.
     async fn backup_put(&self, req: &BackupPut) -> Result<Option<String>, ApiError>;
     async fn backup_get(&self, id: &str) -> Result<BackupBlob, ApiError>;

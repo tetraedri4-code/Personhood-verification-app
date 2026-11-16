@@ -102,7 +102,7 @@ impl RoundSpec {
         let mut h = Sha256::new();
         h.update(b"pop-uniqueness-round-v1");
         h.update(serde_json::to_vec(self).expect("spec serializes"));
-        hex::encode(&h.finalize()[..16])
+        hex::encode(h.finalize())
     }
 }
 
@@ -136,12 +136,19 @@ pub enum Body {
     /// dealer → one receiver: the Feldman commitments, and the polynomial's value at the receiver's
     /// index, encrypted to the receiver. Key generation adds a proof that the dealer knows its secret.
     Deal { to: u32, commitments: Vec<String>, pok: Option<Pok>, sealed: Sealed },
-    /// receiver → everyone: "all deals to me check out"; the hash covers every dealer's commitments
-    Ready { transcript: String },
+    /// receiver → everyone: "all deals to me check out". `transcript` is a hash over every dealer's
+    /// commit; `commits` are those signed commits, so that when two operators disagree, everyone
+    /// can see whether a dealer signed two different ones or the sender made its hash up.
+    Ready {
+        transcript: String,
+        #[serde(default)]
+        commits: Vec<Envelope>,
+    },
     /// receiver → everyone: "my new share is on disk"
     Committed { key: String, epoch: u64 },
     /// receiver → everyone: a deal that does not check out, opened so that anyone can verify
-    Complaint { deal: Box<Envelope>, commit: Box<Envelope>, opening: Opening },
+    /// (no opening when the deal's ciphertext is malformed: that is visible without one)
+    Complaint { deal: Box<Envelope>, commit: Box<Envelope>, opening: Option<Opening> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
