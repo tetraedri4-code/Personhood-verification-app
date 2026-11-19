@@ -22,7 +22,7 @@ What it does:
   cannot be linked.
 - **Stolen identities.** A first enrolment counts at once. If someone enrolled with your eID before
   you, your enrolment is refused and the app sends you to [sourced instructions for securing your
-  eID](docs/reset-eid.md) (Finnish banks, mobile certificates, ID card, police). Then you report "it
+  eID](docs/reset-eid/README.md) (every EU state, in English and its official languages). Then you report "it
   wasn't me": the other secret is suspended at once, and when many such reports come in, recent
   enrolments stop counting for a while ([recovery.md](docs/recovery.md) §4; a proposed change to the
   design, not yet folded into it).

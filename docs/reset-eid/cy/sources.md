@@ -1,0 +1,2 @@
+- Civil Registry and Migration Department, identity card: https://moi.gov.cy/moi/CRMD/crmd.nsf/All/9360684288FC9CE3C22588FA0046196E
+- Politis, Cyprus police launch DigiPol portal (news): https://en.politis.com.cy/news/cy-news/1011845/cyprus-police-launch-digipol-portal-with-more-than-30-online-services

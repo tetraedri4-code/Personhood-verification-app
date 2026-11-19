@@ -415,7 +415,21 @@ async fn the_help_page_is_public_and_the_directory_checks_the_alarm() {
     let csp = r.headers().get("content-security-policy").unwrap().to_str().unwrap().to_string();
     assert!(csp.contains("default-src 'none'"));
     let body = r.text().await.unwrap();
-    assert!(body.contains("<table>") && body.contains("617/2009"), "the page is rendered from docs/reset-eid.md");
+    assert!(body.contains("<datalist id=countries>") && body.contains("Finland (Suomi)"), "the index offers the searchable list");
+    // picking a country redirects to its page, keeping the chosen language when the page has it
+    let nf = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let r = nf.get(format!("{base}{}?lang=en&country=Finland+%28Suomi%29", pop_holder::RESET_EID_PATH)).send().await.unwrap();
+    assert!(r.status().is_redirection());
+    assert_eq!(r.headers()["location"], "/help/reset-eid/fi?lang=en");
+    let r = nf.get(format!("{base}{}?country=%3Cscript%3E", pop_holder::RESET_EID_PATH)).send().await.unwrap();
+    let body = r.text().await.unwrap();
+    assert!(body.contains("role=alert") && !body.contains("<script>"), "an unknown country is not echoed");
+    // a country page defaults to the country's main language, and English is offered
+    let body = reqwest::get(format!("{base}{}/fi", pop_holder::RESET_EID_PATH)).await.unwrap().text().await.unwrap();
+    assert!(body.contains("<html lang=fi>") && body.contains("617/2009") && body.contains("hreflang=en"));
+    let body = reqwest::get(format!("{base}{}/fi?lang=en", pop_holder::RESET_EID_PATH)).await.unwrap().text().await.unwrap();
+    assert!(body.contains("<html lang=en>") && body.contains("<table>"));
+    assert_eq!(reqwest::get(format!("{base}{}/xx", pop_holder::RESET_EID_PATH)).await.unwrap().status(), 404);
 
     // a proof made against a cutoff the directory does not know is refused before it is checked
     let alice = enrolled(d, "dailytruth", "T-HELP-2").await;

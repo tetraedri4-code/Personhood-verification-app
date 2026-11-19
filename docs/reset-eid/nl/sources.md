@@ -1,0 +1,4 @@
+- DigiD, Fraude en misbruik: https://www.digid.nl/veiligheid/fraude-misbruik
+- Rijksoverheid, Helpdesk DigiD: https://www.rijksoverheid.nl/contact/contactgids/helpdesk-digid
+- Rijksoverheid, Wat doe ik bij mogelijke identiteitsfraude?: https://www.rijksoverheid.nl/themas/recht-veiligheid-en-defensie/identiteitsfraude/vraag-en-antwoord/identiteitsfraude/wat-doe-ik-bij-mogelijke-identiteitsfraude
+- RvIG, Melding doen bij het CMI: https://www.rvig.nl/centraal-meldpunt-identiteitsfraude/melding-doen-bij-het-cmi

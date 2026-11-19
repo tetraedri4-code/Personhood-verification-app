@@ -1,0 +1,1 @@
+- DÁP mobile app terms (1 September 2024): https://app.dap.gov.hu/mobilapp-aszf/20240901.pdf

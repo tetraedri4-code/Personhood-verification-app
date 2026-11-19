@@ -1,0 +1,3 @@
+- PMLP, if your personal identification document has been lost, stolen or seized: https://www.pmlp.gov.lv/en/if-your-personal-identification-document-passport-or-eid-card-has-been-lost-stolen-or-seized
+- PMLP, in case of loss or theft and personal certificate: https://www.pmlp.gov.lv/en/what-do-case-loss-or-stealth-and-personal-certificate
+- Smart-ID customer service: https://www.smart-id.com/help/customer-service/

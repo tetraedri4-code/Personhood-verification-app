@@ -1,0 +1,5 @@
+- Swedbank, blocking help: https://www.swedbank.se/om-oss/sakerhet-och-bedragerier/sparrhjalp
+- Freja eID support: https://frejaeid.com/freja-support/
+- Swedish Police, passport and national ID card: https://polisen.se/tjanster-tillstand/pass-och-nationellt-id-kort/
+- Swedish Police, report a crime: https://polisen.se/utsatt-for-brott/polisanmalan/
+- Skatteverket, three ways to reduce the risk of identity theft: https://skatteverket.se/servicelankar/otherlanguages/englishengelska/news/news2025/news/threewaystoreducetheriskofidentitytheft.5.6491ed82199c4722dae51e.html

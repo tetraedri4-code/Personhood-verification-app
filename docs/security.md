@@ -171,6 +171,23 @@ losing an uncontested report, the issuer as the only counter of reports, and col
 alarm. The help page needs no pairing token, so a web page can tell that the holder app runs on a
 computer; the 401 of the other endpoints told it before, and browsers' private-network rules block it.
 
+### Review of the eID help pages for every member state, 19 November 2026
+
+The help page became one page per member state and language, with a country search and a language
+choice ([reset-eid/](reset-eid/README.md), `pop-holder/src/help.rs`). Two passes; the second found
+nothing new.
+
+| # | Problem | Effect | Fix | Test |
+|---|---|---|---|---|
+| 34 | Markdown was rendered with raw HTML passed through | With 61 pages, many translated, a stray or slipped-in tag (an `<iframe>`, a form, a link with odd markup) would have become part of the page; scripts were already blocked by the CSP | Raw HTML in the text is shown as text; every link in the pages and source lists must be `https://` | `raw_html_in_a_page_is_shown_as_text`, `links_in_pages_are_web_links` |
+| 35 | The page relied on `X-Frame-Options` only, and had no `nosniff` | Older browsers that ignore the header could frame it | CSP `frame-ancestors 'none'` and `X-Content-Type-Options: nosniff` added | `the_help_page_is_public_...` |
+
+Checked and found sound: nothing from the request is written into a page (an unknown country gives a
+fixed message, the language is picked from known codes), the redirect after a search is built only from
+a known country code and language, so it cannot point elsewhere; the search input is refused above 100
+bytes before it is copied; forms may submit only to the app (`form-action 'self'`); the pages stay
+outside the token check, as before, because they hold no personal data.
+
 ### Checked and found sound
 
 - **Proof verification.** Points are subgroup-checked on decoding; identity elements are rejected where

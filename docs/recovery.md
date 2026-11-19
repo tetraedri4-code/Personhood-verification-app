@@ -152,7 +152,7 @@ backdated γ would escape the alarm below.
 **Theft is noticed at enrolment.** Someone who enrols with a stolen eID login takes the identity's only
 place. When the real person enrols later, the issuer refuses (`AlreadyEnrolled`), and the app tells them
 what that means: either they enrolled before on another device, or their eID has been used by someone
-else. In the second case the app points to [reset-eid.md](reset-eid.md) (served by the holder app at
+else. In the second case the app points to [reset-eid/](reset-eid/README.md) (served by the holder app at
 `/help/reset-eid`, and linked from the extension's options when a suspension shows): close the eID
 with its provider, report the crime to the police, get new eID means, and only then come back.
 

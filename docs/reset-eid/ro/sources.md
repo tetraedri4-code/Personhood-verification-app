@@ -1,0 +1,4 @@
+- InfoCons (consumer association), steps after losing your ID card: https://infocons.ro/ai-ramas-fara-buletin-afla-care-sunt-pasii-de-urmat-si-cum-poti-obtine-noua-carte-electronica-de-identitate-cei-infocons-protectia-consumatorilor-te-informeaza/
+- DJEP Iași, general information on the CEI (2025): https://www.djep-iasi.ro/wp-content/uploads/2025/08/GENERALITATI-CEI.pdf
+- Ministry of Internal Affairs hub: https://hub.mai.gov.ro/
+- ROeID: https://www.roeid.ro/

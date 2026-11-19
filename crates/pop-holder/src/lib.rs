@@ -15,6 +15,7 @@
 //! It never talks to an identity provider: it only opens the URL the issuer hands it.
 //!
 //! [`local_api`] exposes a small HTTP API on 127.0.0.1 for the browser extension.
+pub mod help;
 pub mod holder;
 pub mod local_api;
 pub mod recovery;

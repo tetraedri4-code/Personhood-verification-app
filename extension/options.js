@@ -16,7 +16,7 @@ $("save").onclick = async () => {
   out("Saved.");
 };
 
-// The holder app serves the instructions for securing an eID at this path (docs/reset-eid.md).
+// The holder app serves the instructions for securing an eID at this path (docs/reset-eid/, one page per EU state and language).
 const RESET_EID_PATH = "/help/reset-eid";
 
 function helpLink() {

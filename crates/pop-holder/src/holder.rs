@@ -102,9 +102,10 @@ impl Ctx {
     }
 }
 
-/// Where the app's instructions for securing an eID are: docs/reset-eid.md, also served by the
+/// Where the app's instructions for securing an eID are: docs/reset-eid/ (one page per EU state and
+/// language), also served by the
 /// holder app at `/help/reset-eid` on its local address.
-pub const RESET_EID_HELP: &str = "https://github.com/tetraedri4-code/Personhood-verification-app/blob/main/docs/reset-eid.md";
+pub const RESET_EID_HELP: &str = "https://github.com/tetraedri4-code/Personhood-verification-app/blob/main/docs/reset-eid/README.md";
 pub const RESET_EID_PATH: &str = "/help/reset-eid";
 
 pub struct Holder {

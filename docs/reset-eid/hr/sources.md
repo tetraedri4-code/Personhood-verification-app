@@ -1,0 +1,3 @@
+- eid.hr, lost or stolen eID: https://eid.hr/en/electronic-id/articles/lost-or-stolen-eid
+- eid.hr, FAQ: https://eid.hr/en/faq
+- gov.hr, list of accepted credentials: https://gov.hr/hr/lista-prihvacenih-vjerodajnica/1792?lang=en

@@ -1,0 +1,2 @@
+- portal.gov.cz, reporting the loss or theft of an ID card: https://portal.gov.cz/en/sluzby-vs/ohlaseni-ztraty-nebo-odcizeni-obcanskeho-prukazu-S186
+- Lupa.cz, how locking login means in Identita občana works (press article, 7 July 2025): https://www.lupa.cz/clanky/jak-funguje-zamykani-prihlasovacich-prostredku-v-identite-obcana/

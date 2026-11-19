@@ -1,0 +1,1 @@
+- Identità, lost or stolen eID card: https://identita.gov.mt/identity-cards-unit/change-in-details/lost-or-stolen-eid-card/

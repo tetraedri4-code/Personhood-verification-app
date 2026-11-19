@@ -421,7 +421,7 @@ async fn a_theft_report_suspends_and_a_recheck_lifts_it() {
     assert_eq!(w.api.reports().await.unwrap().alarm_cutoff, None, "one report is no alarm");
 
     // Whoever holds the old secret and can log in with the eID lifts the suspension (if that was
-    // the thief, Alice's eID is not secured yet: docs/reset-eid.md). The secret stays, the handle is new.
+    // the thief, Alice's eID is not secured yet: docs/reset-eid/). The secret stays, the handle is new.
     w.advance(10);
     w.recheck(&mut thief, "alice").await.unwrap();
     assert!(thief.cred.secret() == secret);

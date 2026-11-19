@@ -1,0 +1,4 @@
+- CTIE, Electronic identity card (eID): https://ctie.gouvernement.lu/en/dossiers/eID/eID.html
+- Guichet.lu, Loss, theft or destruction of an ID card: https://guichet.public.lu/en/citoyens/citoyennete/papiers-identite/carte-identite/perte-vol.html
+- Guichet.lu, Theft or loss of your identity documents: act quickly: https://guichet.public.lu/en/citoyens/life-event/citoyennete/agir-perte-document.html
+- LuxTrust, Certificate revocation: https://luxtrust.com/en/my-luxtrust/my-certificate/revoke

@@ -1,0 +1,4 @@
+- FIM federal service description "elektronischer Identitätsnachweis Sperrung" (Hamburg procedure): https://fimportal.de/api/v0/xzufi-services/S100002/S1000020010000012152/de/pdf
+- City of Munich, Verlust oder Diebstahl Personalausweis: https://stadt.muenchen.de/service/info/verlust-oder-diebstahl-personalausweis/1076889/
+- City of Mainz, reporting the loss of an ID card: https://internet.mainz.de/en/vv/produkte/buergeramt/personalausweis-verlust-anzeigen
+- Bremen, revocation of signature certificates: https://www.service.bremen.de/dienstleistungen/revocation-of-signature-certificates-for-electronic-proof-of-identity-164983

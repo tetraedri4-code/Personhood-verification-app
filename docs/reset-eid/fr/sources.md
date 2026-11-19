@@ -1,0 +1,2 @@
+- France Identité: https://france-identite.gouv.fr/
+- service-public.fr, lost identity card: https://www.service-public.gouv.fr/particuliers/vosdroits/F1344

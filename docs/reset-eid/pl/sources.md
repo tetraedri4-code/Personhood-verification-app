@@ -1,0 +1,2 @@
+- gov.pl, report unauthorised use of your personal data (identity theft), void your ID card: https://www.gov.pl/web/gov/zglos-nieuprawnione-wykorzystanie-swoich-danych-osobowych-kradziez-tozsamosci--uniewaznij-dowod
+- gov.pl, documents under control, new services in mObywatel: https://www.gov.pl/web/uw-kujawsko-pomorski/dokumenty-pod-kontrola---nowe-uslugi-w-mobywatelu

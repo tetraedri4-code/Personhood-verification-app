@@ -46,30 +46,8 @@ pub fn router(holder: Arc<Holder>, token: String) -> Router {
         .layer(cors)
         .with_state(st)
         // public and fixed: the instructions for securing an eID, linked from the app's messages
-        .route("/help/reset-eid", get(reset_eid_help))
-}
-
-/// docs/reset-eid.md, built into the app so that it works without the network.
-pub const RESET_EID_MD: &str = include_str!("../../../docs/reset-eid.md");
-
-async fn reset_eid_help() -> Response {
-    let mut body = String::new();
-    pulldown_cmark::html::push_html(&mut body, pulldown_cmark::Parser::new_ext(RESET_EID_MD, pulldown_cmark::Options::ENABLE_TABLES));
-    let page = format!(
-        "<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">\
-         <title>Securing your eID</title><style>body{{font:16px/1.5 system-ui,sans-serif;max-width:46rem;margin:2rem auto;padding:0 1rem}}\
-         table{{border-collapse:collapse}}td,th{{border:1px solid #999;padding:.3rem .5rem;vertical-align:top}}</style><body>{body}</body></html>"
-    );
-    (
-        [
-            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-            // a fixed page from this program: no scripts, no framing
-            (header::CONTENT_SECURITY_POLICY, "default-src 'none'; style-src 'unsafe-inline'"),
-            (header::X_FRAME_OPTIONS, "DENY"),
-        ],
-        page,
-    )
-        .into_response()
+        .route(crate::holder::RESET_EID_PATH, get(crate::help::index))
+        .route("/help/reset-eid/:cc", get(crate::help::country_page))
 }
 
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {

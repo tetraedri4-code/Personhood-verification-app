@@ -1,0 +1,3 @@
+- Lithuanian MFA, lost your passport or identity card: https://uk.mfa.lt/en/consular-services/consular-issues/lost-your-passport-or-identity-card/231
+- Smart-ID customer service: https://www.smart-id.com/help/customer-service/
+- ePolicija: https://www.epolicija.lt/
