@@ -22,6 +22,11 @@ pub struct DevnetOpts {
     pub uniqueness: UniquenessMode,
     /// days a replacement without the old guardian key waits (None = the issuer's default, 90)
     pub replace_wait_days: Option<u32>,
+    /// the directory's `bucket_posts` (None = its default, 32)
+    pub bucket_posts: Option<u32>,
+    /// the issuer's `like_delay_max_secs` (None = 20 seconds here, so that trying it out is not slow;
+    /// the policy's default for a real deployment is 600)
+    pub like_delay_max_secs: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,7 +40,7 @@ pub enum UniquenessMode {
 
 impl Default for DevnetOpts {
     fn default() -> Self {
-        DevnetOpts { scheme: SchemeConfig::default(), data_dir: None, ports: [4000, 4001, 4002, 4003, 4004], uniqueness: UniquenessMode::Hmac, replace_wait_days: None }
+        DevnetOpts { scheme: SchemeConfig::default(), data_dir: None, ports: [4000, 4001, 4002, 4003, 4004], uniqueness: UniquenessMode::Hmac, replace_wait_days: None, bucket_posts: None, like_delay_max_secs: None }
     }
 }
 
@@ -202,20 +207,25 @@ pub async fn start(o: DevnetOpts) -> anyhow::Result<Devnet> {
         provider_code: 1,
         uniqueness: uniq_file,
         uniqueness_key: None,
-        policy: pop_issuer::Policy { replace_wait_days: o.replace_wait_days.unwrap_or(pop_issuer::Policy::default().replace_wait_days), ..Default::default() },
+        policy: pop_issuer::Policy {
+            replace_wait_days: o.replace_wait_days.unwrap_or(pop_issuer::Policy::default().replace_wait_days),
+            like_delay_max_secs: o.like_delay_max_secs.unwrap_or(20),
+            ..Default::default()
+        },
     })
     .await?;
-    serve(l_iss, wiring::with_gateway(pop_issuer::router(issuer))?);
+    let pad_sizes = issuer.params().pad_sizes;
+    serve(l_iss, wiring::with_gateway(pop_issuer::router(issuer), &pad_sizes)?);
 
     let platforms = wiring::platforms(&PlatformOpts { mockfeed_url: Some(feed_url.clone()), ..Default::default() });
     let dir = Directory::connect(
         Arc::new(HttpClient::new(&issuer_url)),
         platforms,
         wiring::store(o.data_dir.as_deref(), "directory-db")?,
-        DirectoryConfig::default(),
+        DirectoryConfig { bucket_posts: o.bucket_posts.unwrap_or(DirectoryConfig::default().bucket_posts), ..Default::default() },
     )
     .await?;
-    serve(l_dir, wiring::with_gateway(pop_directory::router(dir))?);
+    serve(l_dir, wiring::with_gateway(pop_directory::router(dir), &pad_sizes)?);
     // in a real deployment someone other than the operator of the servers runs the relay
     serve(l_relay, pop_ohttp::relay::router([("issuer".to_string(), issuer_url.clone()), ("directory".to_string(), directory_url.clone())].into())?);
 

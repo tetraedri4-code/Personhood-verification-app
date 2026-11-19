@@ -15,6 +15,8 @@ pub struct Oblivious {
     relay: String,
     http: reqwest::Client,
     keys: Mutex<Option<Vec<u8>>>,
+    /// size classes from the last answer
+    pad_sizes: std::sync::Mutex<Vec<u32>>,
 }
 
 fn t(e: impl std::fmt::Display) -> ApiError {
@@ -27,7 +29,7 @@ impl Oblivious {
         let loopback = matches!(u.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
         anyhow::ensure!(u.scheme() == "https" || (u.scheme() == "http" && loopback), "relay address must be https (or http on this computer)");
         let http = reqwest::Client::builder().timeout(Duration::from_secs(120)).redirect(reqwest::redirect::Policy::none()).build()?;
-        Ok(Oblivious { relay: relay.trim_end_matches('/').to_string(), http, keys: Mutex::new(None) })
+        Ok(Oblivious { relay: relay.trim_end_matches('/').to_string(), http, keys: Mutex::new(None), pad_sizes: std::sync::Mutex::new(crate::DEFAULT_PAD_SIZES.to_vec()) })
     }
 
     async fn keys(&self, refresh: bool) -> Result<Vec<u8>, ApiError> {
@@ -61,6 +63,8 @@ impl Transport for Oblivious {
         }
         let mut plain = vec![];
         m.write_bhttp(bhttp::Mode::KnownLength, &mut plain).map_err(t)?;
+        let sizes = self.pad_sizes.lock().unwrap().clone();
+        crate::pad(&mut plain, &sizes);
         for attempt in 0..2 {
             let keys = self.keys(attempt > 0).await?;
             let (enc, ctx) = ohttp::ClientRequest::from_encoded_config_list(&keys).map_err(t)?.encapsulate(&plain).map_err(t)?;
@@ -78,6 +82,9 @@ impl Transport for Oblivious {
             let mut c = Cursor::new(&inner[..]);
             let resp = bhttp::Message::read_bhttp::<Cursor<&[u8]>, Cursor<&[u8]>>(&mut c).map_err(t)?;
             let status = resp.control().status().ok_or_else(|| t("not a response"))?.code();
+            if let Some(s) = resp.header().get(crate::PAD_HEADER.as_bytes()).and_then(crate::parse_pad_sizes) {
+                *self.pad_sizes.lock().unwrap() = s;
+            }
             return Ok(RawResponse { status, body: resp.content().to_vec() });
         }
         Err(t("the gateway's key keeps changing"))

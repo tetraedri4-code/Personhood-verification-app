@@ -393,6 +393,88 @@ impl Holder {
 
     /// Report a like with a one-per-person tag. Returns the verified count of the post.
     /// The request carries no account and no pseudonym, and tags of different posts are unlinkable.
+    /// The random wait before a like is proved and sent: from 0 to the issuer's `like_delay_max_secs`.
+    /// Without it, the moment a public count goes up shows when the person clicked, which a relay that
+    /// sees their address could match.
+    pub async fn like_delay(&self) -> Result<std::time::Duration> {
+        use rand::Rng;
+        let max = self.params().await?.like_delay_max_secs as u64 * 1000;
+        Ok(std::time::Duration::from_millis(OsRng.gen_range(0..=max)))
+    }
+
+    /// Check at once what can be checked before the wait (credential, probation, post id), then queue
+    /// the like: it is proved and sent after [`Holder::like_delay`]. Survives a restart of the app
+    /// ([`Holder::resume_queued_likes`]). Returns the canonical post id and the longest wait in seconds.
+    pub async fn like_later(self: &Arc<Self>, platform: &str, raw_post: &str) -> Result<(String, u32)> {
+        let (post, new) = {
+            let _g = self.busy.lock().await;
+            let mut st = self.wallet.load()?;
+            let cred = Self::credential(&st)?;
+            let post = self.platforms.get(platform).ok_or_else(|| HolderError::UnknownPlatform(platform.into()))?.canonical_post_id(raw_post).await?;
+            self.check_probation(&cred, &self.ctx().await?)?;
+            let k = format!("{platform}|{post}");
+            // already sent or waiting: nothing more goes out
+            let new = !st.queued_likes.contains(&k) && !st.liked.contains(&k);
+            if new {
+                st.queued_likes.push(k);
+                self.wallet.save(&st)?;
+            }
+            (post, new)
+        };
+        if new {
+            self.spawn_queued(platform.to_string(), post.clone()).await?;
+        }
+        Ok((post, self.params().await?.like_delay_max_secs))
+    }
+
+    async fn spawn_queued(self: &Arc<Self>, platform: String, post: String) -> Result<()> {
+        let delay = self.like_delay().await?;
+        let h = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            if let Err(e) = h.like(&platform, &post).await {
+                tracing::warn!("a queued like could not be reported: {e}");
+            }
+            // sent or refused, it leaves the queue; a refused like can be clicked again
+            let _g = h.busy.lock().await;
+            if let Ok(mut st) = h.wallet.load() {
+                st.queued_likes.retain(|k| k != &format!("{platform}|{post}"));
+                let _ = h.wallet.save(&st);
+            }
+        });
+        Ok(())
+    }
+
+    /// How many likes wait to be sent.
+    pub fn queued_likes(&self) -> usize {
+        self.wallet.load().map(|s| s.queued_likes.len()).unwrap_or(0)
+    }
+
+    /// Queue again the likes that were waiting when the app stopped, each with a new random wait.
+    pub async fn resume_queued_likes(self: &Arc<Self>) -> Result<usize> {
+        let q = self.wallet.load()?.queued_likes;
+        for k in &q {
+            if let Some((platform, post)) = k.split_once('|') {
+                self.spawn_queued(platform.to_string(), post.to_string()).await?;
+            }
+        }
+        Ok(q.len())
+    }
+
+    fn check_probation(&self, cred: &Credential, cx: &Ctx) -> Result<()> {
+        let cutoff = cx.cutoff();
+        if cred.attrs.certified > cutoff {
+            return Err(match cx.alarm {
+                Some(a) if cred.attrs.certified <= cx.today => HolderError::Probation(format!(
+                    "the end of the alarm about stolen eID logins (secrets counting from after {} are paused)",
+                    dates::fmt_day(a)
+                )),
+                _ => HolderError::Probation(dates::fmt_day(cred.attrs.certified)),
+            });
+        }
+        Ok(())
+    }
+
     pub async fn like(&self, platform: &str, raw_post: &str) -> Result<LikeResponse> {
         let _g = self.busy.lock().await;
         let mut st = self.wallet.load()?;
@@ -448,7 +530,8 @@ impl Holder {
     }
 
     pub fn has_liked(&self, platform: &str, canonical_post: &str) -> bool {
-        self.wallet.load().map(|s| s.liked.contains(&format!("{platform}|{canonical_post}"))).unwrap_or(false)
+        let k = format!("{platform}|{canonical_post}");
+        self.wallet.load().map(|s| s.liked.contains(&k) || s.queued_likes.contains(&k)).unwrap_or(false)
     }
 
     // ------------------------------------------------------------ renewal, revocation

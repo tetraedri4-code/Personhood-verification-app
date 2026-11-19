@@ -46,6 +46,9 @@ enum Cmd {
         /// lease of a badge, in days (default nine months)
         #[arg(long, default_value_t = 274, value_parser = clap::value_parser!(u32).range(7..=3650))]
         lease_days: u32,
+        /// posts with likes per count bucket that readers download (more: more private, more data)
+        #[arg(long, default_value_t = 32, value_parser = clap::value_parser!(u32).range(1..=100_000))]
+        bucket_posts: u32,
     },
     /// Run an Oblivious HTTP relay (RFC 9458) in front of the issuer's and directory's gateways, so
     /// that they do not see the holder's address (docs/relay.md). Someone other than their operator
@@ -342,6 +345,14 @@ struct DevnetArgs {
     /// standby) or `hmac` (one keyed hash inside the issuer)
     #[arg(long, default_value = "threshold")]
     uniqueness: String,
+    /// the directory's posts per count bucket (default 32; the demo's few posts then fit in one, so
+    /// readers sync the whole table; 1 makes them use buckets)
+    #[arg(long)]
+    bucket_posts: Option<u32>,
+    /// the issuer's longest random wait before a like is sent, in seconds (default 20 here; 600 in a
+    /// real deployment's policy)
+    #[arg(long)]
+    like_delay_max_secs: Option<u32>,
 }
 
 #[derive(Args, Clone, Default)]
@@ -479,6 +490,8 @@ fn devnet_opts(a: &DevnetArgs) -> anyhow::Result<DevnetOpts> {
             "hmac" => devnet::UniquenessMode::Hmac,
             _ => anyhow::bail!("--uniqueness must be threshold or hmac"),
         },
+        bucket_posts: a.bucket_posts,
+        like_delay_max_secs: a.like_delay_max_secs,
         ..Default::default()
     })
 }
@@ -708,6 +721,9 @@ async fn holder_cmd(a: HolderArgs) -> anyhow::Result<()> {
             println!("Badge withdrawn.");
         }
         HolderCmd::Like { platform, post } => {
+            let wait = h.like_delay().await?;
+            println!("Waiting {} s before sending (a random wait, so the count does not go up the moment you liked)...", wait.as_secs());
+            tokio::time::sleep(wait).await;
             let r = h.like(&platform, &post).await?;
             println!("Reported. New person: {}. Verified likes on this post: {}.", r.new, r.count);
         }
@@ -859,18 +875,21 @@ async fn main() -> anyhow::Result<()> {
             let f: IssuerFile = serde_json::from_slice(&std::fs::read(&config).with_context(|| format!("cannot read {}", config.display()))?)?;
             let issuer = wiring::build_issuer(&f).await?;
             println!("Issuer listening on http://{listen}");
-            serve(listen, wiring::with_gateway(pop_issuer::router(issuer))?).await?;
+            let pad_sizes = issuer.params().pad_sizes;
+            serve(listen, wiring::with_gateway(pop_issuer::router(issuer), &pad_sizes)?).await?;
         }
-        Cmd::Directory { listen, issuer_url, data_dir, platforms, lease_days } => {
+        Cmd::Directory { listen, issuer_url, data_dir, platforms, lease_days, bucket_posts } => {
             let d = Directory::connect(
                 Arc::new(HttpClient::new(&issuer_url)),
                 wiring::platforms(&platforms.into()),
                 wiring::store(data_dir.as_deref(), "directory-db")?,
-                DirectoryConfig { lease_days, ..Default::default() },
+                DirectoryConfig { lease_days, bucket_posts, ..Default::default() },
             )
             .await?;
             println!("Directory listening on http://{listen}");
-            serve(listen, wiring::with_gateway(pop_directory::router(d))?).await?;
+            // the directory's gateway pads to the issuer's size classes
+            let pad_sizes = pop_protocol::api::IssuerApi::params(&HttpClient::new(&issuer_url)).await?.pad_sizes;
+            serve(listen, wiring::with_gateway(pop_directory::router(d), &pad_sizes)?).await?;
         }
         Cmd::Relay { listen, gateways } => {
             let mut m = std::collections::BTreeMap::new();

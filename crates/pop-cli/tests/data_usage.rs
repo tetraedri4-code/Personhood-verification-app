@@ -125,7 +125,7 @@ impl DirectoryApi for Counting {
 async fn data_usage() {
     for (name, ps) in [("LegoGroth16 (default)", ProofSystem::LegoGroth16), ("Bulletproofs", ProofSystem::Bulletproofs)] {
         // tree depth 8 (65,000 revocations) is the default of a real deployment
-        let d = devnet::start(DevnetOpts { scheme: SchemeConfig { proof_system: ps, ..Default::default() }, data_dir: None, ports: [0; 5], uniqueness: devnet::UniquenessMode::Hmac, replace_wait_days: None })
+        let d = devnet::start(DevnetOpts { scheme: SchemeConfig { proof_system: ps, ..Default::default() }, data_dir: None, ports: [0; 5], uniqueness: devnet::UniquenessMode::Hmac, replace_wait_days: None, bucket_posts: None, like_delay_max_secs: None })
             .await
             .unwrap();
         let tally = Arc::new(Tally::default());

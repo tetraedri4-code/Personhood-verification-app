@@ -25,6 +25,8 @@ async fn net() -> &'static Devnet {
                     ports: [0; 5],
                     uniqueness: devnet::UniquenessMode::Hmac,
                     replace_wait_days: None,
+                    bucket_posts: None,
+                    like_delay_max_secs: Some(2),
                 })
                 .await
                 .unwrap();
@@ -237,6 +239,7 @@ async fn readers_download_only_changes() {
 async fn holder_local_api_needs_the_pairing_token() {
     let d = net().await;
     let h = Arc::new(enrolled(d, "alice", "T-LOCAL-1").await);
+    let h2 = h.clone();
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", l.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(l, pop_holder::local_api::router(h, "correct-token-0123".into())).await.unwrap() });
@@ -258,6 +261,15 @@ async fn holder_local_api_needs_the_pairing_token() {
     assert!(r.headers().get("access-control-allow-origin").is_none());
     let r = c.post(format!("{base}/v1/like")).header("x-pop-token", "correct-token-0123").json(&body).send().await.unwrap();
     assert_eq!(r.status(), 200);
+    // the like is queued, then proved and sent after a random wait (at most 2 s in this devnet)
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(v["queued"], true);
+    assert!(h2.has_liked("mockfeed", "p3"), "a queued like counts as liked for the person at once");
+    assert!(h2.queued_likes() <= 1);
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    // sent: out of the queue and still liked (a like the directory refused would be neither)
+    assert_eq!(h2.queued_likes(), 0);
+    assert!(h2.has_liked("mockfeed", "p3"), "the queued like reached the directory");
 }
 
 #[tokio::test]
@@ -443,4 +455,45 @@ async fn the_help_page_is_public_and_the_directory_checks_the_alarm() {
     req.alarm_cutoff = Some(1);
     req.nonce = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into();
     assert_eq!(status(&dir(d).bind(&req).await.unwrap_err()), 409);
+}
+
+#[tokio::test]
+async fn count_buckets_partition_the_table() {
+    let d = net().await;
+    let alice = enrolled(d, "alice", "T-BUCKET-1").await;
+    alice.like("mockfeed", "p1").await.unwrap();
+    alice.like("mockfeed", "p4").await.unwrap();
+    let c = dir(d);
+    let bits: serde_json::Value = c.get("/v1/likes/buckets?platform=mockfeed").await.unwrap();
+    assert!(bits["bits"].as_u64().unwrap() <= 20);
+    // the four buckets at 2 bits hold exactly the table, each post in the bucket of its hash
+    let r: serde_json::Value = c.post("/v1/likes/buckets", &serde_json::json!({"platform": "mockfeed", "bits": 2, "buckets": [0, 1, 2, 3]})).await.unwrap();
+    let mut seen = std::collections::BTreeMap::new();
+    for (b, m) in r["buckets"].as_object().unwrap() {
+        for (post, n) in m.as_object().unwrap() {
+            assert_eq!((pop_directory::bucket_hash("mockfeed", post) >> 30).to_string(), *b);
+            seen.insert(post.clone(), n.as_u64().unwrap());
+        }
+    }
+    let table: CountTable = c.get("/v1/likes/table?platform=mockfeed").await.unwrap();
+    for (post, n) in &seen {
+        assert!(table.counts.get(post).is_some_and(|t| t >= n), "{post}");
+    }
+    assert!(seen.contains_key("p1") && seen.contains_key("p4"));
+    // one bucket only: the posts of the other buckets are not in the answer
+    let b = pop_directory::bucket_hash("mockfeed", "p1") >> 30;
+    let one: serde_json::Value = c.post("/v1/likes/buckets", &serde_json::json!({"platform": "mockfeed", "bits": 2, "buckets": [b]})).await.unwrap();
+    for post in one["buckets"][b.to_string()].as_object().unwrap().keys() {
+        assert_eq!(pop_directory::bucket_hash("mockfeed", post) >> 30, b);
+    }
+    // limits
+    for bad in [
+        serde_json::json!({"platform": "mockfeed", "bits": 21, "buckets": [0]}),
+        serde_json::json!({"platform": "mockfeed", "bits": 2, "buckets": [4]}),
+        serde_json::json!({"platform": "mockfeed", "bits": 2, "buckets": []}),
+        serde_json::json!({"platform": "mockfeed", "bits": 0, "buckets": [0, 0]}),
+        serde_json::json!({"platform": "mockfeed", "bits": 10, "buckets": (0..65).collect::<Vec<u32>>()}),
+    ] {
+        assert_eq!(status(&c.post::<_, serde_json::Value>("/v1/likes/buckets", &bad).await.unwrap_err()), 400, "{bad}");
+    }
 }

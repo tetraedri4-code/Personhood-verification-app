@@ -57,8 +57,9 @@ HTTP and TLS overhead, not a measurement.
 
 The extension shows badges and counts for every account and post on a page, without telling the
 directory which ones the person looks at. It therefore keeps the platform's whole list of bound
-accounts and the whole table of like counts, in the browser's storage, and once a minute while a page
-of that platform is open asks only for what changed since the last time.
+accounts in the browser's storage, and once a minute while a page of that platform is open asks only
+for what changed since the last time. It does the same with the table of like counts while the
+platform has few posts with likes, and then switches to buckets (below).
 
 | | Size |
 |---|---|
@@ -73,14 +74,25 @@ person browses, and, at the first sync of a session, the changes since the last 
 the extension downloaded both lists in full every minute (23 MB per hour of browsing at 1,000 accounts
 and 10,000 posts); now that example costs a few kB per hour.
 
-**What still grows with the system.** The changes are those of the whole platform. If 100,000 enrolled
-people each report ten likes a day, roughly a million counts change a day; a person browsing all day
-would download each post whose count changed once per minute it changed in: up to about 30 MB a day
-at that size if every like is on a different post, less in practice. Someone who browses an hour a day
-pays about the same at the start of the session, for the posts changed since the last one. The table also never forgets old posts. The next steps, not built, are in the design and in
-[real-servers.md](real-servers.md) §5: split the table into buckets by a prefix of the hashed post id and
-keep only buckets for posts actually seen, sync less often in the background, and drop posts older than
-a few weeks from the synced table (asking for one old post's bucket when it is shown).
+**What still grows with the system: count buckets.** Synced whole, the counts table grows with the
+platform: if 100,000 enrolled people each report ten likes a day, roughly a million counts change a
+day, up to about 30 MB a day for someone browsing all day. So once a platform has more posts with
+likes than one bucket holds (the directory's `--bucket-posts`, default 32), the extension stops syncing
+the table and asks instead for the buckets of the posts on screen:
+
+- A post's bucket is the top bits of SHA-256(platform | post id). The directory chooses how many bits so
+  that a bucket holds about 32 posts with likes on average (`GET /v1/likes/buckets?platform=`), and
+  more bits as the platform grows (at most 20, about a million buckets).
+- One request per screen (`POST /v1/likes/buckets`, up to 64 buckets), however many posts it shows.
+  A bucket fetched in the last minute is not fetched again.
+- The directory learns which buckets were asked for, not which of their posts: about 1 in 32.
+
+Cost per screen of new posts: one bucket per post (posts on one screen rarely share a bucket), each
+about 32 posts at the sizes above: about 2.5 kB per bucket for Bluesky ids, about 1 kB gzipped. A
+screen of 10 new posts is then about 25 kB, 10 kB gzipped (through a relay: not compressed, and padded
+to the next size class, here 32 kB). This is an estimate from the per-post sizes above, not a
+measurement. It no longer depends on how many likes the whole platform gets, only on how much the
+person scrolls. A larger `bucket_posts` hides more and costs proportionally more.
 
 Removed claims are remembered for 30 days; a reader away longer downloads the whole list again.
 

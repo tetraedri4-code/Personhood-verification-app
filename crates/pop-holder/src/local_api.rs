@@ -30,6 +30,13 @@ pub fn new_token() -> String {
 }
 
 pub fn router(holder: Arc<Holder>, token: String) -> Router {
+    // likes that were waiting when the app stopped
+    let h = holder.clone();
+    tokio::spawn(async move {
+        if let Err(e) = h.resume_queued_likes().await {
+            tracing::warn!("queued likes not resumed: {e}");
+        }
+    });
     let st = St { holder, token: Arc::new(token) };
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(|o: &HeaderValue, _| {
@@ -89,9 +96,12 @@ struct LikeReq {
     post: String,
 }
 
+/// Queues the like: it is proved and sent after a random wait (the issuer's `like_delay_max_secs`), so
+/// the answer only says it is queued. What can fail early (no credential, probation, a bad post id)
+/// fails here.
 async fn like(State(s): State<St>, Json(r): Json<LikeReq>) -> Response {
-    match s.holder.like(&r.platform, &r.post).await {
-        Ok(v) => Json(v).into_response(),
+    match s.holder.like_later(&r.platform, &r.post).await {
+        Ok((post, within)) => Json(json!({"queued": true, "post": post, "within_secs": within})).into_response(),
         Err(e) => fail(e),
     }
 }

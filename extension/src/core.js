@@ -3,8 +3,9 @@
 //
 // Privacy rules this file keeps:
 //  * It never asks a server about an account or a post. The background worker keeps the whole public
-//    list of verified accounts and the whole table of counts (syncing only changes), and this file
-//    looks things up locally.
+//    list of verified accounts (syncing only changes), and this file looks accounts up locally. For
+//    counts it asks for the buckets of the posts on screen, each bucket holding many posts, in one
+//    request per screen (or keeps the whole table while it is small).
 //  * A like is reported only if the person switched reporting on in the options.
 //  * Everything from the directory and from the page is treated as untrusted text: it reaches the DOM
 //    only through textContent and title, never as HTML.
@@ -37,7 +38,6 @@
       state.today = r.today;
       state.alarm = Number.isInteger(r.alarm) ? r.alarm : null;
       state.seen = r.seen || {};
-      state.counts = r.counts || {};
       // an account can have several claims (anyone enrolled can name any account); keep them all
       state.list = new Map();
       state.byHandle = new Map();
@@ -122,9 +122,10 @@
         // let the site handle the click first, then see whether the post is now liked
         setTimeout(async () => {
           if (!adapter.isLiked(btn)) return;
-          const r = await send({ type: "like", platform: adapter.id, post: id });
+          const r = await send({ type: "like", platform: adapter.id, post: id, shown: state.mine.has(id) ? null : Number(state.counts[id] || 0) });
           if (r && !r.error) {
-            state.counts[id] = r.count;
+            // the holder app sends the like after a random wait; show it now
+            if (!state.mine.has(id)) state.counts[id] = Number(state.counts[id] || 0) + 1;
             state.mine.add(id);
             scan();
           }
@@ -150,9 +151,17 @@
       try {
         await noteProfile();
         for (const a of adapter.findAccounts(document)) drawBadge(a.el, entryFor(a));
+        const found = [];
         for (const post of adapter.findPosts(document)) {
           const id = await adapter.canonicalPostId(post.raw, { byHandle: state.byHandle, send });
-          if (!id) continue;
+          if (id) found.push([post, id]);
+        }
+        // one request for the whole screen
+        const r = found.length ? await send({ type: "counts", platform: adapter.id, posts: found.map(([, id]) => id) }) : null;
+        if (r && r.counts) {
+          for (const [id, n] of Object.entries(r.counts)) state.counts[id] = n;
+        }
+        for (const [post, id] of found) {
           hookLike(post, id);
           drawCount(post, id);
         }

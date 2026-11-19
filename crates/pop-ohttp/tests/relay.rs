@@ -97,3 +97,31 @@ async fn the_relay_refuses_what_is_not_an_encrypted_request() {
     assert_eq!(h.post(format!("{rel}/svc")).header("content-type", "message/ohttp-req").body("garbage").send().await.unwrap().status(), 400);
     assert!(relay::router(BTreeMap::from([("../x".to_string(), svc)])).is_err());
 }
+
+#[tokio::test]
+async fn messages_are_padded_so_their_size_says_little() {
+    // a relay that records the sizes it passes on
+    let sizes: Arc<Mutex<Vec<usize>>> = Default::default();
+    let svc = serve(gateway::wrap(service(Default::default()), gateway::Gateway::generate().unwrap())).await;
+    let rel = serve(relay::router(BTreeMap::from([("svc".to_string(), svc.clone())])).unwrap()).await;
+    let (sz, rel2) = (sizes.clone(), rel.clone());
+    let spy = serve(Router::new().route(
+        "/svc",
+        post(move |body: axum::body::Bytes| {
+            let (sz, rel) = (sz.clone(), rel2.clone());
+            async move {
+                let r = reqwest::Client::new().post(format!("{rel}/svc")).header("content-type", "message/ohttp-req").body(body.clone()).send().await.unwrap();
+                let b = r.bytes().await.unwrap();
+                sz.lock().unwrap().extend([body.len(), b.len()]);
+                ([("content-type", "message/ohttp-res")], b)
+            }
+        }),
+    ).route("/svc/keys", get({ let rel = rel.clone(); move || async move { let r = reqwest::get(format!("{rel}/svc/keys")).await.unwrap(); ([("content-type", "application/ohttp-keys")], r.bytes().await.unwrap()) } })))
+    .await;
+    let c = HttpClient::with_transport(&svc, Arc::new(Oblivious::new(&format!("{spy}/svc")).unwrap()));
+    let _: Value = c.post("/v1/echo", &json!("a")).await.unwrap();
+    let _: Value = c.post("/v1/echo", &json!("a much longer request body than the first, still small")).await.unwrap();
+    let s = sizes.lock().unwrap().clone();
+    assert_eq!(s[0], s[2], "requests of different lengths look the same: {s:?}");
+    assert_eq!(s[1], s[3], "answers of different lengths look the same: {s:?}");
+}

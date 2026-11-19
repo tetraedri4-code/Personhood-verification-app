@@ -259,7 +259,7 @@ async fn replacement_with_the_guardian_key() {
     assert!(matches!(w.replace("alice", Some(&new.guardian)).await.unwrap().2, ReplaceResponse::Issued { .. }));
 
     // after probation the replaced secret likes again
-    let (secrets, _, r) = { w.advance(31); w.replace("alice", Some(&World::guardian())).await.err().map(|e| assert_eq!(status(&e), 401)); w.replace("alice", None).await.unwrap() };
+    let (secrets, _, r) = { w.advance(31); if let Err(e) = w.replace("alice", Some(&World::guardian())).await { assert_eq!(status(&e), 401) } w.replace("alice", None).await.unwrap() };
     let ReplaceResponse::Pending { claim_token, .. } = r else { panic!() };
     w.advance(90);
     let c = w.claim(&claim_token, &secrets).await.unwrap();

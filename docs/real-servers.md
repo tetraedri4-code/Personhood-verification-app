@@ -141,13 +141,17 @@ at start. The settings in force are public at `GET /v1/policy`.
     "reach_days": 28                       // enrolments from this long before stop counting
   },
   "previous_root_grace_secs": 120,         // proofs against the previous revocation root are taken this long
-  "max_backup_chars": 44000                // largest encrypted backup
+  "max_backup_chars": 44000,               // largest encrypted backup
+  "pad_sizes": [1024, 4096, 16384, 65536, 262144, 1048576],  // relay messages are padded to these sizes
+  "like_delay_max_secs": 600               // holders wait a random 0 to 600 s before sending a like
 }
 ```
 
 (JSON has no comments: they only explain the fields here.) See [recovery.md](recovery.md) for what each
 rule does. Set the alarm from the counts of real weeks; the counts are public at `GET /v1/reports`. The
-badge lease is a setting of the directory (`pop directory --lease-days`, default 274). The two-year
+badge lease is a setting of the directory (`pop directory --lease-days`, default 274), and so is the
+size of count buckets (`--bucket-posts`, default 32). The relay settings are explained in
+[relay.md](relay.md); the directory's gateway takes the size classes from the issuer's parameters. The two-year
 re-check and the twelve months an expired credential can still renew are part of the proof statement
 and not settings: changing them means new proving keys for every holder and verifier.
 
@@ -178,11 +182,13 @@ The tree depth is in the scheme configuration: capacity is 4^depth − 1 revoked
 
 ## 5. Like counts
 
-The extension keeps the whole counts table of a platform and syncs it (`GET /v1/likes/table?since=N`),
-so the directory does not learn which posts a person looks at; the same holds for the list of bound
-accounts (`GET /v1/bindings?since=N`). The first download is still the whole table. At scale, split it
-into buckets by a prefix of the hashed post id, so a reader keeps only the buckets of posts it has seen
-and a request reveals only a bucket. Removed claims are remembered for 30 days; a reader away longer
+While a platform has few posts with likes, the extension keeps its whole counts table and syncs it
+(`GET /v1/likes/table?since=N`), so the directory does not learn which posts a person looks at; the
+same holds for the list of bound accounts (`GET /v1/bindings?since=N`). Beyond that it asks for count
+buckets (`GET`/`POST /v1/likes/buckets`), each holding about `pop directory --bucket-posts` posts
+(default 32); a request reveals only buckets, about 1 in 32 posts ([data-usage.md](data-usage.md)).
+The directory keeps the counts ordered by bucket in memory, rebuilt from `like_counts` at start; with
+a database, an index on (platform, bucket hash) replaces it. Removed claims are remembered for 30 days; a reader away longer
 gets the whole list again. A store that keeps change numbers needs them to be atomic with the write,
 which the prototype gets from the directory's write lock. An enrolled person can report likes for post ids that do not exist; the
 directory only checks the id's form. Tags are unlinkable by design, so this cannot be limited per

@@ -63,13 +63,35 @@ different windows. With many users that says little; a real deployment should pu
 everyone can check it is the same (for instance in the issuer's signed parameters) and have clients
 compare.
 
+## Size and time
+
+Encryption hides what a message says, not how long it is or when it is sent. Both are issuer settings
+(`policy` in the issuer configuration, public at `GET /v1/policy` and in `/v1/params`):
+
+- **`pad_sizes`** (default 1, 4, 16, 64, 256 KiB and 1 MiB). Every request and answer through a relay
+  is padded with zero bytes (RFC 9292 allows this) to the smallest size in the list that fits, or
+  beyond the largest to a multiple of it. Without it the relay could tell a like report from a
+  download, or match an answer to one of the public count buckets by its length. Both gateways pad
+  answers with the issuer's sizes and name them inside every encrypted answer; clients pad requests
+  with the sizes of the last answer (the defaults until then).
+- **`like_delay_max_secs`** (default 600). The holder app waits a random time from 0 to this before it
+  proves and sends a like. The relay sees when a person's computer sends something, and anyone can see
+  when a public count goes up; without the wait, the two together would tie the person to the post when
+  there are few users. The extension shows the like at once and keeps showing it until it has surely
+  arrived; the holder keeps waiting likes in the wallet across a restart. The proof is made after the
+  wait, so it uses the revocation root of that moment. (`pop devnet` and `pop demo` default to 20 s;
+  `--like-delay-max-secs` changes it.)
+
 ## What it does not do
 
-- **No delay and no cover traffic.** The design's relays hold reports back and mix them (§4.7). Here a
-  request goes through at once, so the server still sees when a report was made, and a binding sent
-  right after an enrolment is still linkable by timing when there are few users.
+- **No mixing and no cover traffic.** The design's relays also mix reports and add dummy ones (§4.7).
+  The random wait spreads likes over ten minutes; with very few users that window may still hold only
+  one person's likes. Bindings and renewals are sent at once: a binding right after an enrolment is
+  still linkable by timing when there are few users.
+- **Size classes are coarse.** Messages in the same class look the same; a like report (about 4 KiB)
+  is still in a different class from a small download.
 - **The eID login goes straight to the identity provider and back to the issuer** in the browser. The
   issuer learns who the person is at that moment anyway.
-- **Answers are capped at 32 MB.** The full list and counts table pass through the relay; at a very
-  large scale they would not, which the bucketed downloads address.
+- **Answers are capped at 32 MB.** The full list of bound accounts passes through the relay; at a very
+  large scale it would not. Counts switch to buckets as the platform grows.
 - **The relay can still count** how many requests an address sends and when, and drop them.

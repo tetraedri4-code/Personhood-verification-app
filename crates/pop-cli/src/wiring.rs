@@ -247,9 +247,11 @@ pub fn build_holder_via(issuer_url: &str, directory_url: &str, relays: &Relays, 
     Ok(Holder::new(Arc::new(client(issuer_url, relays.issuer.as_deref())?), Arc::new(client(directory_url, relays.directory.as_deref())?), platforms, wallet))
 }
 
-/// A server's routes with an Oblivious HTTP gateway in front (`POST /ohttp`, `GET /ohttp/keys`).
-pub fn with_gateway(app: axum::Router) -> anyhow::Result<axum::Router> {
-    Ok(pop_ohttp::gateway::wrap(app, pop_ohttp::gateway::Gateway::generate()?))
+/// A server's routes with an Oblivious HTTP gateway in front (`POST /ohttp`, `GET /ohttp/keys`),
+/// padding answers to the issuer's size classes (`policy.pad_sizes`; empty: the defaults).
+pub fn with_gateway(app: axum::Router, pad_sizes: &[u32]) -> anyhow::Result<axum::Router> {
+    let sizes = if pad_sizes.is_empty() { pop_ohttp::DEFAULT_PAD_SIZES.to_vec() } else { pad_sizes.to_vec() };
+    Ok(pop_ohttp::gateway::wrap(app, pop_ohttp::gateway::Gateway::with_pad_sizes(sizes)?))
 }
 
 pub fn mock_oidc(idp_url: &str, issuer_url: &str) -> OidcConfig {

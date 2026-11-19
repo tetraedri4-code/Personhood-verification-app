@@ -41,6 +41,14 @@ pub struct Params {
     /// `dates::count_cutoff(today, alarm_cutoff)`.
     #[serde(default)]
     pub alarm_cutoff: Option<Day>,
+    /// Size classes for messages through a relay (the issuer's `policy.pad_sizes`); the directory's
+    /// gateway pads with them too. Empty: the defaults of the relay code.
+    #[serde(default)]
+    pub pad_sizes: Vec<u32>,
+    /// A holder waits a random time up to this before it proves and sends a like, so that the moment
+    /// a count goes up does not show when the person clicked (`policy.like_delay_max_secs`).
+    #[serde(default)]
+    pub like_delay_max_secs: u32,
 }
 
 /// `GET /v1/reports`: how many people said "it wasn't me" per week, and the rule that turns them into

@@ -22,13 +22,35 @@ pub struct DirectoryConfig {
     pub clock: Option<Clock>,
     /// lease of a badge, in days (design §4.5: nine months)
     pub lease_days: u32,
+    /// how many posts with likes a count bucket should hold on average (docs/data-usage.md). Readers
+    /// fetch the buckets of the posts they see; a bucket hides which of its posts they were looking at.
+    /// Larger is more private and costs more data. While all posts of a platform fit in one bucket,
+    /// readers download the whole table and sync only its changes instead.
+    pub bucket_posts: u32,
 }
 
 impl Default for DirectoryConfig {
     fn default() -> Self {
-        DirectoryConfig { clock: None, lease_days: 274 }
+        DirectoryConfig { clock: None, lease_days: 274, bucket_posts: 32 }
     }
 }
+
+/// Finest bucket split offered (about a million buckets).
+pub const MAX_BUCKET_BITS: u32 = 20;
+/// Buckets per request.
+pub const MAX_BUCKETS_PER_REQUEST: usize = 64;
+
+/// The first 32 bits of SHA-256(platform | post): the top `bits` of it are the post's bucket. Readers
+/// compute the same (extension/src/background.js).
+pub fn bucket_hash(platform: &str, post: &str) -> u32 {
+    use sha2::{Digest, Sha256};
+    let h = Sha256::digest(format!("{platform}|{post}").as_bytes());
+    u32::from_be_bytes([h[0], h[1], h[2], h[3]])
+}
+
+/// Counts by platform, ordered by bucket hash, so that a bucket is a range. Rebuilt from the store at
+/// start; a database would keep an index on (platform, hash) instead.
+type BucketIndex = BTreeMap<String, BTreeMap<(u32, String), u64>>;
 
 pub struct Directory {
     scheme: Arc<Scheme>,
@@ -43,6 +65,7 @@ pub struct Directory {
     store: SharedStore,
     cfg: DirectoryConfig,
     write: tokio::sync::Mutex<()>,
+    buckets: RwLock<BucketIndex>,
 }
 
 const T_BIND: &str = "bindings";
@@ -65,6 +88,16 @@ impl Directory {
     /// Fetch the issuer's public parameters (and LegoGroth16 verifying keys) and start.
     pub async fn connect(issuer_api: Arc<dyn IssuerApi>, platforms: PlatformRegistry, store: SharedStore, cfg: DirectoryConfig) -> anyhow::Result<Arc<Self>> {
         anyhow::ensure!((7..=3650).contains(&cfg.lease_days), "lease_days must be between 7 and 3650");
+        anyhow::ensure!((1..=100_000).contains(&cfg.bucket_posts), "bucket_posts must be between 1 and 100000");
+        let mut buckets = BucketIndex::new();
+        for (k, v) in store.list(T_COUNTS).await? {
+            if let Some((platform, post)) = k.split_once('|') {
+                let n = count_of(&v).0;
+                if n > 0 {
+                    buckets.entry(platform.to_string()).or_default().insert((bucket_hash(platform, post), post.to_string()), n);
+                }
+            }
+        }
         let p = issuer_api.params().await?;
         let scheme = Arc::new(Scheme::new(p.config.clone()));
         for k in &p.statements {
@@ -82,6 +115,7 @@ impl Directory {
             store,
             cfg,
             write: tokio::sync::Mutex::new(()),
+            buckets: RwLock::new(buckets),
         }))
     }
 
@@ -386,6 +420,8 @@ impl Directory {
             count += 1;
             let seq = self.next_seq().await?;
             self.store.put(T_COUNTS, &pk, json!({"n": count, "seq": seq})).await?;
+            let h = bucket_hash(&req.platform, &req.post_id);
+            self.buckets.write().unwrap().entry(req.platform.clone()).or_default().insert((h, req.post_id.clone()), count);
         }
         Ok(LikeResponse { new, count })
     }
@@ -424,6 +460,7 @@ pub fn router(d: Arc<Directory>) -> Router {
         .route("/v1/likes", post(like))
         .route("/v1/likes/counts", post(counts))
         .route("/v1/likes/table", get(table))
+        .route("/v1/likes/buckets", get(bucket_bits).post(buckets))
         // the list and table are public and repetitive: gzip shrinks them several times over. Nothing
         // secret is in any answer here, so compression cannot leak one (as in the BREACH attack).
         .layer(CompressionLayer::new())
@@ -544,6 +581,73 @@ async fn counts(State(d): State<St>, Json(req): Json<CountsRequest>) -> Result<J
     Ok(Json(CountsResponse { counts }))
 }
 
+/// How finely the counts of a platform are split: buckets of about `bucket_posts` posts each.
+fn bits_for(posts: usize, target: u32) -> u32 {
+    let mut b = 0;
+    while b < MAX_BUCKET_BITS && posts > (target as usize) << b {
+        b += 1;
+    }
+    b
+}
+
+#[derive(Deserialize)]
+struct BucketQ {
+    platform: String,
+}
+
+/// `{"bits": b}`: readers fetch buckets at this split. 0 means one bucket: read the whole table
+/// (`/v1/likes/table`) and sync its changes instead.
+async fn bucket_bits(State(d): State<St>, Query(q): Query<BucketQ>) -> Json<serde_json::Value> {
+    let n = d.buckets.read().unwrap().get(&q.platform).map_or(0, |m| m.len());
+    Json(json!({"bits": bits_for(n, d.cfg.bucket_posts)}))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BucketsReq {
+    platform: String,
+    bits: u32,
+    buckets: Vec<u32>,
+}
+
+/// The counts of every post in the asked buckets (the top `bits` bits of [`bucket_hash`]), by bucket;
+/// an empty bucket is in the answer too. The answer also says the split currently recommended.
+async fn buckets(State(d): State<St>, Json(req): Json<BucketsReq>) -> Result<Json<serde_json::Value>, ApiErr> {
+    if req.bits > MAX_BUCKET_BITS {
+        return Err(err(StatusCode::BAD_REQUEST, "bits too large"));
+    }
+    if req.buckets.is_empty() || req.buckets.len() > MAX_BUCKETS_PER_REQUEST {
+        return Err(err(StatusCode::BAD_REQUEST, "between 1 and 64 buckets per request"));
+    }
+    if req.buckets.iter().any(|b| u64::from(*b) >> req.bits != 0) {
+        return Err(err(StatusCode::BAD_REQUEST, "bucket out of range"));
+    }
+    // each bucket once: otherwise one request could ask for the whole table 64 times (security.md #43)
+    if req.buckets.iter().collect::<std::collections::BTreeSet<_>>().len() != req.buckets.len() {
+        return Err(err(StatusCode::BAD_REQUEST, "a bucket is asked for twice"));
+    }
+    let idx = d.buckets.read().unwrap();
+    let all = idx.get(&req.platform);
+    let mut out = serde_json::Map::new();
+    for b in req.buckets {
+        let shift = 32 - req.bits;
+        let lo = if req.bits == 0 { 0 } else { u64::from(b) << shift };
+        let hi = if req.bits == 0 { 1u64 << 32 } else { (u64::from(b) + 1) << shift };
+        let mut m = serde_json::Map::new();
+        if let Some(all) = all {
+            for ((h, post), n) in all.range((lo as u32, String::new())..) {
+                if u64::from(*h) >= hi {
+                    break;
+                }
+                m.insert(post.clone(), json!(n));
+            }
+        }
+        out.insert(b.to_string(), serde_json::Value::Object(m));
+    }
+    let n = all.map_or(0, |m| m.len());
+    Ok(Json(json!({"platform": req.platform, "bits": bits_for(n, d.cfg.bucket_posts), "buckets": out})))
+}
+
 /// Every non-zero count of a platform, or those changed after `since`. Extensions keep the table and
 /// sync it instead of asking about the posts on a page, so the directory does not learn what anyone
 /// reads. At scale the table is also split into buckets (docs/real-servers.md).
@@ -563,4 +667,22 @@ async fn table(State(d): State<St>, Query(q): Query<ListQ>) -> Result<Json<Count
         })
         .collect();
     Ok(Json(CountTable { platform: q.platform, instance, seq, full, counts }))
+}
+
+#[cfg(test)]
+mod bucket_tests {
+    use super::*;
+
+    #[test]
+    fn buckets_hold_about_the_set_number_of_posts() {
+        assert_eq!(bits_for(0, 32), 0);
+        assert_eq!(bits_for(32, 32), 0);
+        assert_eq!(bits_for(33, 32), 1);
+        assert_eq!(bits_for(32 * 1024, 32), 10);
+        assert_eq!(bits_for(usize::MAX / 2, 32), MAX_BUCKET_BITS);
+        for n in [100usize, 5_000, 1_000_000] {
+            let b = bits_for(n, 32);
+            assert!(n >> b <= 32 && (b == 0 || n >> (b - 1) > 32), "{n} posts: {b} bits");
+        }
+    }
 }

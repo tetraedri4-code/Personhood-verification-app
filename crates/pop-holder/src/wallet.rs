@@ -16,6 +16,9 @@ pub struct WalletState {
     pub bindings: Vec<LocalBinding>,
     /// posts this person reported a like for: "platform|post"
     pub liked: Vec<String>,
+    /// likes waiting for their random wait to end before they are proved and sent: "platform|post"
+    #[serde(default)]
+    pub queued_likes: Vec<String>,
     /// keys of the encrypted backup, derived from the paper code (the code itself is not kept)
     #[serde(default)]
     pub backup: Option<BackupKeys>,

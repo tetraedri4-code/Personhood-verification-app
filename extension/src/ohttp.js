@@ -81,6 +81,25 @@
     throw new Error("too long");
   }
   const vec = (b) => cat(varint(b.length), b);
+  // Zero bytes at the end (RFC 9292 padding) up to a size class: encryption hides content but not
+  // length, and the relay must not tell requests apart by size. The classes are the issuer's setting;
+  // the gateway sends them with every answer (pop-pad-sizes) and the defaults apply until then.
+  const DEFAULT_PAD_SIZES = [1024, 4096, 16384, 65536, 262144, 1048576];
+  const padSizes = new Map(); // relay address -> classes
+  function parsePadSizes(v) {
+    if (typeof v !== "string") return null;
+    const s = v.split(",").map((x) => Number(x.trim()));
+    const ok = s.length >= 1 && s.length <= 16 && s.every((n, i) => Number.isInteger(n) && n >= 256 && n <= 16 << 20 && (i === 0 || n > s[i - 1]));
+    return ok ? s : null;
+  }
+  function pad(m, sizes) {
+    let n = sizes.find((s) => s >= m.length);
+    if (n === undefined) {
+      const top = sizes[sizes.length - 1];
+      n = Math.ceil(m.length / top) * top;
+    }
+    return cat(m, new Uint8Array(n - m.length));
+  }
   function encodeRequest(method, url, body) {
     const u = new URL(url);
     const fields = body ? cat(vec(te.encode("content-type")), vec(te.encode("application/json"))) : EMPTY;
@@ -140,7 +159,7 @@
   // Send one request through `relay` (e.g. https://relay.example/directory). `url` is the address on the
   // server; only its path and host go inside the encrypted request. Returns { status, headers, body }.
   async function request(relay, method, url, body) {
-    const plain = encodeRequest(method, url, body ? te.encode(body) : null);
+    const plain = pad(encodeRequest(method, url, body ? te.encode(body) : null), padSizes.get(relay) || DEFAULT_PAD_SIZES);
     for (let attempt = 0; attempt < 2; attempt++) {
       const list = attempt === 0 && keys.has(relay) ? keys.get(relay) : await fetchKeys(relay);
       const { id, pk } = pickKey(list);
@@ -157,7 +176,10 @@
       const secret = await lExpand(SUITE, s.exporter, "sec", te.encode("message/bhttp response"), Math.max(NN, NK));
       const prk = await hmac(cat(s.enc, res.subarray(0, Math.max(NN, NK))), secret);
       const inner = await aead("decrypt", await expand(prk, te.encode("key"), NK), await expand(prk, te.encode("nonce"), NN), res.subarray(Math.max(NN, NK)));
-      return decodeResponse(inner);
+      const answer = decodeResponse(inner);
+      const sizes = parsePadSizes(answer.headers["pop-pad-sizes"]);
+      if (sizes) padSizes.set(relay, sizes);
+      return answer;
     }
     throw new Error("relay: the gateway's key keeps changing");
   }

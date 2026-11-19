@@ -250,6 +250,8 @@ impl Issuer {
             today: self.today(),
             providers,
             alarm_cutoff: self.alarm_cutoff(),
+            pad_sizes: self.cfg.policy.pad_sizes.clone(),
+            like_delay_max_secs: self.cfg.policy.like_delay_max_secs,
         }
     }
 

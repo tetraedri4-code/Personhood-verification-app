@@ -65,7 +65,7 @@ Step by step instead of the scripted demo:
 pop devnet                                   # terminal 1: the four services
 pop holder enrol                             # terminal 2: opens the mock bank ID in your browser
 pop holder --mockfeed-url http://127.0.0.1:4000 --mockfeed-as alice bind mockfeed alice
-pop holder --mockfeed-url http://127.0.0.1:4000 like mockfeed p3
+pop holder --mockfeed-url http://127.0.0.1:4000 like mockfeed p3   # sent after a random wait
 pop holder serve                             # local API for the extension
 pop holder recheck                           # the two-year identity re-check
 pop holder backup                            # encrypted backup; prints a paper code
@@ -92,7 +92,7 @@ The directory must be started with `--bluesky` to accept Bluesky bindings.
 
 ```sh
 cargo test --release --workspace             # crypto, adapters, servers, end-to-end, security checks
-POP_PAIRING_TOKEN=0123456789abcdef0123 pop demo &
+POP_PAIRING_TOKEN=0123456789abcdef0123 pop demo --like-delay-max-secs 2 &   # add --bucket-posts 1 for bucket mode
 POP_PAIRING_TOKEN=0123456789abcdef0123 node extension/test/e2e.mjs   # extension in a real Chromium
 node extension/test/ohttp.mjs                # the extension's relay client against the Rust gateway
 cargo audit                                  # dependency advisories

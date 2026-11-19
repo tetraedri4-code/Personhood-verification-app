@@ -247,6 +247,31 @@ and validates gateway names; both clients accept only https or loopback relay ad
 content types; the answer is authenticated (AES-GCM) before the extension parses it; the extension's
 HPKE code gives the same bytes as the Rust gateway expects (tested against it).
 
+### Review of padding, the random wait before likes, and count buckets, 19 November 2026
+
+Relay messages are padded to the issuer's size classes, holders wait a random time (issuer setting,
+default up to 10 minutes) before proving and sending a like, and the extension fetches count buckets
+for the posts on screen once a platform outgrows one bucket. Two passes; the second found nothing new.
+
+| # | Problem | Effect | Fix | Test |
+|---|---|---|---|---|
+| 43 | A bucket request could name the same bucket many times | With one bucket for everything, a single request made the directory gather the whole table 64 times | Each bucket at most once per request | `count_buckets_partition_the_table` |
+| 44 | Clicking like again on a post already liked or waiting queued another send | One more message through the relay for each click: harmless to the count, but more traffic tied to the click | Nothing more is sent for a post already liked or waiting | `holder_local_api_needs_the_pairing_token` |
+
+Checked and found sound: the like proof is made after the wait, so it is against the revocation root
+of that moment (a proof made before a ten-minute wait would be refused after a revocation); waiting
+likes survive a restart of the holder app and are dropped (not retried forever) if refused; the
+extension's own-like display is bounded by the count at the click plus one and expires; the size
+classes a client adopts from an answer must pass the same bounds as the issuer's setting; padding is
+zero bytes after the message, which both binary HTTP readers ignore; the JavaScript bucket hash is the
+same as the directory's (the browser test checks counts in bucket mode).
+
+Known and not fixed: **the directory chooses the bucket size**, and a dishonest one could make buckets
+of one post. **A screen's set of buckets can point to the page:** ten posts of one profile fall into ten
+buckets, and few other pages give the same set, so the directory can guess that someone viewed that
+profile. Buckets hide single posts, not pages. Through a relay the directory does not learn who; without
+one it learns the address. Use a relay.
+
 ### Checked and found sound
 
 - **Proof verification.** Points are subgroup-checked on decoding; identity elements are rejected where
