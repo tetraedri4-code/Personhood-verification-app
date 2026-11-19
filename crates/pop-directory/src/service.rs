@@ -28,7 +28,10 @@ pub struct Directory {
     issuer_api: Arc<dyn IssuerApi>,
     issuer_pk: IssuerPublicKey,
     witness_pk: WitnessPublicKey,
-    roots: RwLock<(String, Option<String>)>,
+    /// the issuer's current and previous revocation roots, and when they were fetched
+    roots: RwLock<(String, Option<String>, std::time::Instant)>,
+    /// the issuer's alarm cutoff and when it was last fetched
+    alarm: RwLock<(Option<Day>, std::time::Instant)>,
     platforms: PlatformRegistry,
     store: SharedStore,
     cfg: DirectoryConfig,
@@ -65,7 +68,8 @@ impl Directory {
             issuer_pk: IssuerPublicKey::from_hex(&p.issuer_public_key)?,
             witness_pk: WitnessPublicKey::from_hex(&p.witness_public_key)?,
             issuer_api,
-            roots: RwLock::new((rv.root, rv.previous_root)),
+            roots: RwLock::new((rv.root, rv.previous_root, std::time::Instant::now())),
+            alarm: RwLock::new((p.alarm_cutoff, std::time::Instant::now())),
             platforms,
             store,
             cfg,
@@ -141,20 +145,68 @@ impl Directory {
         Ok(())
     }
 
-    /// Accept a proof's revocation root if it is the issuer's current or previous one.
+    /// The revocation roots are fetched again when older than this. A root is never trusted for longer:
+    /// a secret suspended a moment ago can prove against the root from before, which must stop working
+    /// within minutes (the issuer offers the previous root for two minutes after a change).
+    const ROOTS_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Accept a proof's revocation root if it is the issuer's current one, or the previous one shortly
+    /// after a change.
     async fn check_root(&self, root: &str) -> Result<(), ApiErr> {
-        let known = |r: &(String, Option<String>)| r.0 == root || r.1.as_deref() == Some(root);
-        if known(&self.roots.read().unwrap()) {
-            return Ok(());
+        let known = |r: &(String, Option<String>, std::time::Instant)| r.0 == root || r.1.as_deref() == Some(root);
+        let stale = || err(StatusCode::CONFLICT, "stale revocation root; fetch the issuer's /v1/revocations and prove again");
+        {
+            let r = self.roots.read().unwrap();
+            let age = r.2.elapsed();
+            if age < Self::ROOTS_TTL && known(&r) {
+                return Ok(());
+            }
+            // ask the issuer again, but not more than every few seconds whatever proofs arrive
+            if age < std::time::Duration::from_secs(2) {
+                return Err(stale());
+            }
         }
         let rv = self.issuer_api.revocations().await.map_err(|e| err(StatusCode::BAD_GATEWAY, e.to_string()))?;
         let mut w = self.roots.write().unwrap();
-        *w = (rv.root, rv.previous_root);
+        *w = (rv.root, rv.previous_root, std::time::Instant::now());
         if known(&w) {
             Ok(())
         } else {
-            Err(err(StatusCode::CONFLICT, "stale revocation root; fetch the issuer's /v1/revocations and prove again"))
+            Err(stale())
         }
+    }
+
+    /// The issuer's alarm cutoff, fetched again when older than this.
+    const ALARM_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+    async fn refresh_alarm(&self) -> Result<Option<Day>, ApiErr> {
+        let p = self.issuer_api.params().await.map_err(|e| err(StatusCode::BAD_GATEWAY, e.to_string()))?;
+        *self.alarm.write().unwrap() = (p.alarm_cutoff, std::time::Instant::now());
+        Ok(p.alarm_cutoff)
+    }
+
+    /// The alarm cutoff as currently known, fetched again if old.
+    async fn alarm(&self) -> Result<Option<Day>, ApiErr> {
+        let (a, at) = *self.alarm.read().unwrap();
+        if at.elapsed() < Self::ALARM_TTL {
+            return Ok(a);
+        }
+        self.refresh_alarm().await
+    }
+
+    /// A proof names the alarm cutoff it was made under; it must be the issuer's current one. On a
+    /// mismatch the issuer is asked again, so a change reaches this server at the first proof that
+    /// knows of it.
+    async fn check_alarm(&self, claimed: Option<Day>) -> Result<Option<Day>, ApiErr> {
+        if self.alarm().await? == claimed {
+            return Ok(claimed);
+        }
+        // ask the issuer again, but not more than every few seconds whatever proofs arrive
+        let recent = self.alarm.read().unwrap().1.elapsed() < std::time::Duration::from_secs(5);
+        if !recent && self.refresh_alarm().await? == claimed {
+            return Ok(claimed);
+        }
+        Err(err(StatusCode::CONFLICT, "the alarm cutoff changed; fetch the issuer's /v1/params and prove again"))
     }
 
     /// Contexts are named by the operator: only platforms this directory was started with are accepted.
@@ -217,9 +269,12 @@ impl Directory {
         }
         let p = self.platform(&req.platform)?;
         self.check_root(&req.revocation_root).await?;
+        let alarm = self.check_alarm(req.alarm_cutoff).await?;
         let ctx = context_id(&req.platform);
         let bind = binding_context(&req.platform, &req.account_id, &req.nonce);
-        self.scheme.verify_binding(&self.vc(req.today, &req.revocation_root)?, &ctx, &bind, &req.proof).map_err(|e| err(StatusCode::UNAUTHORIZED, e.to_string()))?;
+        self.scheme
+            .verify_binding(&self.vc(req.today, &req.revocation_root)?, dates::count_cutoff(req.today, alarm), &ctx, &bind, &req.proof)
+            .map_err(|e| err(StatusCode::UNAUTHORIZED, e.to_string()))?;
         // where the platform can resolve handles, the handle must belong to the account id, and the
         // list shows the platform's spelling of it, not the submitter's
         match p.resolve_account(&req.handle).await {
@@ -241,6 +296,7 @@ impl Directory {
             lease_until: today + dates::LEASE_DAYS,
             counted: req.proof.probation_cleared,
             code_seen_on: None,
+            proved_alarm: if req.proof.probation_cleared { alarm } else { None },
         };
         // A replayed proof is refused before the platform is asked anything. The platform is asked
         // outside the write lock, which readers of the list also take for a moment.
@@ -290,9 +346,10 @@ impl Directory {
         if !self.records(&req.platform, &req.account_id).await?.iter().any(|r| r.request.proof.nym == req.proof.nym) {
             return Err(err(StatusCode::NOT_FOUND, "this pseudonym has no binding on this account"));
         }
+        let alarm = self.check_alarm(req.alarm_cutoff).await?;
         let bind = withdraw_context(&req.platform, &req.account_id, &req.nonce);
         self.scheme
-            .verify_binding(&self.vc(req.today, &req.revocation_root)?, &context_id(&req.platform), &bind, &req.proof)
+            .verify_binding(&self.vc(req.today, &req.revocation_root)?, dates::count_cutoff(req.today, alarm), &context_id(&req.platform), &bind, &req.proof)
             .map_err(|e| err(StatusCode::UNAUTHORIZED, e.to_string()))?;
         let _g = self.write.lock().await;
         self.use_nonce("withdraw", &req.platform, &req.nonce).await?;
@@ -309,8 +366,9 @@ impl Directory {
         if req.post_id.is_empty() || req.post_id.len() > MAX_FIELD || p.canonical_post_id(&req.post_id).await.ok().as_deref() != Some(req.post_id.as_str()) {
             return Err(err(StatusCode::BAD_REQUEST, "post id is not in the platform's canonical form"));
         }
+        let alarm = self.check_alarm(req.alarm_cutoff).await?;
         self.scheme
-            .verify_like(&self.vc(req.today, &req.revocation_root)?, &context_id(&req.platform), &req.post_id, &req.proof)
+            .verify_like(&self.vc(req.today, &req.revocation_root)?, dates::count_cutoff(req.today, alarm), &context_id(&req.platform), &req.post_id, &req.proof)
             .map_err(|e| err(StatusCode::UNAUTHORIZED, e.to_string()))?;
         let _g = self.write.lock().await;
         let pk = key(&req.platform, &req.post_id);
@@ -417,7 +475,8 @@ async fn list(State(d): State<St>, Query(q): Query<ListQ>) -> Result<Json<Bindin
     };
     entries.sort_by(|a, b| a.account_id.cmp(&b.account_id));
     gone.sort_by(|a, b| a.account_id.cmp(&b.account_id));
-    Ok(Json(BindingList { platform: q.platform, today, instance, seq, full, entries, gone }))
+    let alarm_cutoff = d.alarm().await?;
+    Ok(Json(BindingList { platform: q.platform, today, alarm_cutoff, instance, seq, full, entries, gone }))
 }
 
 async fn bind(State(d): State<St>, Json(req): Json<BindRequest>) -> Result<Json<BindingEntry>, ApiErr> {

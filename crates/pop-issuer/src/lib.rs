@@ -22,6 +22,7 @@
 //! moves a record to the newest key when its owner logs in (docs/uniqueness.md).
 pub mod backup;
 pub mod recovery;
+pub mod reports;
 pub mod service;
 pub mod uniqueness;
 

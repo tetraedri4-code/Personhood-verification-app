@@ -36,6 +36,21 @@ pub struct Params {
     pub today: Day,
     /// published list of identity providers: code → name
     pub providers: BTreeMap<u32, String>,
+    /// Set while the alarm about stolen eID logins is on (`GET /v1/reports`): secrets that count from
+    /// after this day are in probation until it is lifted. Proofs are checked against
+    /// `dates::count_cutoff(today, alarm_cutoff)`.
+    #[serde(default)]
+    pub alarm_cutoff: Option<Day>,
+}
+
+/// `GET /v1/reports`: how many people said "it wasn't me" per week, and the rule that turns them into
+/// an alarm. Public, so anyone can check that the alarm follows the rule.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Reports {
+    /// Mondays and counts, oldest first, the current week last
+    pub weeks: Vec<(Day, u64)>,
+    pub alarm_cutoff: Option<Day>,
+    pub rule: String,
 }
 
 /// What an identity check is for. One login serves exactly one purpose.
@@ -138,6 +153,10 @@ pub struct RecheckResponse {
     /// see [`IssuanceResponse::backup_ticket`]
     #[serde(default)]
     pub backup_ticket: Option<String>,
+    /// When the re-check lifted a suspension: the new handle (the old one stays revoked) and the
+    /// witness's signature on it, hex.
+    #[serde(default)]
+    pub new_handle: Option<(u64, String)>,
 }
 
 /// `POST /v1/replace`: replace the secret after an identity check (session purpose `replace`).
@@ -157,6 +176,11 @@ pub struct ReplaceRequest {
     /// Ed25519 signature of the OLD guardian key over `replace_message(session, commitment, new guardian key)`
     #[serde(default)]
     pub old_guardian_signature: Option<String>,
+    /// "It wasn't me": the person did not enrol the existing secret. It is suspended at once and the
+    /// report counted (`GET /v1/reports`). If nobody lifts the suspension during the wait, the new
+    /// secret counts at once, at most once in two years per person. Only without `old_guardian_signature`.
+    #[serde(default)]
+    pub report_theft: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -164,7 +188,14 @@ pub struct ReplaceRequest {
 pub enum ReplaceResponse {
     Issued { issuance: IssuanceResponse },
     /// the request is recorded; claim on or after `claim_after`, and no later than `claim_before`
-    Pending { claim_token: String, claim_after: Day, claim_before: Day },
+    Pending {
+        claim_token: String,
+        claim_after: Day,
+        claim_before: Day,
+        /// the existing secret was suspended by this request's theft report
+        #[serde(default)]
+        suspended: bool,
+    },
 }
 
 pub fn replace_message(session: &str, commitment: &str, new_guardian: &str) -> Vec<u8> {
@@ -266,6 +297,9 @@ pub struct BindRequest {
     pub handle: String,
     pub nonce: String,
     pub today: Day,
+    /// the alarm cutoff the proof was made under (`Params::alarm_cutoff`)
+    #[serde(default)]
+    pub alarm_cutoff: Option<Day>,
     pub revocation_root: String,
     pub proof: BindingProof,
 }
@@ -287,6 +321,18 @@ pub struct BindingEntry {
     pub counted: bool,
     /// day a server-side check last saw the code in the account's public texts, if the platform allows it
     pub code_seen_on: Option<Day>,
+    /// the alarm cutoff in force when the claim was proved, if any
+    #[serde(default)]
+    pub proved_alarm: Option<Day>,
+}
+
+impl BindingEntry {
+    /// Whether the badge counts while `alarm` is the alarm cutoff. A claim proved as counted before
+    /// the alarm still counts if it was made before the cutoff: its secret counted from no later than
+    /// that day. One made after it must be proved again under the alarm.
+    pub fn counts(&self, alarm: Option<Day>) -> bool {
+        self.counted && alarm.map_or(true, |a| self.bound_on < a || self.proved_alarm == Some(a))
+    }
 }
 
 /// `GET /v1/bindings?platform=P&since=N&instance=I`. With `since=0`, with an `instance` other than
@@ -298,6 +344,9 @@ pub struct BindingEntry {
 pub struct BindingList {
     pub platform: String,
     pub today: Day,
+    /// the issuer's alarm cutoff as this directory last saw it; readers apply [`BindingEntry::counts`]
+    #[serde(default)]
+    pub alarm_cutoff: Option<Day>,
     /// names the directory's store; send it back with `since`
     #[serde(default)]
     pub instance: String,
@@ -352,6 +401,9 @@ pub struct WithdrawRequest {
     pub account_id: String,
     pub nonce: String,
     pub today: Day,
+    /// the alarm cutoff the proof was made under (`Params::alarm_cutoff`)
+    #[serde(default)]
+    pub alarm_cutoff: Option<Day>,
     pub revocation_root: String,
     pub proof: BindingProof,
 }
@@ -362,6 +414,9 @@ pub struct LikeRequest {
     pub platform: String,
     pub post_id: String,
     pub today: Day,
+    /// the alarm cutoff the proof was made under (`Params::alarm_cutoff`)
+    #[serde(default)]
+    pub alarm_cutoff: Option<Day>,
     pub revocation_root: String,
     pub proof: LikeProof,
 }
@@ -408,6 +463,7 @@ pub trait IssuerApi: Send + Sync {
         Ok(r)
     }
     async fn revoke(&self, req: &RevokeRequest) -> Result<(), ApiError>;
+    async fn reports(&self) -> Result<Reports, ApiError>;
     async fn identity_recheck(&self, req: &RecheckRequest) -> Result<RecheckResponse, ApiError>;
     async fn replace(&self, req: &ReplaceRequest) -> Result<ReplaceResponse, ApiError>;
     async fn replace_claim(&self, req: &ClaimRequest) -> Result<IssuanceResponse, ApiError>;

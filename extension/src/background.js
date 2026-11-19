@@ -68,6 +68,7 @@ async function synced(dir, platform) {
         for (const e of list.entries || []) st.entries[`${e.account_id}|${e.nym}`] = e;
         st.listSeq = list.seq;
         st.today = list.today;
+        st.alarm = Number.isInteger(list.alarm_cutoff) ? list.alarm_cutoff : null;
         // claims whose lease ran out are not announced as gone: drop them here
         for (const [k, e] of Object.entries(st.entries)) if (e.lease_until < list.today) delete st.entries[k];
         const table = await getJson(`${dir}/v1/likes/table?platform=${platform}&since=${st.countSeq}&instance=${inst}`);
@@ -104,7 +105,7 @@ async function handle(msg) {
     const st = await synced(dir, msg.platform);
     const seen = (await chrome.storage.local.get("seen")).seen || {};
     const entries = Object.values(st.entries).sort((a, b) => (a.account_id < b.account_id ? -1 : a.account_id > b.account_id ? 1 : 0));
-    return { settings: { reportLikes: !!s.reportLikes }, today: st.today, entries, counts: st.counts, seen: seen[msg.platform] || {} };
+    return { settings: { reportLikes: !!s.reportLikes }, today: st.today, alarm: st.alarm ?? null, entries, counts: st.counts, seen: seen[msg.platform] || {} };
   }
   if (msg.type === "seen") {
     const all = (await chrome.storage.local.get("seen")).seen || {};

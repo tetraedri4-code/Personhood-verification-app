@@ -88,6 +88,9 @@ impl IssuerApi for HttpClient {
         let _: serde_json::Value = self.post("/v1/revoke", req).await?;
         Ok(())
     }
+    async fn reports(&self) -> Result<Reports, ApiError> {
+        self.get("/v1/reports").await
+    }
     async fn identity_recheck(&self, req: &RecheckRequest) -> Result<RecheckResponse, ApiError> {
         self.post("/v1/recheck", req).await
     }

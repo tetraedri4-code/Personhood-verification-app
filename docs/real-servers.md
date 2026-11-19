@@ -122,6 +122,12 @@ can be served from another host than the issuer; they share only the `backup_tic
 serialised by a lock inside the issuer process: run one issuer process, or move that into your
 database as a compare-and-swap on the record.
 
+`alarm_min_reports` (default 20) and `alarm_factor` (default 3) set when a week of "it wasn't me"
+reports raises the alarm ([recovery.md](recovery.md) §4). Set them from the counts of real weeks; the
+rule and the counts are public at `GET /v1/reports`. The issuer's configuration no longer takes
+`rollout_certified`: first enrolments count from their own week, and a backdated one would escape the
+alarm. The theft-report counts are in the `theft_reports` table; back it up with `enrolments`.
+
 The proving-key files are named `lego2-*.bin` since the like statement changed; older `lego-*.bin`
 files are unused and can be deleted.
 

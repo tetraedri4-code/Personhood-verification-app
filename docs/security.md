@@ -99,7 +99,7 @@ gain", followed by fixes and tests.
 | 27 | A round spec could spell a key in upper-case hex | Deals are compared with the spec's text, so an honest dealer's correct deal would have looked wrong to a newcomer and the dealer been named | Keys in a spec must be in canonical form | `complaints_are_checked_by_everyone` |
 
 **Pass 5** found nothing new with a reasonable fix. What it weighed and left is in "Known and not
-fixed" below and in [recovery.md](recovery.md) §4 and [uniqueness.md](uniqueness.md) §4.
+fixed" below and in [recovery.md](recovery.md) §5 and [uniqueness.md](uniqueness.md) §4.
 
 Checked and found sound in this change:
 
@@ -145,6 +145,31 @@ the issuer keeps the order of revocations across restarts; compression is used o
 the extension ignores a `__proto__` key and anything but whole numbers in counts. Left as is: the
 extension sends its exact change number, which tells the directory roughly when that browser last
 synced. The browser's address tells it more, which is what relays are for (design §4.7).
+
+### Review of theft reports, suspension and the alarm, 19 November 2026
+
+First enrolments without probation, "it wasn't me" reports that suspend a secret, the lift by re-check,
+the alarm cutoff and the help page ([recovery.md](recovery.md) §4). Three passes; the third found
+nothing new.
+
+| # | Problem | Effect | Fix | Test |
+|---|---|---|---|---|
+| 32 | Proofs against the issuer's previous revocation root were taken until the next revocation, and the directory trusted its cached roots until an unknown root arrived | A secret suspended (or revoked) a moment ago could keep renewing, binding and liking against the root from before, for days in a quiet period. "Suspended at once" would not have held | The issuer offers the previous root for two minutes after a change (`PREVIOUS_ROOT_GRACE`); the directory fetches the roots again when they are older than 30 seconds | `a_theft_report_suspends_and_a_recheck_lifts_it`, `it_wasnt_me_suspends_...` |
+| 33 | The rollout window (`rollout_certified`) backdated every first enrolment to the launch | Enrolments made during the window, which is when stolen logins would be used, could never be reached by an alarm | Removed: γ is always the Monday of the week of issue. First enrolments count at once anyway | `many_reports_raise_the_alarm_...` |
+
+Checked and found sound: a lift needs the record's current handle, a suspension on it, and a proof
+against the exact revocation list before the handle (a permanently revoked secret, or one replaced
+since, cannot use it); the new handle is drawn and signed by the issuer and can only take the holder's
+existing commitment; a report with a guardian signature is refused, so the key holder cannot launder a
+plain replacement into an uncontested report; reports count once per person per 30 days and need an
+enrolled identity; the uncontested-report rule is checked at claim time against the latest request, and
+a re-check or a guardian replacement in between clears the suspension; the directory checks the alarm
+cutoff named in a proof against the issuer's and asks the issuer again at most every five seconds; the
+help page is a fixed text compiled into the app, served without scripts and not frameable. Left as is,
+and listed in [recovery.md](recovery.md) §5: repeated suspensions by an eID thief, a dormant owner
+losing an uncontested report, the issuer as the only counter of reports, and collusion to raise the
+alarm. The help page needs no pairing token, so a web page can tell that the holder app runs on a
+computer; the 401 of the other endpoints told it before, and browsers' private-network rules block it.
 
 ### Checked and found sound
 
@@ -202,10 +227,11 @@ These are limits of the prototype, in rough order of weight:
 10. **No rate limiting in the issuer and the directory.** Put it in the reverse proxy. (The uniqueness
     operators do limit evaluations per minute.) Some issuer endpoints that need no login scan the
     record table (`/v1/revoke`, `/v1/replace/claim`, `/v1/replace/pending`).
-11. **Recovery has edges** ([recovery.md](recovery.md) §4): during the 90-day wait a stolen phone keeps
+11. **Recovery has edges** ([recovery.md](recovery.md) §5): during the 90-day wait a stolen phone keeps
     working; a replaced secret can like old posts again after its probation; whoever holds the eID and
     the current secret together wins every dispute; the backup host can link a backup to an enrolment
-    record.
+    record; an eID thief can suspend an owner's secret again and again; the issuer alone counts the
+    theft reports that set the alarm.
 12. **The mock services have no security at all** by design: the mock identity provider logs anyone in
     as anyone, the mock feed has no passwords. They listen on loopback. Never expose them.
 13. **The 6-digit enrolment code** stops link-based hijacking unless the victim also reads the code to

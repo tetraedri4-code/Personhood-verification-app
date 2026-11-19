@@ -72,6 +72,10 @@ pub struct Status {
     pub counted_from: Option<String>,
     /// the identity re-check must be done by this day, or the credential stops renewing
     pub recheck_by: Option<String>,
+    /// a theft report suspended this secret; a re-check (`pop holder veto`) lifts it
+    pub suspended: bool,
+    /// the alarm about stolen eID logins is on: secrets counting from after this day do not count
+    pub alarm_cutoff: Option<String>,
     /// an encrypted backup exists
     pub backup: bool,
     /// a replacement of the secret asked from this device waits until this day
@@ -87,7 +91,21 @@ pub(crate) struct Ctx {
     pub(crate) issuer_pk: IssuerPublicKey,
     pub(crate) witness_pk: WitnessPublicKey,
     pub(crate) today: Day,
+    /// the issuer's alarm cutoff, if the alarm is on
+    pub(crate) alarm: Option<Day>,
 }
+
+impl Ctx {
+    /// Secrets counting from after this day are in probation today.
+    pub(crate) fn cutoff(&self) -> Day {
+        dates::count_cutoff(self.today, self.alarm)
+    }
+}
+
+/// Where the app's instructions for securing an eID are: docs/reset-eid.md, also served by the
+/// holder app at `/help/reset-eid` on its local address.
+pub const RESET_EID_HELP: &str = "https://github.com/tetraedri4-code/Personhood-verification-app/blob/main/docs/reset-eid.md";
+pub const RESET_EID_PATH: &str = "/help/reset-eid";
 
 pub struct Holder {
     pub(crate) issuer: Arc<dyn IssuerApi>,
@@ -100,11 +118,11 @@ pub struct Holder {
     /// the issuer's parameters, reused for a few minutes instead of fetched before every proof
     params: std::sync::Mutex<Option<(std::time::Instant, Params)>>,
     /// the revocation list and its tree, so that only new revocations are downloaded
-    revs: tokio::sync::Mutex<Option<RevCache>>,
+    pub(crate) revs: tokio::sync::Mutex<Option<RevCache>>,
 }
 
-struct RevCache {
-    revoked: Vec<u64>,
+pub(crate) struct RevCache {
+    pub(crate) revoked: Vec<u64>,
     tree: Arc<RevocationTree>,
     root: String,
 }
@@ -167,7 +185,7 @@ impl Holder {
         if p.today.abs_diff(dates::today()) > 1 {
             return Err(HolderError::ClockMismatch);
         }
-        Ok(Ctx { scheme: scheme.clone(), issuer_pk: IssuerPublicKey::from_hex(ipk)?, witness_pk: WitnessPublicKey::from_hex(wpk)?, today: p.today })
+        Ok(Ctx { scheme: scheme.clone(), issuer_pk: IssuerPublicKey::from_hex(ipk)?, witness_pk: WitnessPublicKey::from_hex(wpk)?, today: p.today, alarm: p.alarm_cutoff })
     }
 
     /// A renewed credential runs to the end of this quarter or the next. Any other date would be a
@@ -292,9 +310,10 @@ impl Holder {
 
     async fn binding_proof(&self, cx: &Ctx, cred: &Credential, platform: &str, slot: u32, bind: Vec<u8>) -> Result<(BindingProof, String)> {
         let (tree, root) = self.tree(cx).await?;
-        let probation = cred.attrs.certified + dates::PROBATION_DAYS <= cx.today;
+        let cutoff = cx.cutoff();
+        let probation = cred.attrs.certified <= cutoff;
         let (scheme, cred, ipk, wpk, today, ctx) = (cx.scheme.clone(), cred.clone(), cx.issuer_pk.clone(), cx.witness_pk.clone(), cx.today, context_id(platform));
-        let proof = tokio::task::spawn_blocking(move || scheme.prove_binding(&mut OsRng, &cred, &tree, &ipk, &wpk, &ctx, slot, today, probation, &bind))
+        let proof = tokio::task::spawn_blocking(move || scheme.prove_binding(&mut OsRng, &cred, &tree, &ipk, &wpk, &ctx, slot, today, cutoff, probation, &bind))
             .await
             .map_err(|e| HolderError::Internal(e.to_string()))??;
         Ok((proof, root))
@@ -325,10 +344,12 @@ impl Holder {
                 handle: account.handle.clone(),
                 nonce: n,
                 today: cx.today,
+                alarm_cutoff: cx.alarm,
                 revocation_root: root,
                 proof,
             })
-            .await?;
+            .await
+            .map_err(|e| self.after_directory_error(e))?;
         if entry.code != code {
             return Err(HolderError::Internal("directory returned a different code".into()));
         }
@@ -356,7 +377,7 @@ impl Holder {
         let n = nonce();
         let (proof, root) = self.binding_proof(&cx, &cred, platform, b.slot, withdraw_context(platform, &b.account_id, &n)).await?;
         self.directory
-            .withdraw(&WithdrawRequest { platform: platform.into(), account_id: b.account_id.clone(), nonce: n, today: cx.today, revocation_root: root, proof })
+            .withdraw(&WithdrawRequest { platform: platform.into(), account_id: b.account_id.clone(), nonce: n, today: cx.today, alarm_cutoff: cx.alarm, revocation_root: root, proof })
             .await?;
         if let Some(p) = self.platforms.get(platform) {
             let acct = AccountRef { platform: platform.into(), account_id: b.account_id.clone(), handle: b.handle.clone() };
@@ -378,22 +399,51 @@ impl Holder {
         let p = self.platforms.get(platform).ok_or_else(|| HolderError::UnknownPlatform(platform.into()))?;
         let post = p.canonical_post_id(raw_post).await?;
         let cx = self.ctx().await?;
-        let counted_from = cred.attrs.certified + dates::PROBATION_DAYS;
-        if counted_from > cx.today {
-            return Err(HolderError::Probation(dates::fmt_day(counted_from)));
+        let cutoff = cx.cutoff();
+        if cred.attrs.certified > cutoff {
+            return Err(match cx.alarm {
+                Some(a) if cred.attrs.certified <= cx.today => HolderError::Probation(format!(
+                    "the end of the alarm about stolen eID logins (secrets counting from after {} are paused)",
+                    dates::fmt_day(a)
+                )),
+                _ => HolderError::Probation(dates::fmt_day(cred.attrs.certified)),
+            });
         }
         let (tree, root) = self.tree(&cx).await?;
         let (scheme, ipk, wpk, today, ctx, post2) = (cx.scheme.clone(), cx.issuer_pk.clone(), cx.witness_pk.clone(), cx.today, context_id(platform), post.clone());
-        let proof = tokio::task::spawn_blocking(move || scheme.prove_like(&mut OsRng, &cred, &tree, &ipk, &wpk, &ctx, &post2, today))
+        let proof = tokio::task::spawn_blocking(move || scheme.prove_like(&mut OsRng, &cred, &tree, &ipk, &wpk, &ctx, &post2, today, cutoff))
             .await
             .map_err(|e| HolderError::Internal(e.to_string()))??;
-        let r = self.directory.like(&LikeRequest { platform: platform.into(), post_id: post.clone(), today: cx.today, revocation_root: root, proof }).await?;
+        let r = self
+            .directory
+            .like(&LikeRequest { platform: platform.into(), post_id: post.clone(), today: cx.today, alarm_cutoff: cx.alarm, revocation_root: root, proof })
+            .await
+            .map_err(|e| self.after_directory_error(e))?;
         let k = format!("{platform}|{post}");
         if !st.liked.contains(&k) {
             st.liked.push(k);
             self.wallet.save(&st)?;
         }
         Ok(r)
+    }
+
+    /// A conflict from the directory may mean the alarm changed: fetch the issuer's parameters again
+    /// next time.
+    fn after_directory_error(&self, e: ApiError) -> HolderError {
+        if matches!(e, ApiError::Server { status: 409, .. }) {
+            *self.params.lock().unwrap() = None;
+        }
+        e.into()
+    }
+
+    /// Has a theft report suspended this wallet's secret? Its handle is then on the revocation list,
+    /// though this app never asked to revoke it. A re-check (`recheck_start`, `recheck_finish`) lifts it.
+    pub async fn suspended(&self) -> Result<bool> {
+        let st = self.wallet.load()?;
+        let Ok(cred) = Self::credential(&st) else { return Ok(false) };
+        let cx = self.ctx().await?;
+        self.tree(&cx).await?;
+        Ok(self.revs.lock().await.as_ref().is_some_and(|c| c.revoked.contains(&cred.handle())))
     }
 
     pub fn has_liked(&self, platform: &str, canonical_post: &str) -> bool {
@@ -449,8 +499,11 @@ impl Holder {
         Ok(Status {
             enrolled: cred.is_some(),
             expiry: cred.as_ref().map(|c| dates::fmt_day(c.expiry())),
-            counted_from: cred.as_ref().map(|c| dates::fmt_day(c.attrs.certified + dates::PROBATION_DAYS)),
+            counted_from: cred.as_ref().map(|c| dates::fmt_day(c.attrs.certified)),
             recheck_by: cred.as_ref().map(|c| dates::fmt_day(c.attrs.last_check + dates::RECHECK_DAYS)),
+            // the handle is on the revocation list this app last downloaded, though the app never asked to revoke it
+            suspended: cred.as_ref().is_some_and(|c| self.revs.try_lock().ok().and_then(|g| g.as_ref().map(|r| r.revoked.contains(&c.handle()))).unwrap_or(false)),
+            alarm_cutoff: self.params.lock().unwrap().as_ref().and_then(|(_, p)| p.alarm_cutoff).map(dates::fmt_day),
             backup: st.backup.is_some(),
             replacement_waits_until: st.claim.as_ref().map(|c| dates::fmt_day(c.claim_after)),
             bindings: st.bindings,

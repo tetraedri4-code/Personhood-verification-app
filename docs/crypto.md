@@ -13,7 +13,7 @@ Everything is in `crates/pop-crypto`. The public API is `src/scheme.rs`; the fil
 | §4.3 blind issuance | `BlindRequest::new`, `Scheme::issue_blind`, `finish_issuance` |
 | §4.4 pseudonym nym = H_G("nym", P, i)^x, x = H_p("nym"; P, s, i, 0) | `prove_binding`, `verify_binding` |
 | §4.5 quarterly badge tags, proof bound to the account | same proof: four tags for the quarters the lease touches |
-| §4.5 probation question | optional term γ ≤ today − 9 months (`probation_cleared`) |
+| §4.5 probation question | γ ≤ cutoff, where γ is the Monday the secret counts from and the cutoff is today or the public alarm cutoff; optional in a binding (`probation_cleared`), required in a like (proposed change, [recovery.md §4](recovery.md)) |
 | §4.6 blind renewal | `prove_renewal`, `reissue`, `finish_renewal` |
 | §4.6 revocation: sorted Poseidon tree, a < r < b inside the circuit | `revtree.rs` builds real trees; the benchmark's gadget proves the path |
 | report §3 row 9: like tag | `prove_like`: T = H_G("like", P, post)^x, x = H_p("like"; P, s, 0, post) |

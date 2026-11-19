@@ -1,6 +1,6 @@
 //! Builders that turn configuration into running parts.
 use anyhow::Context;
-use pop_crypto::{dates, ProofSystem, Scheme, SchemeConfig};
+use pop_crypto::{ProofSystem, Scheme, SchemeConfig};
 use pop_holder::{Holder, WalletStore};
 use pop_idp::oidc::{OidcConfig, OidcProvider};
 use pop_idp::Loa;
@@ -26,8 +26,6 @@ pub struct IssuerFile {
     /// code of this provider in the credential (attribute e); publish the list and never reuse a code
     #[serde(default = "one")]
     pub provider_code: u32,
-    /// "YYYY-MM-DD" quarter start: secrets enrolled now count as certified then (rollout window)
-    pub rollout_certified: Option<String>,
     /// Who computes the deduplication key. Omit for the single-operator keyed hash.
     #[serde(default)]
     pub uniqueness: UniquenessFile,
@@ -39,6 +37,12 @@ pub struct IssuerFile {
     /// re-check with the old app cancels it in that time. Default 90.
     #[serde(default)]
     pub replace_wait_days: Option<u32>,
+    /// alarm rule for theft reports (docs/recovery.md): a week is high with at least this many reports
+    #[serde(default)]
+    pub alarm_min_reports: Option<u64>,
+    /// ... and at least this many times the median of the 12 weeks before
+    #[serde(default)]
+    pub alarm_factor: Option<u64>,
 }
 
 /// The `uniqueness` section of the issuer configuration.
@@ -62,12 +66,6 @@ pub fn store(dir: Option<&Path>, name: &str) -> anyhow::Result<SharedStore> {
         Some(d) => Arc::new(JsonFileStore::open(d.join(name))?),
         None => MemoryStore::shared(),
     })
-}
-
-fn parse_day(s: &str) -> anyhow::Result<u32> {
-    let p: Vec<u32> = s.split('-').map(|x| x.parse()).collect::<Result<_, _>>().context("date must be YYYY-MM-DD")?;
-    anyhow::ensure!(p.len() == 3, "date must be YYYY-MM-DD");
-    Ok(dates::from_civil(p[0] as i32, p[1], p[2]))
 }
 
 const KEY_DIR: &str = "uniqueness-keys";
@@ -193,9 +191,12 @@ pub async fn build_issuer(f: &IssuerFile) -> anyhow::Result<Arc<Issuer>> {
         keys_dir: f.data_dir.as_ref().map(|d| d.join("keys")),
         provider_code: f.provider_code,
         min_loa,
-        rollout_certified: f.rollout_certified.as_deref().map(parse_day).transpose()?,
         clock: None,
         replace_wait_days: f.replace_wait_days.unwrap_or(90),
+        alarm: {
+            let d = pop_issuer::reports::AlarmRule::default();
+            pop_issuer::reports::AlarmRule { min_reports: f.alarm_min_reports.unwrap_or(d.min_reports).max(1), factor: f.alarm_factor.unwrap_or(d.factor).max(1) }
+        },
     };
     Issuer::new(scheme, idp, uniq, db, cfg).await
 }

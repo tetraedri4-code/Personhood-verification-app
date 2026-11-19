@@ -23,7 +23,6 @@ async fn net() -> &'static Devnet {
                     scheme: SchemeConfig { proof_system: ProofSystem::LegoGroth16, tree_depth: 4, slots: 3, bp_gens_log2: 13 },
                     data_dir: None,
                     ports: [0; 4],
-                    rollout: true,
                     uniqueness: devnet::UniquenessMode::Hmac,
                     replace_wait_days: None,
                 })
@@ -71,7 +70,7 @@ async fn full_flow() {
     // binding publishes the code and the directory sees it
     let out = alice.bind("mockfeed", "@alice", 1, CodePlacement::Bio).await.unwrap();
     assert!(out.code_published);
-    assert!(out.entry.counted, "rollout window: counted at once");
+    assert!(out.entry.counted, "a first enrolment counts at once");
     assert!(out.entry.code_seen_on.is_some());
     let list = dir(d).list("mockfeed").await.unwrap();
     assert!(list.entries.iter().any(|e| e.handle == "alice" && e.code == out.entry.code));
@@ -345,7 +344,7 @@ async fn replacing_the_secret() {
     let thief = holder(d, "bob");
     let url = thief.replace_start().await.unwrap();
     let code = devnet::mock_login(&url, "T-REPLACE-1").await.unwrap();
-    assert!(matches!(thief.replace_finish(&code).await.unwrap(), pop_holder::ReplaceOutcome::Waiting { .. }));
+    assert!(matches!(thief.replace_finish(&code, false).await.unwrap(), pop_holder::ReplaceOutcome::Waiting { .. }));
     assert!(thief.status().unwrap().replacement_waits_until.is_some());
     assert!(matches!(thief.replace_claim().await, Err(HolderError::ClaimTooEarly(_))));
     assert!(phone.pending_replacement().await.unwrap().is_some(), "the old app is warned");
@@ -363,14 +362,67 @@ async fn replacing_the_secret() {
     // the device that holds the guardian key replaces at once; the new secret starts probation
     let url = phone.replace_start().await.unwrap();
     let code = devnet::mock_login(&url, "T-REPLACE-1").await.unwrap();
-    assert!(matches!(phone.replace_finish(&code).await.unwrap(), pop_holder::ReplaceOutcome::Issued { .. }));
+    assert!(matches!(phone.replace_finish(&code, false).await.unwrap(), pop_holder::ReplaceOutcome::Issued { .. }));
     assert!(matches!(phone.like("mockfeed", "p1").await, Err(HolderError::Probation(_))));
     let out = phone.bind("mockfeed", "alice", 1, CodePlacement::Bio).await.unwrap();
-    assert!(!out.entry.counted, "a replaced secret is not counted, rollout window or not");
+    assert!(!out.entry.counted, "a replaced secret is not counted");
     phone.renew().await.unwrap();
     // a person with no enrolment cannot replace anything
     let nobody = holder(d, "bob");
     let url = nobody.replace_start().await.unwrap();
     let code = devnet::mock_login(&url, "T-REPLACE-NOBODY").await.unwrap();
-    assert!(matches!(nobody.replace_finish(&code).await, Err(HolderError::EnrolNotReady(EnrolStatus::NotEnrolled))));
+    assert!(matches!(nobody.replace_finish(&code, false).await, Err(HolderError::EnrolNotReady(EnrolStatus::NotEnrolled))));
+}
+
+#[tokio::test]
+async fn it_wasnt_me_suspends_the_thiefs_secret_until_a_recheck() {
+    let d = net().await;
+    let thief = enrolled(d, "bob", "T-THEFT-1").await;
+    thief.like("mockfeed", "p2").await.unwrap();
+    // the real person's enrolment is refused, and they report it
+    let me = holder(d, "carol");
+    let url = me.enrol_start().await.unwrap();
+    let code = devnet::mock_login(&url, "T-THEFT-1").await.unwrap();
+    assert!(matches!(me.enrol_finish(&code).await, Err(HolderError::EnrolNotReady(EnrolStatus::AlreadyEnrolled))));
+    let url = me.replace_start().await.unwrap();
+    let code = devnet::mock_login(&url, "T-THEFT-1").await.unwrap();
+    assert!(matches!(me.replace_finish(&code, true).await.unwrap(), pop_holder::ReplaceOutcome::Waiting { suspended: true, .. }));
+    // the thief's app sees the suspension, and its likes and badges stop
+    assert!(thief.suspended().await.unwrap());
+    assert!(thief.like("mockfeed", "p3").await.is_err());
+    assert!(thief.pending_replacement().await.unwrap().is_some());
+    // whoever has the old secret and the eID lifts it (here the thief: the eID was not secured)
+    let url = thief.recheck_start().await.unwrap();
+    let code = devnet::mock_login(&url, "T-THEFT-1").await.unwrap();
+    thief.recheck_finish(&code).await.unwrap();
+    assert!(!thief.suspended().await.unwrap());
+    thief.like("mockfeed", "p3").await.unwrap();
+    assert!(me.replace_claim().await.is_err());
+    // one report this week, published
+    let r = HttpClient::new(&d.issuer_url).reports().await.unwrap();
+    assert!(r.weeks.last().unwrap().1 >= 1);
+}
+
+#[tokio::test]
+async fn the_help_page_is_public_and_the_directory_checks_the_alarm() {
+    let d = net().await;
+    let h = Arc::new(enrolled(d, "alice", "T-HELP-1").await);
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, pop_holder::local_api::router(h, "correct-token-0123".into())).await.unwrap() });
+    let r = reqwest::get(format!("{base}{}", pop_holder::RESET_EID_PATH)).await.unwrap();
+    assert_eq!(r.status(), 200);
+    let csp = r.headers().get("content-security-policy").unwrap().to_str().unwrap().to_string();
+    assert!(csp.contains("default-src 'none'"));
+    let body = r.text().await.unwrap();
+    assert!(body.contains("<table>") && body.contains("617/2009"), "the page is rendered from docs/reset-eid.md");
+
+    // a proof made against a cutoff the directory does not know is refused before it is checked
+    let alice = enrolled(d, "dailytruth", "T-HELP-2").await;
+    alice.bind("mockfeed", "dailytruth", 1, CodePlacement::Bio).await.unwrap();
+    let recs: Vec<BindingRecord> = dir(d).get("/v1/bindings/mockfeed/u4").await.unwrap();
+    let mut req = recs.into_iter().last().unwrap().request;
+    req.alarm_cutoff = Some(1);
+    req.nonce = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into();
+    assert_eq!(status(&dir(d).bind(&req).await.unwrap_err()), 409);
 }

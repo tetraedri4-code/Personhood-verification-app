@@ -84,6 +84,9 @@ impl IssuerApi for Counting {
     async fn replace_claim(&self, req: &ClaimRequest) -> Result<IssuanceResponse, ApiError> {
         counted!(self, "replace claim", len(req), self.inner.replace_claim(req))
     }
+    async fn reports(&self) -> Result<Reports, ApiError> {
+        counted!(self, "theft reports", 0, self.inner.reports())
+    }
     async fn replace_pending(&self) -> Result<PendingReplacements, ApiError> {
         counted!(self, "pending replacements", 0, self.inner.replace_pending())
     }
@@ -122,7 +125,7 @@ impl DirectoryApi for Counting {
 async fn data_usage() {
     for (name, ps) in [("LegoGroth16 (default)", ProofSystem::LegoGroth16), ("Bulletproofs", ProofSystem::Bulletproofs)] {
         // tree depth 8 (65,000 revocations) is the default of a real deployment
-        let d = devnet::start(DevnetOpts { scheme: SchemeConfig { proof_system: ps, ..Default::default() }, data_dir: None, ports: [0; 4], rollout: true, uniqueness: devnet::UniquenessMode::Hmac, replace_wait_days: None })
+        let d = devnet::start(DevnetOpts { scheme: SchemeConfig { proof_system: ps, ..Default::default() }, data_dir: None, ports: [0; 4], uniqueness: devnet::UniquenessMode::Hmac, replace_wait_days: None })
             .await
             .unwrap();
         let tally = Arc::new(Tally::default());
@@ -167,7 +170,7 @@ async fn data_usage() {
         report("check for a waiting replacement (app start)");
         let url = h.replace_start().await.unwrap();
         let code = devnet::mock_login(&url, "T-DATA-1").await.unwrap();
-        h.replace_finish(&code).await.unwrap();
+        h.replace_finish(&code, false).await.unwrap();
         report("replace the secret, incl. backup update");
 
         // what the browser extension downloads: the first sync, then a sync after one more like

@@ -35,6 +35,7 @@
       if (!r || r.error) return;
       state.settings = r.settings;
       state.today = r.today;
+      state.alarm = Number.isInteger(r.alarm) ? r.alarm : null;
       state.seen = r.seen || {};
       state.counts = r.counts || {};
       // an account can have several claims (anyone enrolled can name any account); keep them all
@@ -63,6 +64,14 @@
     }
     const entryFor = (acct) => claimsFor(acct).find(confirmed);
 
+    // Same rule as BindingEntry::counts in the protocol: while an alarm is on, a claim counts if it
+    // was made before the cutoff or proved again under this alarm.
+    function countsNow(entry) {
+      if (!entry.counted) return false;
+      const a = state.alarm;
+      return a == null || entry.bound_on < a || entry.proved_alarm === a;
+    }
+
     function drawBadge(el, entry) {
       const next = el.nextElementSibling;
       const has = next && next.classList && next.classList.contains("pop-badge");
@@ -71,11 +80,14 @@
         return;
       }
       const b = has ? next : document.createElement("span");
-      b.className = "pop-badge" + (entry.counted ? "" : " pop-probation");
+      const counts = countsNow(entry);
+      b.className = "pop-badge" + (counts ? "" : " pop-probation");
       b.textContent = "1";
-      b.title = entry.counted
+      b.title = counts
         ? "One enrolled person runs this account (personhood prototype). This says nothing about who they are or whether they are trustworthy."
-        : "One enrolled person runs this account, enrolled less than nine months ago (probation).";
+        : state.alarm != null && entry.counted
+          ? "One enrolled person runs this account. Not counted while the alarm about stolen eID logins is on (recent enrolments are paused)."
+          : "One enrolled person runs this account, with a secret still in probation (replaced less than nine months ago).";
       b.setAttribute("role", "img");
       b.setAttribute("aria-label", "one enrolled person");
       if (!has) el.insertAdjacentElement("afterend", b);

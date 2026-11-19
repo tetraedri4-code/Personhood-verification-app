@@ -325,9 +325,6 @@ struct DevnetArgs {
     /// keep keys and data here between runs; omit for in-memory
     #[arg(long)]
     data_dir: Option<PathBuf>,
-    /// enrolments go through nine months of probation instead of counting at once
-    #[arg(long)]
-    no_rollout: bool,
     /// who holds the deduplication key: `threshold` (2-of-3 operators, each its own server, plus a
     /// standby) or `hmac` (one keyed hash inside the issuer)
     #[arg(long, default_value = "threshold")]
@@ -429,6 +426,10 @@ enum HolderCmd {
     Replace {
         #[arg(long)]
         mock_login: Option<String>,
+        /// "It wasn't me": your enrolment was refused because someone else enrolled with your
+        /// identity. Their secret is suspended at once and the report counted. Secure your eID first.
+        #[arg(long)]
+        not_me: bool,
     },
     /// Collect the new credential of a replacement whose wait is over
     Claim,
@@ -453,7 +454,6 @@ fn devnet_opts(a: &DevnetArgs) -> anyhow::Result<DevnetOpts> {
     Ok(DevnetOpts {
         scheme: SchemeConfig { proof_system: wiring::proof_system(&a.proof_system)?, tree_depth: a.tree_depth, ..Default::default() },
         data_dir: a.data_dir.clone(),
-        rollout: !a.no_rollout,
         uniqueness: match a.uniqueness.as_str() {
             "threshold" => devnet::UniquenessMode::Threshold { operators: 3, threshold: 2 },
             "hmac" => devnet::UniquenessMode::Hmac,
@@ -531,13 +531,6 @@ async fn demo(a: DevnetArgs) -> anyhow::Result<()> {
     bob.bind("mockfeed", "bob", 1, CodePlacement::Bio).await?;
 
     step(5, "The like farm put 40 likes on post p2. Verified people like: Alice p3 (twice), Bob p3, Carol p3 and p2.");
-    if a.no_rollout {
-        match alice.like("mockfeed", "p3").await {
-            Err(e) => println!("    refused on the device: {e}"),
-            Ok(_) => anyhow::bail!("a secret in probation reported a like"),
-        }
-        println!("    (started with --no-rollout: every secret is new, so the like steps are skipped; run without it to see them)");
-    } else {
     let r = alice.like("mockfeed", "p3").await?;
     println!("    Alice likes p3: new person = {}, verified count = {}", r.new, r.count);
     let r = alice.like("mockfeed", "p3").await?;
@@ -552,7 +545,6 @@ async fn demo(a: DevnetArgs) -> anyhow::Result<()> {
     .await?;
     println!("    p2: 40 platform likes, {} from verified people", c.counts["p2"]);
     println!("    p3:  6 platform likes, {} from verified people", c.counts["p3"]);
-    }
 
     step(6, "@dailytruth copies Alice's code into its own bio. The code commits to Alice's account, so no badge appears.");
     let http = reqwest::Client::new();
@@ -602,13 +594,32 @@ async fn demo(a: DevnetArgs) -> anyhow::Result<()> {
     let _ = std::fs::remove_file(tmp.join("wallet-carol-new/wallet.json"));
     let url = carol2.replace_start().await?;
     let code = devnet::mock_login(&url, "030375-902C").await?;
-    if let pop_holder::ReplaceOutcome::Waiting { claim_after, .. } = carol2.replace_finish(&code).await? {
+    if let pop_holder::ReplaceOutcome::Waiting { claim_after, .. } = carol2.replace_finish(&code, false).await? {
         println!("    request recorded; the new secret can be collected from {claim_after}");
     }
     if let Some(p) = carol.pending_replacement().await? {
         println!("    Carol's old app sees the request (made on {}); whoever has it AND her eID could refuse", dates::fmt_day(p.requested_on));
     }
     println!("    had she kept her guardian key (it is in the backup), the new secret would come at once, with nine months of probation");
+
+    step(12, "Someone enrols with Dave's eID before he does. Dave's enrolment is refused; he secures his eID and reports \"it wasn't me\".");
+    let thief = Arc::new(holder_for(tmp.join("wallet-thief"), &d, "dave")?);
+    let url = thief.enrol_start().await?;
+    thief.enrol_finish(&devnet::mock_login(&url, "040490-903D").await?).await?;
+    let dave = Arc::new(holder_for(tmp.join("wallet-dave"), &d, "dave")?);
+    let url = dave.enrol_start().await?;
+    let code = devnet::mock_login(&url, "040490-903D").await?;
+    anyhow::ensure!(code.is_empty() && dave.enrol_finish(&code).await.is_err(), "Dave's second enrolment was not refused");
+    println!("    Dave's enrolment is refused: his identity is already enrolled. The app points him to the instructions: {}", reset_eid_help());
+    let url = dave.replace_start().await?;
+    let code = devnet::mock_login(&url, "040490-903D").await?;
+    if let pop_holder::ReplaceOutcome::Waiting { claim_after, suspended, .. } = dave.replace_finish(&code, true).await? {
+        println!("    reported; the other secret suspended: {suspended}; Dave's new secret can be collected from {claim_after}");
+    }
+    println!("    the thief's wallet now sees itself suspended: {}", thief.suspended().await?);
+    let r = pop_protocol::api::IssuerApi::reports(&HttpClient::new(&d.issuer_url)).await?;
+    println!("    public weekly count of such reports this week: {} (alarm cutoff: {:?})", r.weeks.last().map(|w| w.1).unwrap_or(0), r.alarm_cutoff.map(dates::fmt_day));
+    println!("    if nobody lifts the suspension with the thief's app AND Dave's eID, Dave's new secret counts at once (once in two years)");
 
     let token = std::env::var("POP_PAIRING_TOKEN").ok().filter(|t| t.len() >= 16).unwrap_or_else(local_api::new_token);
     let l = tokio::net::TcpListener::bind("127.0.0.1:4010").await?;
@@ -623,6 +634,11 @@ async fn demo(a: DevnetArgs) -> anyhow::Result<()> {
 
 /// The identity check: with the mock provider it can run without a browser; otherwise the person
 /// opens the address and types the code the issuer's page shows.
+/// Where to read how to secure an eID: the copy built into the app, or the repository's.
+fn reset_eid_help() -> String {
+    format!("{} (or http://127.0.0.1:4010{} while `pop holder serve` runs)", pop_holder::holder::RESET_EID_HELP, pop_holder::holder::RESET_EID_PATH)
+}
+
 async fn login(url: &str, mock_login: Option<String>) -> anyhow::Result<String> {
     Ok(match mock_login {
         Some(id) => devnet::mock_login(url, &id).await?,
@@ -641,7 +657,17 @@ async fn holder_cmd(a: HolderArgs) -> anyhow::Result<()> {
     match a.cmd {
         HolderCmd::Enrol { mock_login } => {
             let code = login(&h.enrol_start().await?, mock_login).await?;
-            h.enrol_finish(&code).await?;
+            if let Err(e) = h.enrol_finish(&code).await {
+                if matches!(e, pop_holder::HolderError::EnrolNotReady(pop_protocol::api::EnrolStatus::AlreadyEnrolled)) {
+                    println!("This identity is already enrolled, so a second enrolment is refused.\n");
+                    println!("If you enrolled it yourself on a phone you no longer have, run `pop holder restore` (with your backup code)");
+                    println!("or `pop holder replace`. The new secret counts after about nine months.\n");
+                    println!("If you did NOT enrol it, someone has used your eID. First secure your eID: close it with its provider,");
+                    println!("report the crime to the police and get new eID means. How, with phone numbers: {}", reset_eid_help());
+                    println!("Then run `pop holder replace --not-me` with the new eID means. The other secret is suspended at once.");
+                }
+                return Err(e.into());
+            }
             println!("Enrolled. {}", serde_json::to_string_pretty(&h.status()?)?);
         }
         HolderCmd::Bind { platform, handle, slot, post } => {
@@ -689,14 +715,23 @@ async fn holder_cmd(a: HolderArgs) -> anyhow::Result<()> {
             println!("Restored. {}", serde_json::to_string_pretty(&h.status()?)?);
             println!("If the credential has expired, run `pop holder renew`.");
         }
-        HolderCmd::Replace { mock_login } => {
+        HolderCmd::Replace { mock_login, not_me } => {
+            if not_me {
+                println!("Before you go on: if you have not secured your eID yet, do it first, or whoever used it can undo this.");
+                println!("How: {}\n", reset_eid_help());
+            }
             let code = login(&h.replace_start().await?, mock_login).await?;
-            match h.replace_finish(&code).await? {
+            match h.replace_finish(&code, not_me).await? {
                 pop_holder::ReplaceOutcome::Issued { counted_from } => {
                     println!("Secret replaced. The old secret is revoked; its badges run out with their leases.");
                     println!("The new secret is in probation: bind your accounts again now, they and your likes count from {counted_from}.");
                 }
-                pop_holder::ReplaceOutcome::Waiting { claim_after, claim_before } => {
+                pop_holder::ReplaceOutcome::Waiting { claim_after, claim_before, suspended } => {
+                    if suspended {
+                        println!("Reported. The secret enrolled with your identity is suspended from now on: it can no longer bind accounts or like.");
+                        println!("It can be lifted only by someone who has that app AND can log in with your eID. If that happens, your eID is");
+                        println!("still not safe: tell the police and your eID provider. {}", reset_eid_help());
+                    }
                     println!("Request recorded. This wallet does not have the old guardian key, so the replacement waits.");
                     println!("Until then it can be refused from the app with the old secret, which takes your eID as well. Run `pop holder claim` between {claim_after} and {claim_before}.");
                 }
@@ -704,18 +739,35 @@ async fn holder_cmd(a: HolderArgs) -> anyhow::Result<()> {
         }
         HolderCmd::Claim => println!("Secret replaced. Bind your accounts again; they and your likes count from {}.", h.replace_claim().await?),
         HolderCmd::Veto { mock_login } => {
-            anyhow::ensure!(h.pending_replacement().await?.is_some(), "nobody is waiting to replace this wallet's secret");
+            let pending = h.pending_replacement().await?.is_some();
+            let suspended = h.suspended().await?;
+            anyhow::ensure!(pending || suspended, "nobody is waiting to replace this wallet's secret, and it is not suspended");
             let code = login(&h.recheck_start().await?, mock_login).await?;
             h.recheck_finish(&code).await?;
-            println!("Replacement refused. If you did not ask for it, someone else can log in with your eID: contact your bank or eID provider.");
+            if suspended {
+                println!("Suspension lifted: same secret, same badges.");
+            }
+            if pending {
+                println!("Replacement refused.");
+            }
+            println!("If you did not ask for this, someone else can log in with your eID. Secure it now: {}", reset_eid_help());
         }
         HolderCmd::Status => {
+            let suspended = h.suspended().await.unwrap_or(false);
             println!("{}", serde_json::to_string_pretty(&h.status()?)?);
+            if suspended {
+                println!(
+                    "\nWARNING: someone logged in with your eID and reported that they did not enrol this secret, so it is suspended.\n\
+                     If that was not you, run `pop holder veto` (it asks you to log in), then secure your eID: {}",
+                    reset_eid_help()
+                );
+            }
             if let Ok(Some(p)) = h.pending_replacement().await {
                 println!(
-                    "\nWARNING: on {} someone logged in with your eID and asked to REPLACE this wallet's secret. It takes effect from {}.\nIf that was not you, run `pop holder veto` now (it asks you to log in).",
+                    "\nWARNING: on {} someone logged in with your eID and asked to REPLACE this wallet's secret. It takes effect from {}.\nIf that was not you, run `pop holder veto` now (it asks you to log in), then secure your eID: {}",
                     dates::fmt_day(p.requested_on),
-                    dates::fmt_day(p.claim_after)
+                    dates::fmt_day(p.claim_after),
+                    reset_eid_help()
                 );
             }
         }
@@ -735,9 +787,16 @@ async fn holder_cmd(a: HolderArgs) -> anyhow::Result<()> {
             };
             if let Ok(Some(p)) = h.pending_replacement().await {
                 println!(
-                    "WARNING: on {} someone logged in with your eID and asked to REPLACE this wallet's secret (from {}). If that was not you, run `pop holder veto`.",
+                    "WARNING: on {} someone logged in with your eID and asked to REPLACE this wallet's secret (from {}). If that was not you, run `pop holder veto`, then secure your eID: http://{listen}{}",
                     dates::fmt_day(p.requested_on),
-                    dates::fmt_day(p.claim_after)
+                    dates::fmt_day(p.claim_after),
+                    pop_holder::holder::RESET_EID_PATH
+                );
+            }
+            if h.suspended().await.unwrap_or(false) {
+                println!(
+                    "WARNING: this wallet's secret is suspended by a theft report made with your eID. If that was not you, run `pop holder veto`, then secure your eID: http://{listen}{}",
+                    pop_holder::holder::RESET_EID_PATH
                 );
             }
             println!("Holder app listening on http://{listen}\nPairing token for the extension: {token}");

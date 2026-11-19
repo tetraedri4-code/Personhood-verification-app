@@ -20,6 +20,6 @@ pub mod local_api;
 pub mod recovery;
 pub mod wallet;
 
-pub use holder::{BindOutcome, Holder, HolderError, Status};
+pub use holder::{BindOutcome, Holder, HolderError, Status, RESET_EID_HELP, RESET_EID_PATH};
 pub use recovery::ReplaceOutcome;
 pub use wallet::{FileWallet, MemoryWallet, WalletStore};

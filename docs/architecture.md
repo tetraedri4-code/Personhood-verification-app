@@ -76,8 +76,9 @@ and pseudonym, so it points at exactly one claim.
 on the account: by the directory (where the platform has a public read interface) or by the extension on
 the profile page.
 
-**Like.** The holder proves "valid, unrevoked credential, certified at least nine months ago; this is
-my tag for this post". The directory
+**Like.** The holder proves "valid, unrevoked credential, counted from a day no later than the cutoff;
+this is my tag for this post". The cutoff is today, or the alarm cutoff while many "it wasn't me"
+reports are coming in; a first enrolment counts from its own week, a replaced secret after forty weeks. The directory
 stores the tag; a second report with the same tag does not count.
 
 **Renew, revoke.** As in design v2 §4.6: blind renewal against a proof; revocation by the holder's own
@@ -87,7 +88,9 @@ request, signed with the guardian key.
 inside a renewal proof; the issuer signs the same secret for two more years. A backup is the wallet
 encrypted under a paper code, stored as ciphertext. A lost secret is replaced after an eID login: at
 once with the old guardian key, otherwise after a wait in which a re-check with the old app cancels
-it; the new secret starts a fresh probation. See [recovery.md](recovery.md).
+it; the new secret starts a fresh probation. A person whose identity someone else enrolled reports it:
+the other secret is suspended at once, and an uncontested report gives a secret that counts at once
+(once in two years). See [recovery.md](recovery.md).
 
 ## What the prototype leaves out
 

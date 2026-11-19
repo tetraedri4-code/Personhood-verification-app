@@ -178,7 +178,9 @@ pub struct IssuedAttrs {
     pub handle: u64,
     /// tau: expiry, the last day of a calendar quarter
     pub expiry: Day,
-    /// gamma: first day of the quarter in which s was certified (probation)
+    /// gamma: the Monday from which s counts (likes accepted, badges counted). The week of enrolment
+    /// for a first enrolment, 40 weeks later for a replaced secret. Proofs show only that it is not
+    /// after the public cutoff (`dates::count_cutoff`).
     pub certified: Day,
     /// ell: first day of the month of the last eID check
     pub last_check: Day,
@@ -198,8 +200,8 @@ impl IssuedAttrs {
         if self.expiry != dates::quarter_end(q) {
             return Err(CryptoError::OffGrid("expiry is not the last day of a quarter".into()));
         }
-        if self.certified != dates::quarter_start(dates::quarter_of(self.certified)) {
-            return Err(CryptoError::OffGrid("certification date is not a quarter start".into()));
+        if self.certified != dates::week_start(self.certified) {
+            return Err(CryptoError::OffGrid("the counts-from date is not a Monday".into()));
         }
         if self.last_check != dates::month_start(self.last_check) {
             return Err(CryptoError::OffGrid("re-check date is not a month start".into()));
@@ -455,10 +457,11 @@ impl Scheme {
                 quarters: dates::lease_quarters(today),
                 today,
                 probation: kind == StatementKind::BindingProbation,
+                cutoff: today,
                 root: Fr::zero(),
                 bind: vec![],
             },
-            StatementKind::Like => Stmt::Like { ctx: "setup".into(), post: "setup".into(), today, root: Fr::zero(), bind: vec![] },
+            StatementKind::Like => Stmt::Like { ctx: "setup".into(), post: "setup".into(), today, cutoff: today, root: Fr::zero(), bind: vec![] },
             StatementKind::Renewal => Stmt::Renewal { today, root: Fr::zero(), bind: vec![], shown: None },
         }
     }
@@ -466,7 +469,7 @@ impl Scheme {
     fn cfg_for(&self, st: &Stmt) -> Cfg {
         let kind = st.kind();
         let (hashes, ranges, today, root, bind) = match st {
-            Stmt::Binding { ctx, slot, quarters, today, probation, root, bind } => {
+            Stmt::Binding { ctx, slot, quarters, today, probation, cutoff, root, bind } => {
                 let p = context_scalar(ctx);
                 let mut h = vec![HashUse {
                     label: "nym",
@@ -490,15 +493,11 @@ impl Scheme {
                 }
                 let mut r = vec![Range { label: "tau >= today", terms: vec![(A_TAU, 1)], constant: -(*today as i64) }];
                 if *probation {
-                    r.push(Range {
-                        label: "gamma <= today - 9 months",
-                        terms: vec![(A_GAMMA, -1)],
-                        constant: *today as i64 - dates::PROBATION_DAYS as i64,
-                    });
+                    r.push(Range { label: "gamma <= cutoff", terms: vec![(A_GAMMA, -1)], constant: *cutoff as i64 });
                 }
                 (h, r, *today, *root, bind.clone())
             }
-            Stmt::Like { ctx, post, today, root, bind } => {
+            Stmt::Like { ctx, post, today, cutoff, root, bind } => {
                 let h = vec![HashUse {
                     label: "like",
                     tag: dom("like"),
@@ -508,11 +507,11 @@ impl Scheme {
                     bases: vec![output_base("like", ctx, 0, post)],
                     hidden: vec![false],
                 }];
-                // A like counts only from a secret that has passed probation. Without this, replacing
+                // A like counts only from a secret that is past its probation. Without this, replacing
                 // the secret (recovery) would hand out a fresh set of like tags each time.
                 let r = vec![
                     Range { label: "tau >= today", terms: vec![(A_TAU, 1)], constant: -(*today as i64) },
-                    Range { label: "gamma <= today - 9 months", terms: vec![(A_GAMMA, -1)], constant: *today as i64 - dates::PROBATION_DAYS as i64 },
+                    Range { label: "gamma <= cutoff", terms: vec![(A_GAMMA, -1)], constant: *cutoff as i64 },
                 ];
                 (h, r, *today, *root, bind.clone())
             }
@@ -671,6 +670,7 @@ impl Scheme {
         ctx: &str,
         slot: u32,
         today: Day,
+        cutoff: Day,
         probation: bool,
         bind: &[u8],
     ) -> Result<BindingProof> {
@@ -678,7 +678,7 @@ impl Scheme {
             return Err(CryptoError::Unprovable(format!("slot must be 1..={}", self.config.slots)));
         }
         let quarters = dates::lease_quarters(today);
-        let st = Stmt::Binding { ctx: ctx.into(), slot, quarters, today, probation, root: tree.root(), bind: bind.to_vec() };
+        let st = Stmt::Binding { ctx: ctx.into(), slot, quarters, today, probation, cutoff, root: tree.root(), bind: bind.to_vec() };
         let pr = self.prove_stmt(rng, &st, cred, tree, issuer, witness)?;
         Ok(BindingProof {
             slot,
@@ -690,7 +690,9 @@ impl Scheme {
         })
     }
 
-    pub fn verify_binding(&self, vc: &VerifyCtx, ctx: &str, bind: &[u8], bp: &BindingProof) -> Result<()> {
+    /// `cutoff`: the verifier's own `dates::count_cutoff` for the proof's day (it matters only when the
+    /// proof claims `probation_cleared`).
+    pub fn verify_binding(&self, vc: &VerifyCtx, cutoff: Day, ctx: &str, bind: &[u8], bp: &BindingProof) -> Result<()> {
         if bp.slot == 0 || bp.slot > self.config.slots {
             return Err(CryptoError::InvalidProof);
         }
@@ -704,6 +706,7 @@ impl Scheme {
             quarters,
             today: vc.today,
             probation: bp.probation_cleared,
+            cutoff,
             root: vc.revocation_root,
             bind: bind.to_vec(),
         };
@@ -728,14 +731,15 @@ impl Scheme {
         ctx: &str,
         post: &str,
         today: Day,
+        cutoff: Day,
     ) -> Result<LikeProof> {
-        let st = Stmt::Like { ctx: ctx.into(), post: post.into(), today, root: tree.root(), bind: vec![] };
+        let st = Stmt::Like { ctx: ctx.into(), post: post.into(), today, cutoff, root: tree.root(), bind: vec![] };
         let pr = self.prove_stmt(rng, &st, cred, tree, issuer, witness)?;
         Ok(LikeProof { tag: to_hex(&pr.outputs[0]), proof: hex::encode(codec::encode_proof(&pr)) })
     }
 
-    pub fn verify_like(&self, vc: &VerifyCtx, ctx: &str, post: &str, lp: &LikeProof) -> Result<()> {
-        let st = Stmt::Like { ctx: ctx.into(), post: post.into(), today: vc.today, root: vc.revocation_root, bind: vec![] };
+    pub fn verify_like(&self, vc: &VerifyCtx, cutoff: Day, ctx: &str, post: &str, lp: &LikeProof) -> Result<()> {
+        let st = Stmt::Like { ctx: ctx.into(), post: post.into(), today: vc.today, cutoff, root: vc.revocation_root, bind: vec![] };
         let pr = self.verify_stmt(&st, vc, &lp.proof)?;
         if to_hex(&pr.outputs[0]) != lp.tag {
             return Err(CryptoError::InvalidProof);
@@ -864,26 +868,54 @@ impl Scheme {
         old_check: Day,
         new_expiry: Day,
         new_check: Day,
+        new_handle: Option<u64>,
     ) -> Result<BlindSignature> {
+        if new_handle.is_some_and(|h| h == 0 || h >= 1 << 63 || h == handle) {
+            return Err(CryptoError::OffGrid("new handle".into()));
+        }
         if new_expiry != dates::quarter_end(dates::quarter_of(new_expiry)) || new_check != dates::month_start(new_check) || new_check < old_check {
             return Err(CryptoError::OffGrid("new expiry or re-check month".into()));
         }
         let st = Stmt::Renewal { today: vc.today, root: vc.revocation_root, bind: session.to_vec(), shown: Some((handle, old_check)) };
         let pr = self.verify_stmt(&st, vc, &rp.proof)?;
         let cnew = pr.cnew.ok_or(CryptoError::InvalidProof)?;
-        // cnew commits to every attribute but the expiry, the old month included; swap the month
-        let b = self.g.p1 + self.g.q1 * statement::domain() + cnew + self.g.h[A_TAU] * Fr::from(new_expiry as u64)
+        // cnew commits to every attribute but the expiry, the old month and handle included; swap the
+        // month, and the handle when a suspension is lifted (the old handle stays revoked)
+        let mut b = self.g.p1 + self.g.q1 * statement::domain() + cnew + self.g.h[A_TAU] * Fr::from(new_expiry as u64)
             + self.g.h[A_ELL] * (Fr::from(new_check as u64) - Fr::from(old_check as u64));
+        if let Some(nh) = new_handle {
+            b += self.g.h[A_R] * (Fr::from(nh) - Fr::from(handle));
+        }
         let e = Fr::rand(rng);
         let a = (b * (key.x + e).inverse().unwrap()).into_affine();
         Ok(BlindSignature { a: to_hex(&a), e: to_hex(&e) })
     }
 
     /// Holder: install the re-checked signature.
-    pub fn finish_recheck(&self, issuer: &IssuerPublicKey, old: &Credential, rho_new: Fr, sig: &BlindSignature, new_expiry: Day, new_check: Day) -> Result<Credential> {
+    /// `new_handle`: when a suspension was lifted, the new handle and the witness's signature on it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_recheck(
+        &self,
+        issuer: &IssuerPublicKey,
+        witness: &WitnessPublicKey,
+        old: &Credential,
+        rho_new: Fr,
+        sig: &BlindSignature,
+        new_expiry: Day,
+        new_check: Day,
+        new_handle: Option<(u64, &HandleSignature)>,
+    ) -> Result<Credential> {
         let mut attrs = old.attrs.clone();
         attrs.expiry = new_expiry;
         attrs.last_check = new_check;
+        let mut handle_sig = old.handle_sig.clone();
+        if let Some((h, hs)) = new_handle {
+            if !witness.verify_handle(h, hs) {
+                return Err(CryptoError::BadSignature);
+            }
+            attrs.handle = h;
+            handle_sig = hs.clone();
+        }
         attrs.check_grid()?;
         if new_check < old.attrs.last_check {
             return Err(CryptoError::OffGrid("re-check month went backwards".into()));
@@ -892,6 +924,7 @@ impl Scheme {
         m[A_RHO] = rho_new;
         m[A_TAU] = Fr::from(new_expiry as u64);
         m[A_ELL] = Fr::from(new_check as u64);
+        m[A_R] = Fr::from(attrs.handle);
         let a: G1A = from_hex(&sig.a)?;
         let e: Fr = from_hex(&sig.e)?;
         if !statement::bbs_verify(&self.g, &issuer.w, &a, e, &statement::bbs_b(&self.g, &m)) {
@@ -900,7 +933,8 @@ impl Scheme {
         let mut mv = old.inner.mv;
         mv[A_TAU] = new_expiry as u64;
         mv[A_ELL] = new_check as u64;
-        Ok(Credential { inner: statement::Credential { a, e, m, mv }, attrs, handle_sig: old.handle_sig.clone() })
+        mv[A_R] = attrs.handle;
+        Ok(Credential { inner: statement::Credential { a, e, m, mv }, attrs, handle_sig })
     }
 }
 
@@ -913,8 +947,8 @@ fn cfg_pos<'a>(s: &'a Scheme, cfg: &Cfg) -> &'a Poseidon {
 }
 
 enum Stmt {
-    Binding { ctx: String, slot: u32, quarters: [u32; 4], today: Day, probation: bool, root: Fr, bind: Vec<u8> },
-    Like { ctx: String, post: String, today: Day, root: Fr, bind: Vec<u8> },
+    Binding { ctx: String, slot: u32, quarters: [u32; 4], today: Day, probation: bool, cutoff: Day, root: Fr, bind: Vec<u8> },
+    Like { ctx: String, post: String, today: Day, cutoff: Day, root: Fr, bind: Vec<u8> },
     /// `shown`: a re-check shows the handle and the month of the last identity check to the issuer
     Renewal { today: Day, root: Fr, bind: Vec<u8>, shown: Option<(u64, Day)> },
 }

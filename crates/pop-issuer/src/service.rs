@@ -27,19 +27,18 @@ pub struct IssuerConfig {
     pub provider_code: u32,
     /// minimum level of assurance at enrolment. The design asks "high"; Finnish bank IDs are "substantial".
     pub min_loa: Loa,
-    /// Rollout window (design §4.5): while set, secrets count as certified on this quarter start, so a
-    /// launch gives counted badges at once. None = probation runs nine months from enrolment.
-    pub rollout_certified: Option<Day>,
     /// override "today" (tests)
     pub clock: Option<Clock>,
     /// Recovery level 2 without the guardian key: days a replacement waits, during which a re-check
     /// with the old app cancels it (docs/recovery.md).
     pub replace_wait_days: u32,
+    /// when "it wasn't me" reports raise the alarm (`GET /v1/reports`)
+    pub alarm: crate::reports::AlarmRule,
 }
 
 impl Default for IssuerConfig {
     fn default() -> Self {
-        IssuerConfig { keys_dir: None, provider_code: 1, min_loa: Loa::Substantial, rollout_certified: None, clock: None, replace_wait_days: 90 }
+        IssuerConfig { keys_dir: None, provider_code: 1, min_loa: Loa::Substantial, clock: None, replace_wait_days: 90, alarm: Default::default() }
     }
 }
 
@@ -47,8 +46,22 @@ pub(crate) struct RevState {
     pub(crate) epoch: u64,
     pub(crate) revoked: Vec<u64>,
     pub(crate) root: String,
-    pub(crate) previous_root: Option<String>,
+    previous_root: Option<String>,
+    /// when `root` last changed
+    changed_at: std::time::Instant,
     pub(crate) tree: pop_crypto::revtree::RevocationTree,
+}
+
+/// How long proofs against the root before the latest revocation are still taken, for proofs that were
+/// being made when it changed. Kept short: a secret revoked or suspended a moment ago can prove against
+/// that root, so it must stop working within minutes, not at the next revocation (which in a quiet
+/// period could be days away).
+pub const PREVIOUS_ROOT_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
+
+impl RevState {
+    pub(crate) fn previous_root(&self) -> Option<&str> {
+        self.previous_root.as_deref().filter(|_| self.changed_at.elapsed() < PREVIOUS_ROOT_GRACE)
+    }
 }
 
 pub struct Issuer {
@@ -70,6 +83,8 @@ pub struct Issuer {
     pub(crate) records: tokio::sync::Mutex<()>,
     /// one revocation at a time, so positions in the list are unique
     revoking: tokio::sync::Mutex<()>,
+    /// "it wasn't me" reports per week (Monday → count)
+    pub(crate) reports: RwLock<BTreeMap<Day, u64>>,
 }
 
 pub(crate) const T_SESSIONS: &str = "enrol_sessions";
@@ -126,6 +141,17 @@ pub(crate) struct Enrolment {
     /// a replacement that waits for its veto period to pass
     #[serde(default)]
     pub(crate) pending: Option<crate::recovery::PendingReplace>,
+    /// day a theft report suspended the secret (its handle is revoked); a re-check with the old app
+    /// and the eID lifts the suspension with a new handle
+    #[serde(default)]
+    pub(crate) suspended_on: Option<Day>,
+    /// day of the last theft report counted for this person (one per 30 days counts)
+    #[serde(default)]
+    pub(crate) reported_on: Option<Day>,
+    /// day of the last replacement that counted at once after an uncontested theft report
+    #[serde(default)]
+    pub(crate) fresh_replacement_on: Option<Day>,
+
     /// Version of the uniqueness key the record's key d was computed under. d is only comparable with
     /// values made under the same key, so a record without its key is a record nobody can match.
     #[serde(default)]
@@ -191,9 +217,15 @@ impl Issuer {
         listed.sort();
         let revoked: Vec<u64> = listed.into_iter().map(|(_, h)| h).collect();
         let tree = scheme.revocation_tree(&revoked)?;
+        let reports: BTreeMap<Day, u64> = store
+            .list(crate::reports::T_REPORTS)
+            .await?
+            .iter()
+            .filter_map(|(k, v)| Some((k.parse().ok()?, v.as_u64()?)))
+            .collect();
         check_key_versions(&*uniq, &store).await?;
-        let rev = RevState { epoch: 0, root: root_to_hex(&tree.root()), previous_root: None, revoked, tree };
-        Ok(Arc::new(Issuer { scheme, key, witness, lego, idp, uniq, store, cfg, rev: RwLock::new(rev), rng: Mutex::new(rng), records: tokio::sync::Mutex::new(()), revoking: tokio::sync::Mutex::new(()), backups: tokio::sync::Mutex::new(()) }))
+        let rev = RevState { epoch: 0, root: root_to_hex(&tree.root()), previous_root: None, changed_at: std::time::Instant::now(), revoked, tree };
+        Ok(Arc::new(Issuer { scheme, key, witness, lego, idp, uniq, store, cfg, rev: RwLock::new(rev), rng: Mutex::new(rng), records: tokio::sync::Mutex::new(()), revoking: tokio::sync::Mutex::new(()), reports: RwLock::new(reports), backups: tokio::sync::Mutex::new(()) }))
     }
 
     pub fn today(&self) -> Day {
@@ -216,6 +248,7 @@ impl Issuer {
             statements: self.lego.keys().copied().collect(),
             today: self.today(),
             providers,
+            alarm_cutoff: self.alarm_cutoff(),
         }
     }
 
@@ -239,7 +272,9 @@ impl Issuer {
         let today = self.today();
         let q = dates::quarter_of(today);
         let expiry = Self::expiry_from(today);
-        let certified = self.cfg.rollout_certified.unwrap_or_else(|| dates::quarter_start(q));
+        // A first enrolment counts from its own week: no probation unless an alarm reaches back to it.
+        // Never backdated (there is no rollout window any more): a backdated secret would escape the alarm.
+        let certified = dates::week_start(today);
         IssuedAttrs {
             handle,
             expiry,
@@ -266,6 +301,7 @@ impl Issuer {
         revoked.push(handle);
         let tree = self.scheme.revocation_tree(&revoked)?;
         rv.previous_root = Some(rv.root.clone());
+        rv.changed_at = std::time::Instant::now();
         rv.root = root_to_hex(&tree.root());
         rv.epoch += 1;
         rv.revoked = revoked;
@@ -281,7 +317,7 @@ impl Issuer {
         let rv = self.rev.read().unwrap();
         let total = rv.revoked.len() as u64;
         let from = since.min(total);
-        Revocations { epoch: rv.epoch, from, total, revoked: rv.revoked[from as usize..].to_vec(), root: rv.root.clone(), previous_root: rv.previous_root.clone() }
+        Revocations { epoch: rv.epoch, from, total, revoked: rv.revoked[from as usize..].to_vec(), root: rv.root.clone(), previous_root: rv.previous_root().map(String::from) }
     }
 }
 
@@ -401,6 +437,7 @@ pub fn router(issuer: Arc<Issuer>) -> Router {
         // public answers only: compressing a response that holds a secret could leak it (BREACH)
         .route("/v1/revocations", get(revocations).layer(tower_http::compression::CompressionLayer::new()))
         .route("/v1/revoke", post(revoke))
+        .route("/v1/reports", get(crate::reports::reports))
         .route("/v1/recheck", post(crate::recovery::recheck))
         .route("/v1/replace", post(crate::recovery::replace))
         .route("/v1/replace/claim", post(crate::recovery::claim))
@@ -548,7 +585,7 @@ async fn enrol_finish(State(s): State<St>, Json(req): Json<EnrolFinishRequest>) 
     let (sess, d, key_version) = authenticated_session(&s, &req.session, Purpose::Enrol, &req.confirm_code).await?;
     check_guardian_key(&req.guardian_public_key)?;
     let handle = s.new_handle();
-    let rec = Enrolment { handle, guardian: req.guardian_public_key.clone(), status: "active".into(), enrolled_on: s.today(), replaced_on: None, pending: None, key_version };
+    let rec = Enrolment { handle, guardian: req.guardian_public_key.clone(), status: "active".into(), enrolled_on: s.today(), replaced_on: None, pending: None, suspended_on: None, reported_on: None, fresh_replacement_on: None, key_version };
     // atomic: two sessions of one person cannot both get through
     if !s.store.insert_new(T_ENROL, &d, serde_json::to_value(&rec)?).await? {
         return Err(err(StatusCode::CONFLICT, "already enrolled"));
@@ -614,17 +651,35 @@ pub(crate) async fn authenticated_session(s: &Issuer, id: &str, purpose: Purpose
     Ok((sess, d, key_version))
 }
 
-/// A proof's date must be within a day of the issuer's, and its revocation root the current or the
-/// previous one.
+/// A proof's date must be within a day of the issuer's, and its revocation root the current one, or the
+/// previous one for [`PREVIOUS_ROOT_GRACE`] after a change.
 pub(crate) fn check_date_and_root(s: &Issuer, proof_today: Day, proof_root: &str) -> Result<pop_crypto::params::Fr, ApiErr> {
     if proof_today.abs_diff(s.today()) > 1 {
         return Err(err(StatusCode::BAD_REQUEST, "date out of window"));
     }
     let rv = s.rev.read().unwrap();
-    if proof_root != rv.root && Some(proof_root) != rv.previous_root.as_deref() {
+    if proof_root != rv.root && Some(proof_root) != rv.previous_root() {
         return Err(err(StatusCode::CONFLICT, "stale revocation root; fetch /v1/revocations"));
     }
     Ok(pop_crypto::root_from_hex(proof_root)?)
+}
+
+/// For lifting a suspension: the proof must be against the revocation list as it was just before
+/// `handle` was added to it.
+pub(crate) fn check_date_and_root_before(s: &Issuer, proof_today: Day, proof_root: &str, handle: u64) -> Result<pop_crypto::params::Fr, ApiErr> {
+    if proof_today.abs_diff(s.today()) > 1 {
+        return Err(err(StatusCode::BAD_REQUEST, "date out of window"));
+    }
+    let prefix: Vec<u64> = {
+        let rv = s.rev.read().unwrap();
+        let pos = rv.revoked.iter().position(|h| *h == handle).ok_or_else(|| err(StatusCode::CONFLICT, "this secret is not suspended"))?;
+        rv.revoked[..pos].to_vec()
+    };
+    let tree = s.scheme.revocation_tree(&prefix)?;
+    if root_to_hex(&tree.root()) != proof_root {
+        return Err(err(StatusCode::CONFLICT, "a suspended secret proves against the revocation list as it was before its suspension"));
+    }
+    Ok(tree.root())
 }
 
 async fn renew(State(s): State<St>, Json(req): Json<RenewRequest>) -> Result<Json<RenewResponse>, ApiErr> {

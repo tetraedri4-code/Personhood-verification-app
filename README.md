@@ -20,6 +20,12 @@ What it does:
 - **Verified like counts.** When you like a post, your app can report a tag that is unique per person
   and post. One person counts once however many accounts they have, and tags for different posts
   cannot be linked.
+- **Stolen identities.** A first enrolment counts at once. If someone enrolled with your eID before
+  you, your enrolment is refused and the app sends you to [sourced instructions for securing your
+  eID](docs/reset-eid.md) (Finnish banks, mobile certificates, ID card, police). Then you report "it
+  wasn't me": the other secret is suspended at once, and when many such reports come in, recent
+  enrolments stop counting for a while ([recovery.md](docs/recovery.md) §4; a proposed change to the
+  design, not yet folded into it).
 
 ## Try it
 
@@ -33,7 +39,8 @@ The first start takes about a minute (proof-system setup), then prints a walk-th
 refused second enrolment, binding, a like farm of 40 bots against 1 verified like, an impostor copying
 a code, blind renewal, the uniqueness operators refreshing their key shares and replacing one of
 their number while Alice stays recognised, the two-year identity re-check, a backup restored on a new
-device with a paper code, and a lost secret being replaced. The services keep running:
+device with a paper code, a lost secret being replaced, and a person reporting that someone enrolled
+with their eID. The services keep running:
 
 | Service | Address |
 |---|---|
@@ -41,7 +48,7 @@ device with a paper code, and a lost secret being replaced. The services keep ru
 | Mock identity provider | http://127.0.0.1:4001 |
 | Issuer | http://127.0.0.1:4002 |
 | Directory | http://127.0.0.1:4003 |
-| Alice's holder app (for the extension) | http://127.0.0.1:4010 |
+| Alice's holder app (for the extension); eID help at `/help/reset-eid` | http://127.0.0.1:4010 |
 | Uniqueness operators (three with a share, one standby) | four free ports, printed at start |
 
 ![The mock feed with the extension: badges on two accounts, 40 likes but 1 verified on the farmed post](docs/img/mockfeed-with-extension.png)
@@ -62,6 +69,8 @@ pop holder recheck                           # the two-year identity re-check
 pop holder backup                            # encrypted backup; prints a paper code
 pop holder restore                           # on a new device: asks for the paper code
 pop holder replace                           # lost or stolen secret: a new one after an eID login
+pop holder replace --not-me                  # someone else enrolled with your eID: report it
+pop holder veto                              # refuse a replacement, or lift a suspension
 ```
 
 (`pop` is `cargo run --release -p pop-cli --`.)

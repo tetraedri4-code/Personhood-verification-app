@@ -4,7 +4,7 @@ use crate::wiring::{self, IssuerFile, PlatformOpts, UniquenessFile};
 use pop_uniqueness::admin::{self, AdminEndpoint};
 use pop_uniqueness::{Operator, OperatorConfig, OperatorEndpoint, ThresholdConfig};
 use serde::{Deserialize, Serialize};
-use pop_crypto::{dates, SchemeConfig};
+use pop_crypto::SchemeConfig;
 use pop_directory::{Directory, DirectoryConfig};
 use pop_mock_idp::{MockClient, MockIdpConfig};
 use pop_protocol::http::HttpClient;
@@ -19,8 +19,6 @@ pub struct DevnetOpts {
     pub data_dir: Option<PathBuf>,
     /// ports for feed, idp, issuer, directory; 0 = any free port
     pub ports: [u16; 4],
-    /// enrolments count at once (rollout window) instead of after nine months of probation
-    pub rollout: bool,
     pub uniqueness: UniquenessMode,
     /// days a replacement without the old guardian key waits (None = the issuer's default, 90)
     pub replace_wait_days: Option<u32>,
@@ -37,7 +35,7 @@ pub enum UniquenessMode {
 
 impl Default for DevnetOpts {
     fn default() -> Self {
-        DevnetOpts { scheme: SchemeConfig::default(), data_dir: None, ports: [4000, 4001, 4002, 4003], rollout: true, uniqueness: UniquenessMode::Hmac, replace_wait_days: None }
+        DevnetOpts { scheme: SchemeConfig::default(), data_dir: None, ports: [4000, 4001, 4002, 4003], uniqueness: UniquenessMode::Hmac, replace_wait_days: None }
     }
 }
 
@@ -180,8 +178,6 @@ pub async fn start(o: DevnetOpts) -> anyhow::Result<Devnet> {
         }),
     );
 
-    // a quarter start more than nine months back, so demo badges are "counted" at once
-    let rollout = o.rollout.then(|| dates::fmt_day(dates::quarter_start(dates::quarter_of(dates::today()).saturating_sub(4))));
     let (uniqueness, uniq_file) = match o.uniqueness {
         UniquenessMode::Hmac => (None, UniquenessFile::Hmac),
         UniquenessMode::Threshold { operators, threshold } => {
@@ -194,10 +190,11 @@ pub async fn start(o: DevnetOpts) -> anyhow::Result<Devnet> {
         scheme: o.scheme.clone(),
         oidc,
         provider_code: 1,
-        rollout_certified: rollout,
         uniqueness: uniq_file,
         uniqueness_key: None,
         replace_wait_days: o.replace_wait_days,
+        alarm_min_reports: None,
+        alarm_factor: None,
     })
     .await?;
     serve(l_iss, pop_issuer::router(issuer));

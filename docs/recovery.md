@@ -1,12 +1,13 @@
 # Re-check and recovery
 
-Three things happen to a credential after enrolment besides the quarterly renewal:
+Besides the quarterly renewal, these things can happen to a credential after enrolment:
 
 | | When | What the person needs | What changes |
 |---|---|---|---|
 | **Identity re-check** | every two years | eID login + the app | nothing: same secret, same pseudonyms, same badges |
 | **Restore a backup** (level 1) | phone lost or replaced | the paper code | nothing: the same secret on a new device |
-| **Replace the secret** (level 2) | no backup, or the secret was stolen | eID login (+ the old guardian key, to skip the wait) | new secret, new pseudonyms, nine months of probation; the old secret is revoked |
+| **Replace the secret** (level 2) | no backup, or the secret was stolen | eID login (+ the old guardian key, to skip the wait) | new secret, new pseudonyms, forty weeks of probation; the old secret is revoked |
+| **"It wasn't me"** (theft report, §4) | someone enrolled with your identity | eID login | the other secret is suspended at once; after an uncontested wait your new secret counts at once (once in two years) |
 
 All three are in the holder core (`crates/pop-holder/src/recovery.rs`) and the issuer
 (`crates/pop-issuer/src/recovery.rs`, `backup.rs`). The interface between them is in
@@ -17,12 +18,19 @@ pop holder recheck            # two-year re-check
 pop holder backup             # make a backup, print the paper code
 pop holder restore            # asks for the code (or: restore <code>)
 pop holder replace            # replace the secret after an eID login
+pop holder replace --not-me   # the same, reporting that someone else enrolled with your identity
 pop holder claim              # collect a replacement that had to wait
-pop holder veto               # refuse a replacement someone else asked for (asks you to log in)
-pop holder status             # shows the re-check date, and warns of a waiting replacement
+pop holder veto               # refuse a replacement, or lift a suspension (asks you to log in)
+pop holder status             # shows the re-check date, warns of a waiting replacement or a suspension
 ```
 
-`pop demo` runs a re-check, a backup with restore, and a waiting replacement (steps 9 to 11).
+`pop demo` runs a re-check, a backup with restore, a waiting replacement and a theft report (steps 9
+to 12).
+
+**Status: proposed change to the design, not folded.** First enrolments without probation, theft
+reports with suspension, the alarm cutoff and the two-year rule for uncontested reports (§4) were agreed
+for the prototype on 19 November 2026. These rules are not in design v2 yet; folding them into the design
+waits for its author's word.
 
 ## 1. The two-year re-check
 
@@ -119,10 +127,10 @@ default 90):
 
 **In both cases the new secret starts over:**
 
-- Its probation runs from the start of the **next** quarter, rollout window or not, so it is at least
-  nine months before its badges are counted and before it can report likes. This is what makes a stolen
-  eID login worth little, and it is why like proofs now require a secret that has passed probation
-  (otherwise each replacement would hand out a fresh set of like tags at once).
+- Its probation runs forty weeks from the Monday of the week it is issued (`PROBATION_DAYS`), about
+  nine months, before its badges are counted and before it can report likes. This is what makes a stolen
+  eID login worth little: each new secret can like every post again. The one exception is an uncontested
+  theft report (§4).
 - It has new pseudonyms. Accounts must be bound again; the old badges run out with their leases.
 - At most one replacement per 30 days per person.
 
@@ -131,11 +139,58 @@ Who can do what:
 | Attacker has | Can they take over? | Can they lock the owner out? |
 |---|---|---|
 | the phone (secret + guardian key), not the eID | uses the secret until the owner replaces it; cannot replace it | no: cannot refuse the owner's replacement (it takes the eID). The owner waits 90 days, or restores a backup and replaces at once |
-| the eID, not the phone | only if the owner ignores the app's warning for 90 days; then gets a secret in probation | the owner refuses each request with a re-check |
+| the eID, not the phone | only if the owner ignores the app's warning for 90 days; then gets a secret in probation, or a counted one if they reported "it wasn't me" and that person's two-year allowance is unused (§4) | the owner refuses each request, or lifts each suspension, with a re-check |
 | the paper code, not the eID | restores and uses the secret alongside the owner | no: the owner replaces at once (guardian key) |
 | the eID and the phone, or the eID and the paper code | yes | yes, until the eID is blocked at the bank. That is two of the person's factors |
 
-## 4. Limits
+## 4. "It wasn't me": theft reports, suspension and the alarm
+
+**First enrolments count at once.** A secret's γ (`certified`) is the Monday of the week it was
+issued; proofs show γ ≤ cutoff, and without an alarm the cutoff is today. There is no rollout window: a
+backdated γ would escape the alarm below.
+
+**Theft is noticed at enrolment.** Someone who enrols with a stolen eID login takes the identity's only
+place. When the real person enrols later, the issuer refuses (`AlreadyEnrolled`), and the app tells them
+what that means: either they enrolled before on another device, or their eID has been used by someone
+else. In the second case the app points to [reset-eid.md](reset-eid.md) (served by the holder app at
+`/help/reset-eid`, and linked from the extension's options when a suspension shows): close the eID
+with its provider, report the crime to the police, get new eID means, and only then come back.
+
+**The report.** `pop holder replace --not-me` is a replacement request (§3) with `report_theft: true`
+and no guardian signature (a report with one is refused: whoever holds that key enrolled the secret).
+The issuer then
+
+- **suspends** the enrolled secret at once: its handle goes on the revocation list, so it can no longer
+  renew, bind or like. The suspended secret's app shows it (`pop holder status`, `serve`, the extension).
+- **counts** the report in this week's public total (`GET /v1/reports`), at most once per person per 30
+  days.
+- lets the request wait as any other (90 days).
+
+**Lifting a suspension.** Whoever holds the suspended secret and can log in with the eID lifts it with a
+re-check (`pop holder veto`). The renewal proof inside the re-check is made against the revocation list
+as it was just before the handle was added; the issuer checks that root, gives the same secret a new
+handle (signed by the witness key; the commitment is updated without the holder's help), and cancels the
+waiting request. If it is the thief who lifts it, the real person's eID is still not safe: they secure
+it and report again.
+
+**An uncontested report counts at once.** If nobody lifts the suspension during the wait, the claim
+gives the reporter a secret that counts from its week, without probation. At most once per person in
+two years (`FRESH_REPLACEMENT_INTERVAL_DAYS` = 730): a report could be made about one's own secret, and
+each new secret can like every post again, so this bounds what a false report gains to one more like on
+a post, once in two years. A second report within the two years still suspends at once, but the new
+secret has the usual probation.
+
+**The alarm.** Reports are counted per week and published with the rule. A week is high if it has at
+least 20 reports and at least three times the median of the twelve weeks before it (configurable:
+`alarm_min_reports`, `alarm_factor`). While any of the last four weeks is high, the **alarm cutoff** is
+28 days before the Monday of the earliest high week (`ALARM_REACH_DAYS`), and proofs show γ ≤ cutoff
+instead of γ ≤ today. So secrets enrolled from about a month before a wave of reports stop counting
+until the alarm ends; older secrets are not touched. The cutoff is in `/v1/params`, the holder proves
+against it and names it in each request, and the directory refuses a proof made under another cutoff
+(409; the app fetches the parameters again). Badges bound after the cutoff stop counting while the
+alarm is on, unless proved again under it (`BindingEntry::counts`, mirrored in the extension).
+
+## 5. Limits
 
 - **Stolen phone, no backup: the thief keeps using the secret during the 90 days.** An immediate freeze
   on eID login alone would let an eID thief switch off anybody's badge at will. Revoking at once takes
@@ -143,6 +198,29 @@ Who can do what:
 - **A replaced secret can like the same posts again after its probation.** Like tags come from the
   secret, so one person can count twice on an old post, once per replacement, nine or more months
   apart.
+- **An eID thief can suspend an enrolled person's secret** by reporting "it wasn't me", again after each
+  lift. Each round costs the thief an eID login; the owner lifts it with a re-check and should secure
+  the eID. The design's in-person desk is for this case.
+- **A dormant owner can lose to an eID thief who reports.** If the owner does not open the app for the
+  90 days, the thief's uncontested report gives the thief a secret that counts at once (once in two
+  years per identity), and uses up the owner's two-year allowance. Before, such a thief got a secret in
+  probation. A real app would notify the owner (push message, e-mail from the issuer); the prototype
+  warns only when the app runs.
+- **Whoever starts a report last wins the waiting slot.** A newer request replaces an older one, so an
+  eID thief can overwrite the real person's report until the eID is secured.
+- **The issuer counts reports and computes the alarm.** The counts and the rule are public, so anyone
+  can recompute the cutoff from the counts, but not check the counts themselves: an oversight body
+  should audit them against the records.
+- **Colluding enrolled people can raise the alarm** by reporting themselves (20 in a week by default,
+  more as the median grows). It costs each of them a suspended secret, which they can lift. The effect
+  is that enrolments of the last month or so stop counting for four weeks. Real thresholds belong to the
+  operator and should be set from data.
+- **Likes reported before an alarm stay counted.** The alarm stops new likes and new bindings by recent
+  secrets; it does not remove counts already made.
+- **Each proof under an alarm shows one more bit:** that its secret is older than the cutoff.
+- **A suspended secret that expires can no longer be lifted** (a re-check needs a credential that can
+  still renew); its owner then replaces it, with probation.
+- **Sold eID logins are not caught by reports**: a person who sells their login does not report it.
 - **Whoever holds both the eID and the current secret wins every dispute.** The design sends such cases
   to a desk with an in-person check; the prototype has no desk.
 - **If the answer to a replacement is lost on the way** (network failure after the issuer acted), the

@@ -32,7 +32,8 @@ pub enum ReplaceOutcome {
     Issued { counted_from: String },
     /// the old guardian key was not available: claim between these days, unless a re-check with
     /// the old app cancels it
-    Waiting { claim_after: String, claim_before: String },
+    /// the old app cancels it. `suspended`: a theft report stopped the other secret meanwhile.
+    Waiting { claim_after: String, claim_before: String, suspended: bool },
 }
 
 // ---------------------------------------------------------------- paper code
@@ -153,7 +154,17 @@ impl Holder {
             EnrolStatus::Authenticated => {}
             other => return Err(HolderError::EnrolNotReady(other)),
         }
-        let (tree, root) = self.tree(&cx).await?;
+        let (mut tree, mut root) = self.tree(&cx).await?;
+        let suspended = self.revs.lock().await.as_ref().and_then(|c| c.revoked.iter().position(|h| *h == cred.handle()));
+        if let Some(pos) = suspended {
+            // A theft report suspended this secret. Prove against the list as it was before: the
+            // issuer checks the shown handle itself and lifts the suspension with a new handle.
+            let prefix = self.revs.lock().await.as_ref().map(|c| c.revoked[..pos].to_vec()).unwrap_or_default();
+            let scheme = cx.scheme.clone();
+            let t = tokio::task::spawn_blocking(move || scheme.revocation_tree(&prefix)).await.map_err(|e| HolderError::Internal(e.to_string()))??;
+            root = pop_crypto::root_to_hex(&t.root());
+            tree = std::sync::Arc::new(t);
+        }
         let (scheme, c2, ipk, wpk, today, session) = (cx.scheme.clone(), cred.clone(), cx.issuer_pk.clone(), cx.witness_pk.clone(), cx.today, p.session.clone());
         let (proof, rho) = tokio::task::spawn_blocking(move || scheme.prove_recheck(&mut OsRng, &c2, &tree, &ipk, &wpk, today, session.as_bytes()))
             .await
@@ -175,7 +186,12 @@ impl Holder {
             return Err(HolderError::Internal("the issuer set an unexpected re-check month".into()));
         }
         Self::check_new_expiry(cx.today, r.new_expiry)?;
-        let new = cx.scheme.finish_recheck(&cx.issuer_pk, &cred, rho, &r.signature, r.new_expiry, r.new_check)?;
+        let new_handle = match (&r.new_handle, suspended) {
+            (Some((h, hs)), Some(_)) => Some((*h, HandleSignature::from_hex(hs)?)),
+            (None, None) => None,
+            _ => return Err(HolderError::Internal("the issuer changed the handle unasked, or did not lift the suspension".into())),
+        };
+        let new = cx.scheme.finish_recheck(&cx.issuer_pk, &cx.witness_pk, &cred, rho, &r.signature, r.new_expiry, r.new_check, new_handle.as_ref().map(|(h, hs)| (*h, hs)))?;
         st.credential = Some(new.to_json());
         st.pending = None;
         if r.backup_ticket.is_some() {
@@ -318,7 +334,10 @@ impl Holder {
 
     /// Step 2. If this device still holds the guardian key of the old secret, it signs the request
     /// and the new credential comes at once. Otherwise the request waits.
-    pub async fn replace_finish(&self, confirm_code: &str) -> Result<ReplaceOutcome> {
+    /// `report_theft`: "it wasn't me". The person did not enrol the secret that blocks their
+    /// enrolment. It is suspended at once and the report counted; secure the eID first (see
+    /// [`crate::holder::RESET_EID_HELP`]), or whoever holds it can lift the suspension again.
+    pub async fn replace_finish(&self, confirm_code: &str, report_theft: bool) -> Result<ReplaceOutcome> {
         let _g = self.busy.lock().await;
         let mut st = self.wallet.load()?;
         let p = st.pending.clone().filter(|p| p.purpose == Purpose::Replace).ok_or(HolderError::NoPending)?;
@@ -332,8 +351,16 @@ impl Holder {
         let req = BlindRequest::for_secrets(&mut OsRng, &cx.scheme, &secrets, p.session.as_bytes());
         let new_guardian = Ed25519KeyPair::from_pkcs8(&hex::decode(&new_pkcs8).map_err(|e| HolderError::Internal(e.to_string()))?).map_err(|_| HolderError::Internal("guardian key".into()))?;
         let new_pub = hex::encode(new_guardian.public_key().as_ref());
-        let old_sig = guardian_of(&st).map(|g| hex::encode(g.sign(&replace_message(&p.session, &req.commitment, &new_pub)).as_ref()));
-        let mut request = ReplaceRequest { session: p.session.clone(), confirm_code: confirm_code.trim().to_string(), blind_request: req, guardian_public_key: new_pub, old_guardian_signature: old_sig };
+        // a report says this device does not hold the secret, so it signs nothing with an old key
+        let old_sig = if report_theft { None } else { guardian_of(&st).map(|g| hex::encode(g.sign(&replace_message(&p.session, &req.commitment, &new_pub)).as_ref())) };
+        let mut request = ReplaceRequest {
+            session: p.session.clone(),
+            confirm_code: confirm_code.trim().to_string(),
+            blind_request: req,
+            guardian_public_key: new_pub,
+            old_guardian_signature: old_sig,
+            report_theft,
+        };
         let resp = match self.issuer.replace(&request).await {
             // this device's guardian key is not the enrolment's current one (an old backup, say):
             // ask again without it and wait like anyone who has only the eID
@@ -349,13 +376,13 @@ impl Holder {
                 Self::install_replacement(&mut st, &cred, new_pkcs8, issuance.backup_ticket);
                 self.wallet.save(&st)?;
                 self.sync_backup(&st).await;
-                Ok(ReplaceOutcome::Issued { counted_from: dates::fmt_day(cred.attrs.certified + dates::PROBATION_DAYS) })
+                Ok(ReplaceOutcome::Issued { counted_from: dates::fmt_day(cred.attrs.certified) })
             }
-            ReplaceResponse::Pending { claim_token, claim_after, claim_before } => {
+            ReplaceResponse::Pending { claim_token, claim_after, claim_before, suspended } => {
                 st.claim = Some(PendingClaim { claim_token, rho: p.rho, s: p.s, delta: p.delta, guardian_pkcs8: new_pkcs8, claim_after, claim_before });
                 st.pending = None;
                 self.wallet.save(&st)?;
-                Ok(ReplaceOutcome::Waiting { claim_after: dates::fmt_day(claim_after), claim_before: dates::fmt_day(claim_before) })
+                Ok(ReplaceOutcome::Waiting { claim_after: dates::fmt_day(claim_after), claim_before: dates::fmt_day(claim_before), suspended })
             }
         }
     }
@@ -385,7 +412,7 @@ impl Holder {
         Self::install_replacement(&mut st, &cred, c.guardian_pkcs8, issuance.backup_ticket);
         self.wallet.save(&st)?;
         self.sync_backup(&st).await;
-        Ok(dates::fmt_day(cred.attrs.certified + dates::PROBATION_DAYS))
+        Ok(dates::fmt_day(cred.attrs.certified))
     }
 
     /// Is someone waiting to replace THIS device's secret? The app asks at every start and warns the
