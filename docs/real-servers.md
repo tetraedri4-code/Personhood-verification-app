@@ -72,15 +72,19 @@ Tables in use:
 | issuer | `enrolments` | deduplication key d | handle, guardian public key, status, day, uniqueness key version |
 | issuer | `enrol_sessions`, `enrol_states` | random ids | sessions in progress, deleted at the end or after 15 minutes |
 | issuer | `revoked` | handle | day of revocation |
+| issuer | `enrol_by_handle`, `enrol_by_claim`, `enrol_pending` | handle, claim-token hash, d | the record key d (lookup tables, rebuilt at start) |
 | directory | `bindings` | platform, account, pseudonym | the claim and its proof |
 | directory | `nyms` | platform, pseudonym | account the pseudonym is bound to |
 | directory | `likes` | platform, post, tag | day |
 | directory | `like_counts` | platform, post | count |
 | directory | `nonces` | kind, platform, nonce | day, pruned after three days |
 
-Two places scan a whole table and need an index or a query once there are many rows: the issuer's
-`revoke` (find the enrolment by handle) and the directory's `list` and `table`. With a database, add
-methods for those instead of calling `list`.
+The issuer finds enrolment records by handle and by claim token through three lookup tables it keeps
+in the same store (`enrol_by_handle`, `enrol_by_claim`, `enrol_pending`), so any store works without
+secondary indexes. They are rebuilt from `enrolments` at every start, which reads every record once
+(the start already does so to check key versions); they need no backup. With a database you can replace them
+by indexes on the record's handle and claim hash. The directory's `list` and `table` still read a whole
+table; with a database, add methods for those instead of calling `list`.
 
 The directory runs as one process: it serialises writes with an in-process lock. To run several, move
 the "one account per pseudonym" and "count once" logic into database transactions.

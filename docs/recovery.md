@@ -238,9 +238,9 @@ alarm is on, unless proved again under it (`BindingEntry::counts`, mirrored in t
   service would make the request repeatable for a day.
 - **The re-check needs a credential that can still renew.** Too late means replacement and probation.
 - **The backup host can link a backup to an enrolment record** through the ticket (§2).
-- **Unauthenticated endpoints scan the record table** (`/v1/replace/claim`, `/v1/replace/pending`, as
-  `/v1/revoke` did before). Rate-limit them at the proxy, and give a real store an index by handle and
-  by claim hash.
+- **Unauthenticated endpoints** (`/v1/replace/claim`, `/v1/replace/pending`, `/v1/revoke`) go through
+  lookup tables, not a scan of the records, but have no rate limit of their own. Rate-limit them at the
+  proxy. `/v1/replace/pending` returns every waiting request.
 - **One issuer process.** Changes to a record are serialised by a lock inside the process; several
   issuer processes over one database need compare-and-swap there.
 - **`pop holder backup` prints the code to the terminal.** A phone app would show it once on screen.

@@ -224,6 +224,7 @@ impl Issuer {
             .filter_map(|(k, v)| Some((k.parse().ok()?, v.as_u64()?)))
             .collect();
         check_key_versions(&*uniq, &store).await?;
+        crate::index::rebuild(&*store).await?;
         let rev = RevState { epoch: 0, root: root_to_hex(&tree.root()), previous_root: None, changed_at: std::time::Instant::now(), revoked, tree };
         Ok(Arc::new(Issuer { scheme, key, witness, lego, idp, uniq, store, cfg, rev: RwLock::new(rev), rng: Mutex::new(rng), records: tokio::sync::Mutex::new(()), revoking: tokio::sync::Mutex::new(()), reports: RwLock::new(reports), backups: tokio::sync::Mutex::new(()) }))
     }
@@ -373,6 +374,9 @@ impl Issuer {
             return Err(err(StatusCode::SERVICE_UNAVAILABLE, "the uniqueness service is not available; try again later"));
         }
         let current = keys[0].clone();
+        // a move must not race a replace, claim, re-check or revoke of the same record: the change would
+        // be written to the old key and then deleted with it (security.md #40)
+        let _g = self.records.lock().await;
         for (i, k) in keys.iter().enumerate() {
             let Some(v) = self.store.get(T_ENROL, &k.d).await? else { continue };
             if i > 0 {
@@ -381,7 +385,9 @@ impl Issuer {
                 // write the new record first: a crash in between leaves two records of one person,
                 // both of which still block a second enrolment
                 self.store.insert_new(T_ENROL, &current.d, serde_json::to_value(&rec)?).await?;
+                crate::index::reindex(&*self.store, &current.d, None, Some(&rec)).await?;
                 self.store.delete(T_ENROL, &k.d).await?;
+                crate::index::reindex(&*self.store, &k.d, Some(&rec), None).await?;
                 tracing::info!("migrated an enrolment record from key version {from} to {}", current.version);
             }
             return Ok(Lookup::Enrolled(current));
@@ -591,6 +597,7 @@ async fn enrol_finish(State(s): State<St>, Json(req): Json<EnrolFinishRequest>) 
     if !s.store.insert_new(T_ENROL, &d, serde_json::to_value(&rec)?).await? {
         return Err(err(StatusCode::CONFLICT, "already enrolled"));
     }
+    crate::index::reindex(&*s.store, &d, None, Some(&rec)).await?;
     let attrs = s.attrs_for(handle);
     let sig = {
         let mut rng = s.rng.lock().unwrap();
@@ -600,6 +607,7 @@ async fn enrol_finish(State(s): State<St>, Json(req): Json<EnrolFinishRequest>) 
         Ok(sig) => sig,
         Err(e) => {
             s.store.delete(T_ENROL, &d).await?;
+            crate::index::reindex(&*s.store, &d, Some(&rec), None).await?;
             return Err(e.into());
         }
     };
@@ -707,22 +715,16 @@ async fn revocations(State(s): State<St>, Query(q): Query<SinceQ>) -> Json<Revoc
 
 async fn revoke(State(s): State<St>, Json(req): Json<RevokeRequest>) -> Result<Json<serde_json::Value>, ApiErr> {
     let _g = s.records.lock().await;
-    let found = s
-        .store
-        .list(T_ENROL)
-        .await?
-        .into_iter()
-        .find(|(_, v)| v["handle"].as_u64() == Some(req.handle) && v["guardian"].as_str() == Some(&req.guardian_public_key));
-    let (d, v) = found.ok_or_else(|| err(StatusCode::NOT_FOUND, "no enrolment with this handle and guardian key"))?;
+    let found = crate::index::by_handle(&s, req.handle).await?.filter(|(_, r)| r.guardian == req.guardian_public_key);
+    let (d, mut rec) = found.ok_or_else(|| err(StatusCode::NOT_FOUND, "no enrolment with this handle and guardian key"))?;
     let pk = hex::decode(&req.guardian_public_key)?;
     let sig = hex::decode(&req.signature)?;
     ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, pk)
         .verify(&revoke_message(req.handle), &sig)
         .map_err(|_| err(StatusCode::UNAUTHORIZED, "bad guardian signature"))?;
-    let mut rec: Enrolment = serde_json::from_value(v)?;
     rec.status = "revoked".into();
     // the holder gave the secret up; a waiting replacement stays, it is how the person comes back
-    s.store.put(T_ENROL, &d, serde_json::to_value(rec)?).await?;
+    crate::index::put_record(&s, &d, &rec).await?;
     s.revoke_handle(req.handle).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(json!({"revoked": true})))
 }

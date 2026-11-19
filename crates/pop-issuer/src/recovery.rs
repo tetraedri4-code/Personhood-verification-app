@@ -79,18 +79,6 @@ async fn load_record(s: &Issuer, d: &str) -> Result<Enrolment, ApiErr> {
     Ok(serde_json::from_value(v)?)
 }
 
-/// Every record with its key. The prototype's store has no secondary index; a real one looks records
-/// up by handle and by claim hash.
-async fn records(s: &Issuer) -> Result<Vec<(String, Enrolment)>, ApiErr> {
-    let mut out = vec![];
-    for (d, v) in s.store.list(T_ENROL).await? {
-        if let Ok(rec) = serde_json::from_value::<Enrolment>(v) {
-            out.push((d, rec));
-        }
-    }
-    Ok(out)
-}
-
 fn pending_expired(s: &Issuer, p: &PendingReplace, today: Day) -> bool {
     today > p.requested_on + s.cfg.policy.replace_wait_days + s.cfg.policy.claim_window_days
 }
@@ -102,7 +90,7 @@ pub(crate) async fn recheck(State(s): State<St>, Json(req): Json<RecheckRequest>
     let today = s.today();
     if rec.contest.as_ref().is_some_and(|c| today > c.until) {
         rec.contest = None;
-        s.store.put(T_ENROL, &d, serde_json::to_value(&rec)?).await?;
+        crate::index::put_record(&s, &d, &rec).await?;
     }
     // the replaced secret of a replacement made after a theft report, within the time to block it
     let blocking = rec.contest.as_ref().is_some_and(|c| c.old_handle == req.handle);
@@ -143,7 +131,7 @@ pub(crate) async fn recheck(State(s): State<St>, Json(req): Json<RecheckRequest>
         rec.status = "active".into();
         rec.suspended_on = None;
         rec.pending = None;
-        s.store.put(T_ENROL, &d, serde_json::to_value(&rec)?).await?;
+        crate::index::put_record(&s, &d, &rec).await?;
         tracing::warn!("a replacement after a theft report was blocked by a re-check with the replaced secret");
     } else if let Some((h, _)) = &new_handle {
         // the person has both the old secret and the eID: the report was not theirs to make, or the
@@ -151,12 +139,12 @@ pub(crate) async fn recheck(State(s): State<St>, Json(req): Json<RecheckRequest>
         rec.handle = *h;
         rec.suspended_on = None;
         rec.pending = None;
-        s.store.put(T_ENROL, &d, serde_json::to_value(&rec)?).await?;
+        crate::index::put_record(&s, &d, &rec).await?;
         tracing::warn!("a suspension was lifted by a re-check with the old secret");
     }
     // the person holds both the eID and the old secret: whoever asked to replace it was someone else
     if rec.pending.take().is_some() {
-        s.store.put(T_ENROL, &d, serde_json::to_value(&rec)?).await?;
+        crate::index::put_record(&s, &d, &rec).await?;
         tracing::warn!("a waiting replacement was cancelled by a re-check with the old secret");
     }
     drop_session(&s, &req.session, &sess).await?;
@@ -203,7 +191,7 @@ async fn issue_replacement(s: &Issuer, d: &str, rec: &mut Enrolment, blind: &Bli
     if probation != Probation::Full {
         rec.fresh_replacement_on = Some(today);
     }
-    s.store.put(T_ENROL, d, serde_json::to_value(&*rec)?).await?;
+    crate::index::put_record(s, d, rec).await?;
     tracing::info!("replaced a secret (old handle revoked, identity not stored)");
     let backup_ticket = Some(crate::backup::new_ticket(s).await?);
     Ok(IssuanceResponse { signature, attrs, handle_signature: hs.to_hex(), backup_ticket })
@@ -246,7 +234,7 @@ pub(crate) async fn replace(State(s): State<St>, Json(req): Json<ReplaceRequest>
         let contest = Contest { old_handle: rec.handle, old_guardian: rec.guardian.clone(), until: today + s.cfg.policy.contest_days };
         let issuance = issue_replacement(&s, &d, &mut rec, &req.blind_request, req.session.as_bytes(), &req.guardian_public_key, today, Probation::Report).await?;
         rec.contest = Some(contest);
-        s.store.put(T_ENROL, &d, serde_json::to_value(&rec)?).await?;
+        crate::index::put_record(&s, &d, &rec).await?;
         drop_session(&s, &req.session, &sess).await?;
         tracing::warn!("a theft report replaced a secret at once; the replaced secret can block it");
         return Ok(Json(ReplaceResponse::Issued { issuance }));
@@ -276,7 +264,7 @@ pub(crate) async fn replace(State(s): State<St>, Json(req): Json<ReplaceRequest>
         guardian: req.guardian_public_key.clone(),
         report: req.report_theft,
     });
-    s.store.put(T_ENROL, &d, serde_json::to_value(&rec)?).await?;
+    crate::index::put_record(&s, &d, &rec).await?;
     drop_session(&s, &req.session, &sess).await?;
     let claim_after = today + s.cfg.policy.replace_wait_days;
     Ok(Json(ReplaceResponse::Pending { claim_token, claim_after, claim_before: claim_after + s.cfg.policy.claim_window_days, suspended }))
@@ -288,7 +276,7 @@ pub(crate) async fn claim(State(s): State<St>, Json(req): Json<ClaimRequest>) ->
     }
     let _g = s.records.lock().await;
     let hash = sha_hex(&req.claim_token);
-    let found = records(&s).await?.into_iter().find(|(_, r)| r.pending.as_ref().map(|p| p.claim_hash == hash).unwrap_or(false));
+    let found = crate::index::by_claim(&s, &hash).await?;
     let (d, mut rec) = found.ok_or_else(|| err(StatusCode::NOT_FOUND, "no waiting replacement for this token (it may have been refused with the old app, or replaced by a newer request)"))?;
     let p = rec.pending.clone().expect("found by its pending entry");
     let today = s.today();
@@ -298,7 +286,7 @@ pub(crate) async fn claim(State(s): State<St>, Json(req): Json<ClaimRequest>) ->
     }
     if pending_expired(&s, &p, today) {
         rec.pending = None;
-        s.store.put(T_ENROL, &d, serde_json::to_value(&rec)?).await?;
+        crate::index::put_record(&s, &d, &rec).await?;
         return Err(err(StatusCode::GONE, "this replacement was not claimed in time; start again"));
     }
     too_soon(&s, &rec, today)?;
@@ -312,7 +300,7 @@ pub(crate) async fn claim(State(s): State<St>, Json(req): Json<ClaimRequest>) ->
 
 pub(crate) async fn pending(State(s): State<St>) -> Result<Json<PendingReplacements>, ApiErr> {
     let today = s.today();
-    let entries = records(&s)
+    let entries = crate::index::pending(&s)
         .await?
         .into_iter()
         .filter_map(|(_, r)| {

@@ -217,6 +217,18 @@ nothing new.
 | 38 | Day settings had no upper bound once they became settings | A huge value would overflow the date sums (wrapping in a release build), so a wait or a block window could end at once, or a probation date fall outside the proofs' 16-bit range | Every day setting must be 1 to 3650 (the directory's lease 7 to 3650); rules between settings are checked too (whole-week probation, block window longer than the probation it guards, quick-replacement interval at least the block window) | `settings_that_break_a_rule_are_refused` |
 | 39 | Unknown fields in the issuer configuration were ignored | The examples still carried `rollout_certified`, removed earlier; an operator setting `replace_wait_days` at the old place would have believed it applied | The configuration, the policy and the alarm rule refuse unknown fields; the examples are checked by a test | `the_example_configurations_parse` |
 
+### Review of the issuer's lookup tables, 19 November 2026
+
+`/v1/revoke`, `/v1/replace/claim` and `/v1/replace/pending` no longer read every enrolment record. Three
+tables in the same store lead to the record: handle to record key, claim-token hash to record key, and
+the keys of records with a waiting replacement (`crates/pop-issuer/src/index.rs`). They hold nothing the
+records do not; every record write updates them; every lookup checks the record it reaches, so a stale
+entry is ignored; the issuer rebuilds them at start. Two passes; the second found nothing new.
+
+| # | Problem | Effect | Fix | Test |
+|---|---|---|---|---|
+| 40 | Moving a record to the newest uniqueness key (at login) did not hold the records lock (there before this change) | A claim timed to run during the thief's own login after a key change was written to the old key and deleted with it: the record kept the old handle and the waiting request, so the token could be claimed a second time, and the first new secret was never revoked, giving one person two working secrets | The move holds the same lock as revoke, re-check, replace and claim | none (a race); the lock is the one the other writers hold |
+
 ### Checked and found sound
 
 - **Proof verification.** Points are subgroup-checked on decoding; identity elements are rejected where
@@ -271,8 +283,8 @@ These are limits of the prototype, in rough order of weight:
 9. **A count is self-reported.** It says an enrolled person's app reported a like, not that the like
    exists on the platform.
 10. **No rate limiting in the issuer and the directory.** Put it in the reverse proxy. (The uniqueness
-    operators do limit evaluations per minute.) Some issuer endpoints that need no login scan the
-    record table (`/v1/revoke`, `/v1/replace/claim`, `/v1/replace/pending`).
+    operators do limit evaluations per minute.) The issuer reads every enrolment record twice at start
+    (key versions, lookup tables).
 11. **Recovery has edges** ([recovery.md](recovery.md) §5): during the 90-day wait a stolen phone keeps
     working; a replaced secret can like old posts again after its probation; whoever holds the eID and
     the current secret together wins every dispute; the backup host can link a backup to an enrolment
