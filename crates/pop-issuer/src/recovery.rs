@@ -29,6 +29,41 @@ pub const CLAIM_WINDOW_DAYS: u32 = 90;
 pub const FRESH_REPLACEMENT_INTERVAL_DAYS: u32 = 730;
 /// One theft report per person counts in this many days.
 pub const REPORT_COUNT_INTERVAL_DAYS: u32 = 30;
+/// A replacement after a theft report (while the two-year allowance lasts) is issued at once and
+/// counts after this short probation: if the report was a thief's, an active owner is warned by
+/// their app and blocks it within the week, before any of its likes count. The day is rounded up to
+/// a Monday, so the credential's date tells no more than the week.
+pub const REPORT_PROBATION_DAYS: u32 = 7;
+/// For this long after such a replacement, the replaced secret can block it with a re-check (the old
+/// app and the eID together): the new secret is revoked and the old one works again.
+pub const CONTEST_DAYS: u32 = 90;
+
+/// A replacement issued at once after a theft report, which the replaced secret can still block.
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct Contest {
+    /// the replaced secret's handle (revoked; a re-check with it blocks the replacement)
+    pub(crate) old_handle: u64,
+    /// the replaced secret's guardian key, restored when it blocks
+    pub(crate) old_guardian: String,
+    /// last day a block is possible
+    pub(crate) until: Day,
+}
+
+/// How long a new secret waits before it counts.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Probation {
+    /// counts at once
+    None,
+    /// [`REPORT_PROBATION_DAYS`], rounded up to a Monday
+    Report,
+    /// [`dates::PROBATION_DAYS`] (about nine months)
+    Full,
+}
+
+/// Is the person's once-in-two-years allowance for a counted replacement after a report unused?
+fn fresh_allowed(rec: &Enrolment, today: Day) -> bool {
+    rec.fresh_replacement_on.is_none_or(|f| today >= f + FRESH_REPLACEMENT_INTERVAL_DAYS)
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct PendingReplace {
@@ -82,22 +117,31 @@ pub(crate) async fn recheck(State(s): State<St>, Json(req): Json<RecheckRequest>
     let (sess, d, _) = authenticated_session(&s, &req.session, Purpose::Recheck, &req.confirm_code).await?;
     let _g = s.records.lock().await;
     let mut rec = load_record(&s, &d).await?;
-    if rec.status != "active" {
+    let today = s.today();
+    if rec.contest.as_ref().is_some_and(|c| today > c.until) {
+        rec.contest = None;
+        s.store.put(T_ENROL, &d, serde_json::to_value(&rec)?).await?;
+    }
+    // the replaced secret of a replacement made after a theft report, within the time to block it
+    let blocking = rec.contest.as_ref().is_some_and(|c| c.old_handle == req.handle);
+    // (the reported side revoking its own new secret must not end the time to block)
+    if rec.status != "active" && !blocking {
         return Err(err(StatusCode::CONFLICT, "this enrolment was revoked; replace the secret instead"));
     }
     // the login says who this is; the credential must be that person's own
-    if rec.handle != req.handle {
+    if rec.handle != req.handle && !blocking {
         return Err(err(StatusCode::FORBIDDEN, "this credential does not belong to the person who logged in"));
     }
     // A suspended secret's handle is on the revocation list, so its proof cannot be against the current
     // list. It is against the list as it was just before the handle went on it: the handle is shown and
     // checked against the record here, which is all non-revocation would have told.
-    let (root, new_handle) = if rec.suspended_on.is_some() {
+    let (root, new_handle) = if blocking {
+        (check_date_and_root_before(&s, req.today, &req.revocation_root, req.handle)?, Some(s.new_handle()))
+    } else if rec.suspended_on.is_some() {
         (check_date_and_root_before(&s, req.today, &req.revocation_root, rec.handle)?, Some(s.new_handle()))
     } else {
         (check_date_and_root(&s, req.today, &req.revocation_root)?, None)
     };
-    let today = s.today();
     let new_check = dates::month_start(today);
     let new_expiry = dates::quarter_end(dates::quarter_of(today) + 1);
     let vc = VerifyCtx { issuer: &s.key.public, witness: &s.witness.public, today: req.today, revocation_root: root };
@@ -106,7 +150,20 @@ pub(crate) async fn recheck(State(s): State<St>, Json(req): Json<RecheckRequest>
         s.scheme.reissue_recheck(&mut *rng, &s.key, &vc, req.session.as_bytes(), &req.proof, req.handle, req.last_check, new_expiry, new_check, new_handle)?
     };
     let new_handle = new_handle.map(|h| (h, s.witness.sign_handle(&mut *s.rng.lock().unwrap(), h).to_hex()));
-    if let Some((h, _)) = &new_handle {
+    if let (true, Some((h, _))) = (blocking, &new_handle) {
+        // The replaced secret and the eID together: the report was not the owner's. The secret it
+        // gave is revoked, the old one works again under a new handle. The two-year allowance stays
+        // used, so a thief who keeps the eID cannot repeat this every month.
+        let c = rec.contest.take().expect("blocking");
+        s.revoke_handle(rec.handle).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        rec.handle = *h;
+        rec.guardian = c.old_guardian;
+        rec.status = "active".into();
+        rec.suspended_on = None;
+        rec.pending = None;
+        s.store.put(T_ENROL, &d, serde_json::to_value(&rec)?).await?;
+        tracing::warn!("a replacement after a theft report was blocked by a re-check with the replaced secret");
+    } else if let Some((h, _)) = &new_handle {
         // the person has both the old secret and the eID: the report was not theirs to make, or the
         // thief has lost the eID since. Same secret, new handle; the old handle stays revoked.
         rec.handle = *h;
@@ -127,16 +184,21 @@ pub(crate) async fn recheck(State(s): State<St>, Json(req): Json<RecheckRequest>
 
 /// Certify a new secret for the person behind `rec`, revoke the old handle and update the record.
 /// `checked_on` is the day of the identity check this replacement rests on.
-/// `fresh`: counts at once (an uncontested theft report, see [`FRESH_REPLACEMENT_INTERVAL_DAYS`]).
-/// Otherwise the new secret counts 40 weeks after the Monday of this week.
+/// `probation`: when the new secret counts. Anything shorter than [`Probation::Full`] uses the
+/// person's two-year allowance ([`FRESH_REPLACEMENT_INTERVAL_DAYS`]).
 #[allow(clippy::too_many_arguments)]
-async fn issue_replacement(s: &Issuer, d: &str, rec: &mut Enrolment, blind: &BlindRequest, session: &[u8], guardian: &str, checked_on: Day, fresh: bool) -> Result<IssuanceResponse, ApiErr> {
+async fn issue_replacement(s: &Issuer, d: &str, rec: &mut Enrolment, blind: &BlindRequest, session: &[u8], guardian: &str, checked_on: Day, probation: Probation) -> Result<IssuanceResponse, ApiErr> {
     let today = s.today();
     let handle = s.new_handle();
     let mut attrs = s.attrs_for(handle);
     // A replaced secret does not count for about nine months. Each new secret
     // can like every post again, and this is what makes a stolen eID login worth little.
-    attrs.certified = if fresh { dates::week_start(today) } else { dates::week_start(today) + dates::PROBATION_DAYS };
+    attrs.certified = match probation {
+        Probation::None => dates::week_start(today),
+        // at least the full probation, up to the next Monday
+        Probation::Report => dates::week_start(today + REPORT_PROBATION_DAYS - 1) + 7,
+        Probation::Full => dates::week_start(today) + dates::PROBATION_DAYS,
+    };
     attrs.last_check = dates::month_start(checked_on);
     attrs.first_quarter = dates::quarter_of(rec.enrolled_on);
     let signature = {
@@ -154,7 +216,9 @@ async fn issue_replacement(s: &Issuer, d: &str, rec: &mut Enrolment, blind: &Bli
     rec.replaced_on = Some(today);
     rec.pending = None;
     rec.suspended_on = None;
-    if fresh {
+    // a block stays possible across later replacements: whoever holds the new secret's guardian key
+    // must not be able to end it by replacing that secret again
+    if probation != Probation::Full {
         rec.fresh_replacement_on = Some(today);
     }
     s.store.put(T_ENROL, d, serde_json::to_value(&*rec)?).await?;
@@ -185,8 +249,23 @@ pub(crate) async fn replace(State(s): State<St>, Json(req): Json<ReplaceRequest>
             return Err(err(StatusCode::BAD_REQUEST, "whoever holds the guardian key enrolled this secret: a theft report needs no key"));
         }
         verify_guardian(&rec.guardian, &replace_message(&req.session, &req.blind_request.commitment, &req.guardian_public_key), sig)?;
-        let issuance = issue_replacement(&s, &d, &mut rec, &req.blind_request, req.session.as_bytes(), &req.guardian_public_key, today, false).await?;
+        let issuance = issue_replacement(&s, &d, &mut rec, &req.blind_request, req.session.as_bytes(), &req.guardian_public_key, today, Probation::Full).await?;
         drop_session(&s, &req.session, &sess).await?;
+        return Ok(Json(ReplaceResponse::Issued { issuance }));
+    }
+    // "It wasn't me", with the two-year allowance unused: the new secret comes now, counts after a
+    // week, and the replaced one can block it for 90 days with a re-check
+    if req.report_theft && fresh_allowed(&rec, today) {
+        if rec.reported_on.is_none_or(|r| today >= r + REPORT_COUNT_INTERVAL_DAYS) {
+            s.count_report().await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            rec.reported_on = Some(today);
+        }
+        let contest = Contest { old_handle: rec.handle, old_guardian: rec.guardian.clone(), until: today + CONTEST_DAYS };
+        let issuance = issue_replacement(&s, &d, &mut rec, &req.blind_request, req.session.as_bytes(), &req.guardian_public_key, today, Probation::Report).await?;
+        rec.contest = Some(contest);
+        s.store.put(T_ENROL, &d, serde_json::to_value(&rec)?).await?;
+        drop_session(&s, &req.session, &sess).await?;
+        tracing::warn!("a theft report replaced a secret at once; the replaced secret can block it");
         return Ok(Json(ReplaceResponse::Issued { issuance }));
     }
     // No proof of the old device: the eID alone asks. Wait, publish the request so the old app can
@@ -201,7 +280,7 @@ pub(crate) async fn replace(State(s): State<St>, Json(req): Json<ReplaceRequest>
             rec.suspended_on = Some(today);
         }
         suspended = true;
-        if rec.reported_on.map_or(true, |r| today >= r + REPORT_COUNT_INTERVAL_DAYS) {
+        if rec.reported_on.is_none_or(|r| today >= r + REPORT_COUNT_INTERVAL_DAYS) {
             s.count_report().await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
             rec.reported_on = Some(today);
         }
@@ -242,8 +321,9 @@ pub(crate) async fn claim(State(s): State<St>, Json(req): Json<ClaimRequest>) ->
     too_soon(&rec, today)?;
     // Nobody lifted the suspension in all that time with the old secret and the eID: the report
     // stands, and the person should not wait again for a theft they suffered.
-    let fresh = p.report && rec.suspended_on.is_some() && rec.fresh_replacement_on.map_or(true, |f| today >= f + FRESH_REPLACEMENT_INTERVAL_DAYS);
-    let issuance = issue_replacement(&s, &d, &mut rec, &req.blind_request, &claim_session(&req.claim_token), &p.guardian, p.requested_on, fresh).await?;
+    let fresh = p.report && rec.suspended_on.is_some() && fresh_allowed(&rec, today);
+    let probation = if fresh { Probation::None } else { Probation::Full };
+    let issuance = issue_replacement(&s, &d, &mut rec, &req.blind_request, &claim_session(&req.claim_token), &p.guardian, p.requested_on, probation).await?;
     Ok(Json(issuance))
 }
 

@@ -89,8 +89,8 @@ inside a renewal proof; the issuer signs the same secret for two more years. A b
 encrypted under a paper code, stored as ciphertext. A lost secret is replaced after an eID login: at
 once with the old guardian key, otherwise after a wait in which a re-check with the old app cancels
 it; the new secret starts a fresh probation. A person whose identity someone else enrolled reports it:
-the other secret is suspended at once, and an uncontested report gives a secret that counts at once
-(once in two years). See [recovery.md](recovery.md).
+the other secret is revoked at once, and the first report in two years gives a new secret at once
+that counts after a week; for 90 days the replaced secret can block it with a re-check. See [recovery.md](recovery.md).
 
 ## What the prototype leaves out
 

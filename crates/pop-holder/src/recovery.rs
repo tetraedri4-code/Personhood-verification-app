@@ -28,10 +28,10 @@ type Result<T> = std::result::Result<T, HolderError>;
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "outcome", rename_all = "kebab-case")]
 pub enum ReplaceOutcome {
-    /// the new secret is certified; likes and badges count from `counted_from`
+    /// the new secret is certified; likes and badges count from `counted_from`. After a theft report
+    /// (the first in two years), the replaced secret can still block it for 90 days with a re-check.
     Issued { counted_from: String },
     /// the old guardian key was not available: claim between these days, unless a re-check with
-    /// the old app cancels it
     /// the old app cancels it. `suspended`: a theft report stopped the other secret meanwhile.
     Waiting { claim_after: String, claim_before: String, suspended: bool },
 }
@@ -335,8 +335,9 @@ impl Holder {
     /// Step 2. If this device still holds the guardian key of the old secret, it signs the request
     /// and the new credential comes at once. Otherwise the request waits.
     /// `report_theft`: "it wasn't me". The person did not enrol the secret that blocks their
-    /// enrolment. It is suspended at once and the report counted; secure the eID first (see
-    /// [`crate::holder::RESET_EID_HELP`]), or whoever holds it can lift the suspension again.
+    /// enrolment. That secret is revoked at once and the report counted. The first report in two
+    /// years gets the new secret at once, counting after a week; the replaced secret can block it for
+    /// 90 days with a re-check, so secure the eID first (see [`crate::holder::RESET_EID_HELP`]).
     pub async fn replace_finish(&self, confirm_code: &str, report_theft: bool) -> Result<ReplaceOutcome> {
         let _g = self.busy.lock().await;
         let mut st = self.wallet.load()?;

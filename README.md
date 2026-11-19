@@ -23,7 +23,8 @@ What it does:
 - **Stolen identities.** A first enrolment counts at once. If someone enrolled with your eID before
   you, your enrolment is refused and the app sends you to [sourced instructions for securing your
   eID](docs/reset-eid/README.md) (every EU state, in English and its official languages). Then you report "it
-  wasn't me": the other secret is suspended at once, and when many such reports come in, recent
+  wasn't me": the other secret is revoked at once and you get a new one that counts after a week
+  (the other side can block it for 90 days with its app and your eID), and when many such reports come in, recent
   enrolments stop counting for a while ([recovery.md](docs/recovery.md) §4; a proposed change to the
   design, not yet folded into it).
 

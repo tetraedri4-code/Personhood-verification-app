@@ -613,13 +613,15 @@ async fn demo(a: DevnetArgs) -> anyhow::Result<()> {
     println!("    Dave's enrolment is refused: his identity is already enrolled. The app points him to the instructions: {}", reset_eid_help());
     let url = dave.replace_start().await?;
     let code = devnet::mock_login(&url, "040490-903D").await?;
-    if let pop_holder::ReplaceOutcome::Waiting { claim_after, suspended, .. } = dave.replace_finish(&code, true).await? {
-        println!("    reported; the other secret suspended: {suspended}; Dave's new secret can be collected from {claim_after}");
+    match dave.replace_finish(&code, true).await? {
+        pop_holder::ReplaceOutcome::Issued { counted_from } => println!("    reported; Dave has a new secret at once, which counts from {counted_from} (a week's probation)"),
+        pop_holder::ReplaceOutcome::Waiting { claim_after, .. } => println!("    reported; Dave's new secret can be collected from {claim_after}"),
     }
     println!("    the thief's wallet now sees itself suspended: {}", thief.suspended().await?);
     let r = pop_protocol::api::IssuerApi::reports(&HttpClient::new(&d.issuer_url)).await?;
     println!("    public weekly count of such reports this week: {} (alarm cutoff: {:?})", r.weeks.last().map(|w| w.1).unwrap_or(0), r.alarm_cutoff.map(dates::fmt_day));
-    println!("    if nobody lifts the suspension with the thief's app AND Dave's eID, Dave's new secret counts at once (once in two years)");
+    println!("    for 90 days, the thief's app AND Dave's eID together could block Dave's new secret; Dave secured his eID, so they cannot");
+    println!("    (a quick replacement like this one is possible once in two years; later reports wait 90 days and then nine months)");
 
     let token = std::env::var("POP_PAIRING_TOKEN").ok().filter(|t| t.len() >= 16).unwrap_or_else(local_api::new_token);
     let l = tokio::net::TcpListener::bind("127.0.0.1:4010").await?;
@@ -722,6 +724,12 @@ async fn holder_cmd(a: HolderArgs) -> anyhow::Result<()> {
             }
             let code = login(&h.replace_start().await?, mock_login).await?;
             match h.replace_finish(&code, not_me).await? {
+                pop_holder::ReplaceOutcome::Issued { counted_from } if not_me => {
+                    println!("Reported. The secret enrolled with your identity is revoked from now on, and you have a new one.");
+                    println!("Bind your accounts again now; they and your likes count from {counted_from}.");
+                    println!("For 90 days, someone who has the old app AND can log in with your eID can still block this and take the");
+                    println!("identity back. If that happens, your eID is still not safe: tell the police and your eID provider. {}", reset_eid_help());
+                }
                 pop_holder::ReplaceOutcome::Issued { counted_from } => {
                     println!("Secret replaced. The old secret is revoked; its badges run out with their leases.");
                     println!("The new secret is in probation: bind your accounts again now, they and your likes count from {counted_from}.");
@@ -745,7 +753,7 @@ async fn holder_cmd(a: HolderArgs) -> anyhow::Result<()> {
             let code = login(&h.recheck_start().await?, mock_login).await?;
             h.recheck_finish(&code).await?;
             if suspended {
-                println!("Suspension lifted: same secret, same badges.");
+                println!("Suspension lifted: same secret, same badges. If someone had replaced it with a theft report, their new secret is revoked.");
             }
             if pending {
                 println!("Replacement refused.");

@@ -188,6 +188,24 @@ a known country code and language, so it cannot point elsewhere; the search inpu
 bytes before it is copied; forms may submit only to the app (`form-action 'self'`); the pages stay
 outside the token check, as before, because they hold no personal data.
 
+### Review of the quick replacement after a theft report, 19 November 2026
+
+The first report in two years now gets the new secret at once, counting after a week, and the replaced
+secret can block it for 90 days ([recovery.md](recovery.md) §4). Three passes; the third found
+nothing new.
+
+| # | Problem | Effect | Fix | Test |
+|---|---|---|---|---|
+| 36 | A re-check of a revoked enrolment was refused before the block was considered | Whoever made a false report could revoke their own new secret with its guardian key, and the owner could no longer block: the identity would stay revoked, and the owner would have to wait 90 days and nine months for a replacement | A block is checked first and works on a revoked record; it makes the record active again | `a_replacement_after_a_report_can_be_blocked_for_90_days_only` |
+| 37 | A replacement with the guardian key (or any later replacement) would have cleared the time to block | The reporter could end the owner's 90 days after 30, by replacing their own new secret | The time to block survives later replacements; a block revokes whatever secret is current | `a_theft_report_replaces_at_once_and_the_replaced_secret_can_block_it` |
+
+Checked and found sound: a block needs a login of the same person and a proof with the replaced
+secret's own handle, against the revocation list as it was before that handle went on it; the block
+ends after 90 days and is cleared then; a block does not give back the two-year allowance, so a thief
+who keeps the eID gets one quick replacement in two years, and later ones wait and have full
+probation; reports still count once per person per 30 days. Left as is: likes counted between the end
+of the week and a block stay counted, because likes cannot be linked to the secret that made them.
+
 ### Checked and found sound
 
 - **Proof verification.** Points are subgroup-checked on decoding; identity elements are rejected where

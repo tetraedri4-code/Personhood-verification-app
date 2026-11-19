@@ -390,71 +390,116 @@ fn can_like(w: &World, cred: &Credential, tree: &pop_crypto::revtree::Revocation
 }
 
 #[tokio::test]
-async fn a_theft_report_suspends_and_a_recheck_lifts_it() {
+async fn a_theft_report_replaces_at_once_and_the_replaced_secret_can_block_it() {
     let w = world(90).await;
     // a first enrolment counts at once
-    let mut thief = w.enrol("alice").await;
+    let mut first = w.enrol("alice").await;
     let (tree, _) = w.tree().await;
-    assert!(can_like(&w, &thief.cred, &tree, w.today()));
-    let old_handle = thief.cred.handle();
-    let secret = thief.cred.secret();
+    assert!(can_like(&w, &first.cred, &tree, w.today()));
+    let old_handle = first.cred.handle();
+    let secret = first.cred.secret();
 
-    // Alice finds her identity taken and reports it
+    // Someone else logs in with Alice's eID, finds the identity enrolled and reports "it wasn't me".
+    // A report never comes with the old guardian key: whoever holds it enrolled the secret.
     assert_eq!(login_status(&w, Purpose::Enrol, "alice").await, EnrolStatus::AlreadyEnrolled);
-    // a report never comes with the old guardian key: whoever holds it enrolled the secret
-    let e = w.replace_with("alice", Some(&thief.guardian), true).await.err().unwrap();
+    let e = w.replace_with("alice", Some(&first.guardian), true).await.err().unwrap();
     assert_eq!(status(&e), 400, "{e}");
-    let (secrets, _, r) = w.replace_with("alice", None, true).await.unwrap();
-    let ReplaceResponse::Pending { claim_token, suspended, .. } = r else { panic!("expected to wait") };
-    assert!(suspended);
-    // the other secret is suspended at once: it renews no more and proves nothing
-    assert!(w.api.revocations().await.unwrap().revoked.contains(&old_handle));
+    let (secrets, g2, r) = w.replace_with("alice", None, true).await.unwrap();
+    let ReplaceResponse::Issued { issuance } = r else { panic!("the first report in two years is served at once") };
+    let mut reporter = Person { cred: w.finish(&secrets, &issuance), secrets, guardian: g2, ticket: None };
+    // the new secret counts after a week, rounded up to a Monday
+    let certified = reporter.cred.attrs.certified;
+    assert!(certified >= w.today() + 7 && certified < w.today() + 14 && certified == dates::week_start(certified), "{certified}");
     let (tree, _) = w.tree().await;
-    assert!(!can_like(&w, &thief.cred, &tree, w.today()));
-    assert!(w.renew(&mut thief).await.is_err());
+    assert!(!can_like(&w, &reporter.cred, &tree, w.today()), "no likes count in the first week");
+    // the replaced secret stops at once
+    assert!(w.api.revocations().await.unwrap().revoked.contains(&old_handle));
+    assert!(!can_like(&w, &first.cred, &tree, w.today()));
+    assert!(w.renew(&mut first).await.is_err());
     // the report is counted, once per person a month
     let week = dates::week_start(w.today());
     let count = |r: &Reports| r.weeks.iter().find(|(d, _)| *d == week).map(|(_, n)| *n);
     assert_eq!(count(&w.api.reports().await.unwrap()), Some(1));
-    let _ = w.replace_with("alice", None, true).await.unwrap();
-    assert_eq!(count(&w.api.reports().await.unwrap()), Some(1), "a repeated report counts once");
     assert_eq!(w.api.reports().await.unwrap().alarm_cutoff, None, "one report is no alarm");
 
-    // Whoever holds the old secret and can log in with the eID lifts the suspension (if that was
-    // the thief, Alice's eID is not secured yet: docs/reset-eid/). The secret stays, the handle is new.
-    w.advance(10);
-    w.recheck(&mut thief, "alice").await.unwrap();
-    assert!(thief.cred.secret() == secret);
-    assert!(thief.cred.handle() != old_handle);
-    w.renew(&mut thief).await.unwrap();
+    // after the week the reporter's likes count
+    w.advance(14);
+    w.renew(&mut reporter).await.unwrap();
     let (tree, _) = w.tree().await;
-    assert!(can_like(&w, &thief.cred, &tree, w.today()));
-    // ... and the waiting replacement is gone
+    assert!(can_like(&w, &reporter.cred, &tree, w.today()));
+    // Replacing the reported secret again with its guardian key does not end the time to block.
+    w.advance(17);
+    let (s3, g3, r) = w.replace_with("alice", Some(&reporter.guardian), false).await.unwrap();
+    let ReplaceResponse::Issued { issuance } = r else { panic!() };
+    let reporter = Person { cred: w.finish(&s3, &issuance), secrets: s3, guardian: g3, ticket: None };
+
+    // Whoever holds the replaced secret and can log in with the eID blocks the replacement: the
+    // reported side's secret is revoked, the old one works again under a new handle.
+    w.recheck(&mut first, "alice").await.unwrap();
+    assert!(first.cred.secret() == secret);
+    assert!(first.cred.handle() != old_handle);
+    w.renew(&mut first).await.unwrap();
+    let (tree, _) = w.tree().await;
+    assert!(can_like(&w, &first.cred, &tree, w.today()));
+    assert!(w.api.revocations().await.unwrap().revoked.contains(&reporter.cred.handle()));
+    assert!(!can_like(&w, &reporter.cred, &tree, w.today()));
+    // ... once only
+    let mut again = Person { cred: first.cred.clone(), secrets: first.secrets.clone(), guardian: World::guardian(), ticket: None };
+    w.recheck(&mut again, "alice").await.unwrap();
+    assert_eq!(again.cred.handle(), first.cred.handle(), "a re-check of a working secret keeps its handle");
+
+    // The two-year allowance stays used: the next report suspends and waits, and the replaced
+    // secret lifts the suspension with a re-check.
+    w.advance(31);
+    w.renew(&mut first).await.unwrap();
+    let h = first.cred.handle();
+    let (secrets, _, r) = w.replace_with("alice", None, true).await.unwrap();
+    let ReplaceResponse::Pending { claim_token, suspended: true, .. } = r else { panic!("expected to wait") };
+    let _ = w.replace_with("alice", None, true).await.unwrap();
+    assert!(w.renew(&mut first).await.is_err());
+    w.advance(10);
+    w.recheck(&mut first, "alice").await.unwrap();
+    assert!(first.cred.handle() != h);
+    w.renew(&mut first).await.unwrap();
     assert!(w.api.replace_pending().await.unwrap().entries.is_empty());
     w.advance(90);
     assert_eq!(status(&w.claim(&claim_token, &secrets).await.err().unwrap()), 404);
-    // a re-check of a secret that is not suspended keeps its handle
-    let h = thief.cred.handle();
-    w.recheck(&mut thief, "alice").await.unwrap();
-    assert_eq!(thief.cred.handle(), h);
 }
 
 #[tokio::test]
-async fn an_uncontested_report_counts_at_once_but_only_once_in_two_years() {
+async fn a_replacement_after_a_report_can_be_blocked_for_90_days_only() {
     let w = world(90).await;
-    let mut thief = w.enrol("alice").await;
-    let (secrets, _, r) = w.replace_with("alice", None, true).await.unwrap();
-    let ReplaceResponse::Pending { claim_token, .. } = r else { panic!() };
-    w.advance(90);
-    let cred = w.claim(&claim_token, &secrets).await.unwrap();
-    // nobody lifted the suspension: the new secret counts from this week
-    assert_eq!(cred.attrs.certified, dates::week_start(w.today()));
-    let (tree, _) = w.tree().await;
-    assert!(can_like(&w, &cred, &tree, w.today()));
-    assert!(w.renew(&mut thief).await.is_err());
+    // the reported side revoking its own new secret does not end the time to block
+    let mut first = w.enrol("bob").await;
+    let (secrets, g, r) = w.replace_with("bob", None, true).await.unwrap();
+    let ReplaceResponse::Issued { issuance } = r else { panic!() };
+    let reporter = w.finish(&secrets, &issuance);
+    let sig = hex::encode(g.sign(&revoke_message(reporter.handle())).as_ref());
+    w.api.revoke(&RevokeRequest { handle: reporter.handle(), guardian_public_key: hex::encode(g.public_key().as_ref()), signature: sig }).await.unwrap();
+    w.recheck(&mut first, "bob").await.unwrap();
+    w.renew(&mut first).await.unwrap();
 
-    // another report within two years still suspends, but the new secret waits out probation
-    let mut alice = Person { cred, secrets, guardian: World::guardian(), ticket: None };
+    let mut first = w.enrol("alice").await;
+    let (secrets, _, r) = w.replace_with("alice", None, true).await.unwrap();
+    let ReplaceResponse::Issued { issuance } = r else { panic!() };
+    let mut reporter = Person { cred: w.finish(&secrets, &issuance), secrets, guardian: World::guardian(), ticket: None };
+    w.advance(91);
+    let e = w.recheck(&mut first, "alice").await.err().unwrap();
+    assert_eq!(status(&e), 403, "{e}");
+    w.renew(&mut reporter).await.unwrap();
+    let (tree, _) = w.tree().await;
+    assert!(can_like(&w, &reporter.cred, &tree, w.today()));
+}
+
+#[tokio::test]
+async fn a_report_counts_quickly_only_once_in_two_years() {
+    let w = world(90).await;
+    let _first = w.enrol("alice").await;
+    let (secrets, g, r) = w.replace_with("alice", None, true).await.unwrap();
+    let ReplaceResponse::Issued { issuance } = r else { panic!() };
+    let mut alice = Person { cred: w.finish(&secrets, &issuance), secrets, guardian: g, ticket: None };
+
+    // another report within two years suspends, waits, and the new secret waits out probation
     w.advance(31);
     w.renew(&mut alice).await.unwrap();
     let (s2, _, r) = w.replace_with("alice", None, true).await.unwrap();
@@ -466,7 +511,7 @@ async fn an_uncontested_report_counts_at_once_but_only_once_in_two_years() {
     assert!(!can_like(&w, &c2, &tree, w.today()));
     assert!(w.renew(&mut alice).await.is_err());
 
-    // a plain replacement (no report) never counts at once, even after an uncontested wait
+    // a plain replacement (no report) never counts quickly
     let mut p = Person { cred: c2, secrets: s2, guardian: World::guardian(), ticket: None };
     w.advance(31);
     w.renew(&mut p).await.unwrap();
@@ -475,6 +520,13 @@ async fn an_uncontested_report_counts_at_once_but_only_once_in_two_years() {
     w.advance(90);
     let c3 = w.claim(&t3, &s3).await.unwrap();
     assert_eq!(c3.attrs.certified, dates::week_start(w.today()) + dates::PROBATION_DAYS);
+
+    // two years after the first, a report is served at once again
+    w.advance(730 - 31 - 90 - 31 - 90);
+    let mut p = Person { cred: c3, secrets: s3, guardian: World::guardian(), ticket: None };
+    w.renew(&mut p).await.ok();
+    let (_, _, r) = w.replace_with("alice", None, true).await.unwrap();
+    assert!(matches!(r, ReplaceResponse::Issued { .. }));
 }
 
 #[tokio::test]
@@ -489,7 +541,7 @@ async fn many_reports_raise_the_alarm_and_fresh_enrolments_stop_counting() {
     for who in ["dave", "erin"] {
         let _thief = w.enrol(who).await;
         let (_, _, r) = w.replace_with(who, None, true).await.unwrap();
-        assert!(matches!(r, ReplaceResponse::Pending { suspended: true, .. }));
+        assert!(matches!(r, ReplaceResponse::Issued { .. }));
     }
     let cut = dates::week_start(w.today()) - dates::ALARM_REACH_DAYS;
     let rep = w.api.reports().await.unwrap();

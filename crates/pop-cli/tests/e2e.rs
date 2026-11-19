@@ -375,7 +375,7 @@ async fn replacing_the_secret() {
 }
 
 #[tokio::test]
-async fn it_wasnt_me_suspends_the_thiefs_secret_until_a_recheck() {
+async fn it_wasnt_me_replaces_at_once_and_the_old_app_can_block_it() {
     let d = net().await;
     let thief = enrolled(d, "bob", "T-THEFT-1").await;
     thief.like("mockfeed", "p2").await.unwrap();
@@ -386,18 +386,21 @@ async fn it_wasnt_me_suspends_the_thiefs_secret_until_a_recheck() {
     assert!(matches!(me.enrol_finish(&code).await, Err(HolderError::EnrolNotReady(EnrolStatus::AlreadyEnrolled))));
     let url = me.replace_start().await.unwrap();
     let code = devnet::mock_login(&url, "T-THEFT-1").await.unwrap();
-    assert!(matches!(me.replace_finish(&code, true).await.unwrap(), pop_holder::ReplaceOutcome::Waiting { suspended: true, .. }));
+    // the first report in two years is served at once, and counts after a week
+    assert!(matches!(me.replace_finish(&code, true).await.unwrap(), pop_holder::ReplaceOutcome::Issued { .. }));
+    assert!(!me.suspended().await.unwrap());
+    assert!(me.like("mockfeed", "p2").await.is_err(), "no likes in the first week");
     // the thief's app sees the suspension, and its likes and badges stop
     assert!(thief.suspended().await.unwrap());
     assert!(thief.like("mockfeed", "p3").await.is_err());
-    assert!(thief.pending_replacement().await.unwrap().is_some());
-    // whoever has the old secret and the eID lifts it (here the thief: the eID was not secured)
+    // whoever has the old secret and the eID blocks the replacement (here the thief: the eID was
+    // not secured). The reporter's secret is revoked.
     let url = thief.recheck_start().await.unwrap();
     let code = devnet::mock_login(&url, "T-THEFT-1").await.unwrap();
     thief.recheck_finish(&code).await.unwrap();
     assert!(!thief.suspended().await.unwrap());
     thief.like("mockfeed", "p3").await.unwrap();
-    assert!(me.replace_claim().await.is_err());
+    assert!(me.suspended().await.unwrap());
     // one report this week, published
     let r = HttpClient::new(&d.issuer_url).reports().await.unwrap();
     assert!(r.weeks.last().unwrap().1 >= 1);

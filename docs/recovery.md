@@ -7,7 +7,7 @@ Besides the quarterly renewal, these things can happen to a credential after enr
 | **Identity re-check** | every two years | eID login + the app | nothing: same secret, same pseudonyms, same badges |
 | **Restore a backup** (level 1) | phone lost or replaced | the paper code | nothing: the same secret on a new device |
 | **Replace the secret** (level 2) | no backup, or the secret was stolen | eID login (+ the old guardian key, to skip the wait) | new secret, new pseudonyms, forty weeks of probation; the old secret is revoked |
-| **"It wasn't me"** (theft report, §4) | someone enrolled with your identity | eID login | the other secret is suspended at once; after an uncontested wait your new secret counts at once (once in two years) |
+| **"It wasn't me"** (theft report, §4) | someone enrolled with your identity | eID login | the other secret is revoked at once and you get a new one that counts after a week; the other side can block it for 90 days with its app and the eID (quickly once in two years; otherwise it waits like a replacement) |
 
 All three are in the holder core (`crates/pop-holder/src/recovery.rs`) and the issuer
 (`crates/pop-issuer/src/recovery.rs`, `backup.rs`). The interface between them is in
@@ -29,7 +29,8 @@ to 12).
 
 **Status: proposed change to the design, not folded.** First enrolments without probation, theft
 reports with suspension, the alarm cutoff and the two-year rule for uncontested reports (§4) were agreed
-for the prototype on 19 November 2026. These rules are not in design v2 yet; folding them into the design
+for the prototype on 19 November 2026; the same day, the first report in two years was changed to give
+the new secret at once, with a week's probation and 90 days in which the replaced secret can block it. These rules are not in design v2 yet; folding them into the design
 waits for its author's word.
 
 ## 1. The two-year re-check
@@ -129,8 +130,8 @@ default 90):
 
 - Its probation runs forty weeks from the Monday of the week it is issued (`PROBATION_DAYS`), about
   nine months, before its badges are counted and before it can report likes. This is what makes a stolen
-  eID login worth little: each new secret can like every post again. The one exception is an uncontested
-  theft report (§4).
+  eID login worth little: each new secret can like every post again. The one exception is the first
+  theft report in two years (§4).
 - It has new pseudonyms. Accounts must be bound again; the old badges run out with their leases.
 - At most one replacement per 30 days per person.
 
@@ -139,7 +140,7 @@ Who can do what:
 | Attacker has | Can they take over? | Can they lock the owner out? |
 |---|---|---|
 | the phone (secret + guardian key), not the eID | uses the secret until the owner replaces it; cannot replace it | no: cannot refuse the owner's replacement (it takes the eID). The owner waits 90 days, or restores a backup and replaces at once |
-| the eID, not the phone | only if the owner ignores the app's warning for 90 days; then gets a secret in probation, or a counted one if they reported "it wasn't me" and that person's two-year allowance is unused (§4) | the owner refuses each request, or lifts each suspension, with a re-check |
+| the eID, not the phone | with a plain request, only if the owner ignores the app's warning for 90 days, and then in probation. With "it wasn't me" while the two-year allowance is unused, at once, counting after a week, until the owner blocks it (§4) | the owner refuses each request, lifts each suspension, or blocks the reported replacement, with a re-check |
 | the paper code, not the eID | restores and uses the secret alongside the owner | no: the owner replaces at once (guardian key) |
 | the eID and the phone, or the eID and the paper code | yes | yes, until the eID is blocked at the bank. That is two of the person's factors |
 
@@ -164,21 +165,30 @@ The issuer then
   renew, bind or like. The suspended secret's app shows it (`pop holder status`, `serve`, the extension).
 - **counts** the report in this week's public total (`GET /v1/reports`), at most once per person per 30
   days.
-- lets the request wait as any other (90 days).
+- **the first report in two years** (`FRESH_REPLACEMENT_INTERVAL_DAYS` = 730) gets the new secret at
+  once. It counts after a week (`REPORT_PROBATION_DAYS`, rounded up to a Monday so the date tells only
+  the week), and the enrolled secret is revoked. For 90 days (`CONTEST_DAYS`) the replaced secret can
+  **block** it (below).
+- a later report within the two years suspends the enrolled secret and waits like any other request
+  (90 days), and the new secret then has the usual forty weeks of probation.
 
-**Lifting a suspension.** Whoever holds the suspended secret and can log in with the eID lifts it with a
-re-check (`pop holder veto`). The renewal proof inside the re-check is made against the revocation list
-as it was just before the handle was added; the issuer checks that root, gives the same secret a new
-handle (signed by the witness key; the commitment is updated without the holder's help), and cancels the
-waiting request. If it is the thief who lifts it, the real person's eID is still not safe: they secure
-it and report again.
+**Blocking a reported replacement, or lifting a suspension.** Whoever holds the replaced or suspended
+secret and can log in with the eID does it with a re-check (`pop holder veto`). The renewal proof
+inside the re-check is made against the revocation list as it was just before the handle was added; the
+issuer checks that root, gives the same secret a new handle (signed by the witness key; the commitment
+is updated without the holder's help), and cancels any waiting request. A block also revokes the secret
+the report gave, whatever has happened to it since: replacing it again with its guardian key, or
+revoking it, does not end the 90 days. If it is the thief who blocks or lifts, the real person's eID is
+still not safe: they secure it and report again.
 
-**An uncontested report counts at once.** If nobody lifts the suspension during the wait, the claim
-gives the reporter a secret that counts from its week, without probation. At most once per person in
-two years (`FRESH_REPLACEMENT_INTERVAL_DAYS` = 730): a report could be made about one's own secret, and
-each new secret can like every post again, so this bounds what a false report gains to one more like on
-a post, once in two years. A second report within the two years still suspends at once, but the new
-secret has the usual probation.
+**Why a week, and why the allowance stays used.** If a thief made the report, the owner is most likely
+active, sees the warning in their app and blocks within the week, before any of the thief's likes
+count. Likes cannot be linked to the secret that made them, so likes counted before a block stay
+counted: what a false report gains is at most the likes between the end of the week and the block.
+A block does not give the two-year allowance back, so a thief who keeps access to the eID cannot repeat
+this every month; their next reports wait 90 days and then nine months, and the owner blocks them.
+Each new secret can like every post again, so the allowance also bounds what a report about one's own
+secret gains: one more like on a post, once in two years.
 
 **The alarm.** Reports are counted per week and published with the rule. A week is high if it has at
 least 20 reports and at least three times the median of the twelve weeks before it (configurable:
@@ -201,11 +211,11 @@ alarm is on, unless proved again under it (`BindingEntry::counts`, mirrored in t
 - **An eID thief can suspend an enrolled person's secret** by reporting "it wasn't me", again after each
   lift. Each round costs the thief an eID login; the owner lifts it with a re-check and should secure
   the eID. The design's in-person desk is for this case.
-- **A dormant owner can lose to an eID thief who reports.** If the owner does not open the app for the
-  90 days, the thief's uncontested report gives the thief a secret that counts at once (once in two
-  years per identity), and uses up the owner's two-year allowance. Before, such a thief got a secret in
-  probation. A real app would notify the owner (push message, e-mail from the issuer); the prototype
-  warns only when the app runs.
+- **An eID thief's first report works at once.** Its secret counts after a week, until the owner
+  blocks it; likes counted before the block stay (they cannot be linked to the secret). If the owner does
+  not open the app for 90 days, the thief keeps the identity, and the owner's two-year allowance is used
+  up. A real app would notify the owner (push message, e-mail from the issuer); the prototype warns only
+  when the app runs.
 - **Whoever starts a report last wins the waiting slot.** A newer request replaces an older one, so an
   eID thief can overwrite the real person's report until the eID is secured.
 - **The issuer counts reports and computes the alarm.** The counts and the rule are public, so anyone

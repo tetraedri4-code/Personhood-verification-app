@@ -151,6 +151,10 @@ pub(crate) struct Enrolment {
     /// day of the last replacement that counted at once after an uncontested theft report
     #[serde(default)]
     pub(crate) fresh_replacement_on: Option<Day>,
+    /// a replacement after a theft report that was issued at once; the replaced secret can still
+    /// block it, with a re-check, until the day given
+    #[serde(default)]
+    pub(crate) contest: Option<crate::recovery::Contest>,
 
     /// Version of the uniqueness key the record's key d was computed under. d is only comparable with
     /// values made under the same key, so a record without its key is a record nobody can match.
@@ -585,7 +589,7 @@ async fn enrol_finish(State(s): State<St>, Json(req): Json<EnrolFinishRequest>) 
     let (sess, d, key_version) = authenticated_session(&s, &req.session, Purpose::Enrol, &req.confirm_code).await?;
     check_guardian_key(&req.guardian_public_key)?;
     let handle = s.new_handle();
-    let rec = Enrolment { handle, guardian: req.guardian_public_key.clone(), status: "active".into(), enrolled_on: s.today(), replaced_on: None, pending: None, suspended_on: None, reported_on: None, fresh_replacement_on: None, key_version };
+    let rec = Enrolment { handle, guardian: req.guardian_public_key.clone(), status: "active".into(), enrolled_on: s.today(), replaced_on: None, pending: None, suspended_on: None, reported_on: None, fresh_replacement_on: None, contest: None, key_version };
     // atomic: two sessions of one person cannot both get through
     if !s.store.insert_new(T_ENROL, &d, serde_json::to_value(&rec)?).await? {
         return Err(err(StatusCode::CONFLICT, "already enrolled"));
