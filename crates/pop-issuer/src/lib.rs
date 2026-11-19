@@ -21,10 +21,12 @@
 //! issuer refuses to start if it holds records under a key the uniqueness service no longer has, and
 //! moves a record to the newest key when its owner logs in (docs/uniqueness.md).
 pub mod backup;
+pub mod policy;
 pub mod recovery;
 pub mod reports;
 pub mod service;
 pub mod uniqueness;
 
+pub use policy::Policy;
 pub use service::{router, Issuer, IssuerConfig};
 pub use uniqueness::{hmac_key_version, DedupKey, HmacUniqueness, UniquenessService};

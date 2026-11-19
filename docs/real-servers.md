@@ -113,20 +113,48 @@ For anything beyond a demo:
 - Back up `enrolments` and the uniqueness keys together. Without the key of its records nobody can be
   recognised as already enrolled, so the issuer refuses to start ([uniqueness.md](uniqueness.md) §1).
 
-### Recovery settings
+### Policy settings
 
-`replace_wait_days` in the issuer configuration (default 90) is how long a replacement of a lost secret
-waits when the old guardian key did not sign it ([recovery.md](recovery.md) §3). The two backup routes
-can be served from another host than the issuer; they share only the `backup_tickets` table with it
-([recovery.md](recovery.md) §2). Changes to an enrolment record (revoke, re-check, replace, claim) are
-serialised by a lock inside the issuer process: run one issuer process, or move that into your
-database as a compare-and-swap on the record.
+Every number the rules chose is a setting in the `policy` section of the issuer configuration. Leave
+out any you do not change; a misspelt name is an error, and settings that would break a rule (a
+probation that is not whole weeks, a block window shorter than the probation it guards) stop the issuer
+at start. The settings in force are public at `GET /v1/policy`.
 
-`alarm_min_reports` (default 20) and `alarm_factor` (default 3) set when a week of "it wasn't me"
-reports raises the alarm ([recovery.md](recovery.md) §4). Set them from the counts of real weeks; the
-rule and the counts are public at `GET /v1/reports`. The issuer's configuration no longer takes
-`rollout_certified`: first enrolments count from their own week, and a backdated one would escape the
-alarm. The theft-report counts are in the `theft_reports` table; back it up with `enrolments`.
+```json
+"policy": {
+  "replace_wait_days": 90,                 // replacement without the old guardian key waits this long
+  "claim_window_days": 90,                 // ... and must then be collected within this many days
+  "replace_min_interval_days": 30,         // at most one replacement per person in this many days
+  "probation_days": 280,                   // probation of a replaced secret (whole weeks)
+  "report_probation_days": 7,              // probation after the first theft report in the period below
+  "contest_days": 90,                      // the replaced secret can block that replacement this long
+  "fresh_replacement_interval_days": 730,  // one quick replacement after a report per person in this time
+  "report_count_interval_days": 30,        // one report per person counts in the public totals
+  "alarm": {
+    "min_reports": 20, "factor": 3,        // a week is high with this many reports and this many times
+    "baseline_weeks": 12,                  //   the median of the weeks before
+    "alarm_weeks": 4,                      // the alarm stays on while one of the latest weeks is high
+    "reach_days": 28                       // enrolments from this long before stop counting
+  },
+  "previous_root_grace_secs": 120,         // proofs against the previous revocation root are taken this long
+  "max_backup_chars": 44000                // largest encrypted backup
+}
+```
+
+(JSON has no comments: they only explain the fields here.) See [recovery.md](recovery.md) for what each
+rule does. Set the alarm from the counts of real weeks; the counts are public at `GET /v1/reports`. The
+badge lease is a setting of the directory (`pop directory --lease-days`, default 274). The two-year
+re-check and the twelve months an expired credential can still renew are part of the proof statement
+and not settings: changing them means new proving keys for every holder and verifier.
+
+The two backup routes can be served from another host than the issuer; they share only the
+`backup_tickets` table with it ([recovery.md](recovery.md) §2). Changes to an enrolment record (revoke,
+re-check, replace, claim) are serialised by a lock inside the issuer process: run one issuer process, or
+move that into your database as a compare-and-swap on the record. The theft-report counts are in the
+`theft_reports` table; back it up with `enrolments`.
+
+The issuer configuration no longer takes `replace_wait_days`, `alarm_min_reports` and `alarm_factor` at
+the top level (they are in `policy`), nor `rollout_certified`.
 
 The proving-key files are named `lego2-*.bin` since the like statement changed; older `lego-*.bin`
 files are unused and can be deleted.

@@ -18,25 +18,7 @@ use pop_protocol::api::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// A person can replace the secret at most this often. Each replacement puts one more handle on the
-/// revocation list for good, so this bounds how fast one person can grow it.
-pub const REPLACE_MIN_INTERVAL_DAYS: u32 = 30;
-/// A replacement that has waited out its veto period must be claimed within this many days.
-pub const CLAIM_WINDOW_DAYS: u32 = 90;
-/// A replacement after an uncontested theft report counts at once, at most this often per person.
-/// A report could be made about one's own eID, and each new secret can like every post again, so this
-/// bounds what a false report gains: a second like on a post, once in two years.
-pub const FRESH_REPLACEMENT_INTERVAL_DAYS: u32 = 730;
-/// One theft report per person counts in this many days.
-pub const REPORT_COUNT_INTERVAL_DAYS: u32 = 30;
-/// A replacement after a theft report (while the two-year allowance lasts) is issued at once and
-/// counts after this short probation: if the report was a thief's, an active owner is warned by
-/// their app and blocks it within the week, before any of its likes count. The day is rounded up to
-/// a Monday, so the credential's date tells no more than the week.
-pub const REPORT_PROBATION_DAYS: u32 = 7;
-/// For this long after such a replacement, the replaced secret can block it with a re-check (the old
-/// app and the eID together): the new secret is revoked and the old one works again.
-pub const CONTEST_DAYS: u32 = 90;
+// The numbers below (waits, probations, intervals) are settings: `s.cfg.policy`, see crate::policy.
 
 /// A replacement issued at once after a theft report, which the replaced secret can still block.
 #[derive(Serialize, Deserialize, Clone)]
@@ -54,15 +36,15 @@ pub(crate) struct Contest {
 enum Probation {
     /// counts at once
     None,
-    /// [`REPORT_PROBATION_DAYS`], rounded up to a Monday
+    /// `policy.report_probation_days`, rounded up to a Monday
     Report,
-    /// [`dates::PROBATION_DAYS`] (about nine months)
+    /// `policy.probation_days` (about nine months)
     Full,
 }
 
 /// Is the person's once-in-two-years allowance for a counted replacement after a report unused?
-fn fresh_allowed(rec: &Enrolment, today: Day) -> bool {
-    rec.fresh_replacement_on.is_none_or(|f| today >= f + FRESH_REPLACEMENT_INTERVAL_DAYS)
+fn fresh_allowed(s: &Issuer, rec: &Enrolment, today: Day) -> bool {
+    rec.fresh_replacement_on.is_none_or(|f| today >= f + s.cfg.policy.fresh_replacement_interval_days)
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -110,7 +92,7 @@ async fn records(s: &Issuer) -> Result<Vec<(String, Enrolment)>, ApiErr> {
 }
 
 fn pending_expired(s: &Issuer, p: &PendingReplace, today: Day) -> bool {
-    today > p.requested_on + s.cfg.replace_wait_days + CLAIM_WINDOW_DAYS
+    today > p.requested_on + s.cfg.policy.replace_wait_days + s.cfg.policy.claim_window_days
 }
 
 pub(crate) async fn recheck(State(s): State<St>, Json(req): Json<RecheckRequest>) -> Result<Json<RecheckResponse>, ApiErr> {
@@ -185,7 +167,7 @@ pub(crate) async fn recheck(State(s): State<St>, Json(req): Json<RecheckRequest>
 /// Certify a new secret for the person behind `rec`, revoke the old handle and update the record.
 /// `checked_on` is the day of the identity check this replacement rests on.
 /// `probation`: when the new secret counts. Anything shorter than [`Probation::Full`] uses the
-/// person's two-year allowance ([`FRESH_REPLACEMENT_INTERVAL_DAYS`]).
+/// person's two-year allowance (`policy.fresh_replacement_interval_days`).
 #[allow(clippy::too_many_arguments)]
 async fn issue_replacement(s: &Issuer, d: &str, rec: &mut Enrolment, blind: &BlindRequest, session: &[u8], guardian: &str, checked_on: Day, probation: Probation) -> Result<IssuanceResponse, ApiErr> {
     let today = s.today();
@@ -196,8 +178,8 @@ async fn issue_replacement(s: &Issuer, d: &str, rec: &mut Enrolment, blind: &Bli
     attrs.certified = match probation {
         Probation::None => dates::week_start(today),
         // at least the full probation, up to the next Monday
-        Probation::Report => dates::week_start(today + REPORT_PROBATION_DAYS - 1) + 7,
-        Probation::Full => dates::week_start(today) + dates::PROBATION_DAYS,
+        Probation::Report => dates::week_start(today + s.cfg.policy.report_probation_days - 1) + 7,
+        Probation::Full => dates::week_start(today) + s.cfg.policy.probation_days,
     };
     attrs.last_check = dates::month_start(checked_on);
     attrs.first_quarter = dates::quarter_of(rec.enrolled_on);
@@ -227,11 +209,12 @@ async fn issue_replacement(s: &Issuer, d: &str, rec: &mut Enrolment, blind: &Bli
     Ok(IssuanceResponse { signature, attrs, handle_signature: hs.to_hex(), backup_ticket })
 }
 
-fn too_soon(rec: &Enrolment, today: Day) -> Result<(), ApiErr> {
+fn too_soon(s: &Issuer, rec: &Enrolment, today: Day) -> Result<(), ApiErr> {
+    let min = s.cfg.policy.replace_min_interval_days;
     match rec.replaced_on {
-        Some(last) if today < last + REPLACE_MIN_INTERVAL_DAYS => Err(err(
+        Some(last) if today < last + min => Err(err(
             StatusCode::TOO_MANY_REQUESTS,
-            format!("the secret was replaced on {}; the next replacement is possible from {}", dates::fmt_day(last), dates::fmt_day(last + REPLACE_MIN_INTERVAL_DAYS)),
+            format!("the secret was replaced on {}; the next replacement is possible from {}", dates::fmt_day(last), dates::fmt_day(last + min)),
         )),
         _ => Ok(()),
     }
@@ -243,7 +226,7 @@ pub(crate) async fn replace(State(s): State<St>, Json(req): Json<ReplaceRequest>
     let _g = s.records.lock().await;
     let mut rec = load_record(&s, &d).await?;
     let today = s.today();
-    too_soon(&rec, today)?;
+    too_soon(&s, &rec, today)?;
     if let Some(sig) = &req.old_guardian_signature {
         if req.report_theft {
             return Err(err(StatusCode::BAD_REQUEST, "whoever holds the guardian key enrolled this secret: a theft report needs no key"));
@@ -255,12 +238,12 @@ pub(crate) async fn replace(State(s): State<St>, Json(req): Json<ReplaceRequest>
     }
     // "It wasn't me", with the two-year allowance unused: the new secret comes now, counts after a
     // week, and the replaced one can block it for 90 days with a re-check
-    if req.report_theft && fresh_allowed(&rec, today) {
-        if rec.reported_on.is_none_or(|r| today >= r + REPORT_COUNT_INTERVAL_DAYS) {
+    if req.report_theft && fresh_allowed(&s, &rec, today) {
+        if rec.reported_on.is_none_or(|r| today >= r + s.cfg.policy.report_count_interval_days) {
             s.count_report().await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
             rec.reported_on = Some(today);
         }
-        let contest = Contest { old_handle: rec.handle, old_guardian: rec.guardian.clone(), until: today + CONTEST_DAYS };
+        let contest = Contest { old_handle: rec.handle, old_guardian: rec.guardian.clone(), until: today + s.cfg.policy.contest_days };
         let issuance = issue_replacement(&s, &d, &mut rec, &req.blind_request, req.session.as_bytes(), &req.guardian_public_key, today, Probation::Report).await?;
         rec.contest = Some(contest);
         s.store.put(T_ENROL, &d, serde_json::to_value(&rec)?).await?;
@@ -280,7 +263,7 @@ pub(crate) async fn replace(State(s): State<St>, Json(req): Json<ReplaceRequest>
             rec.suspended_on = Some(today);
         }
         suspended = true;
-        if rec.reported_on.is_none_or(|r| today >= r + REPORT_COUNT_INTERVAL_DAYS) {
+        if rec.reported_on.is_none_or(|r| today >= r + s.cfg.policy.report_count_interval_days) {
             s.count_report().await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
             rec.reported_on = Some(today);
         }
@@ -295,8 +278,8 @@ pub(crate) async fn replace(State(s): State<St>, Json(req): Json<ReplaceRequest>
     });
     s.store.put(T_ENROL, &d, serde_json::to_value(&rec)?).await?;
     drop_session(&s, &req.session, &sess).await?;
-    let claim_after = today + s.cfg.replace_wait_days;
-    Ok(Json(ReplaceResponse::Pending { claim_token, claim_after, claim_before: claim_after + CLAIM_WINDOW_DAYS, suspended }))
+    let claim_after = today + s.cfg.policy.replace_wait_days;
+    Ok(Json(ReplaceResponse::Pending { claim_token, claim_after, claim_before: claim_after + s.cfg.policy.claim_window_days, suspended }))
 }
 
 pub(crate) async fn claim(State(s): State<St>, Json(req): Json<ClaimRequest>) -> Result<Json<IssuanceResponse>, ApiErr> {
@@ -309,7 +292,7 @@ pub(crate) async fn claim(State(s): State<St>, Json(req): Json<ClaimRequest>) ->
     let (d, mut rec) = found.ok_or_else(|| err(StatusCode::NOT_FOUND, "no waiting replacement for this token (it may have been refused with the old app, or replaced by a newer request)"))?;
     let p = rec.pending.clone().expect("found by its pending entry");
     let today = s.today();
-    let claim_after = p.requested_on + s.cfg.replace_wait_days;
+    let claim_after = p.requested_on + s.cfg.policy.replace_wait_days;
     if today < claim_after {
         return Err(err(StatusCode::CONFLICT, format!("this replacement waits until {}", dates::fmt_day(claim_after))));
     }
@@ -318,10 +301,10 @@ pub(crate) async fn claim(State(s): State<St>, Json(req): Json<ClaimRequest>) ->
         s.store.put(T_ENROL, &d, serde_json::to_value(&rec)?).await?;
         return Err(err(StatusCode::GONE, "this replacement was not claimed in time; start again"));
     }
-    too_soon(&rec, today)?;
+    too_soon(&s, &rec, today)?;
     // Nobody lifted the suspension in all that time with the old secret and the eID: the report
     // stands, and the person should not wait again for a theft they suffered.
-    let fresh = p.report && rec.suspended_on.is_some() && fresh_allowed(&rec, today);
+    let fresh = p.report && rec.suspended_on.is_some() && fresh_allowed(&s, &rec, today);
     let probation = if fresh { Probation::None } else { Probation::Full };
     let issuance = issue_replacement(&s, &d, &mut rec, &req.blind_request, &claim_session(&req.claim_token), &p.guardian, p.requested_on, probation).await?;
     Ok(Json(issuance))
@@ -338,7 +321,7 @@ pub(crate) async fn pending(State(s): State<St>) -> Result<Json<PendingReplaceme
                 id: pending_id(r.handle, &p.nonce),
                 nonce: p.nonce.clone(),
                 requested_on: p.requested_on,
-                claim_after: p.requested_on + s.cfg.replace_wait_days,
+                claim_after: p.requested_on + s.cfg.policy.replace_wait_days,
             })
         })
         .collect();

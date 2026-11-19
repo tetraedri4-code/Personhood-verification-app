@@ -113,7 +113,7 @@ request carries a signature of the old guardian key, and the issuer acts at once
 secret blindly, revokes the old handle and stores the new guardian key.
 
 **Without it** (new phone, no backup): the eID alone asks, and the eID alone is what a thief of bank
-credentials would have too. So the request **waits** (`replace_wait_days` in the issuer configuration,
+credentials would have too. So the request **waits** (`policy.replace_wait_days` in the issuer configuration,
 default 90):
 
 - The issuer publishes the request in `GET /v1/replace/pending` under an id that only the holder of
@@ -128,7 +128,7 @@ default 90):
 
 **In both cases the new secret starts over:**
 
-- Its probation runs forty weeks from the Monday of the week it is issued (`PROBATION_DAYS`), about
+- Its probation runs forty weeks from the Monday of the week it is issued (`policy.probation_days`), about
   nine months, before its badges are counted and before it can report likes. This is what makes a stolen
   eID login worth little: each new secret can like every post again. The one exception is the first
   theft report in two years (§4).
@@ -165,9 +165,9 @@ The issuer then
   renew, bind or like. The suspended secret's app shows it (`pop holder status`, `serve`, the extension).
 - **counts** the report in this week's public total (`GET /v1/reports`), at most once per person per 30
   days.
-- **the first report in two years** (`FRESH_REPLACEMENT_INTERVAL_DAYS` = 730) gets the new secret at
-  once. It counts after a week (`REPORT_PROBATION_DAYS`, rounded up to a Monday so the date tells only
-  the week), and the enrolled secret is revoked. For 90 days (`CONTEST_DAYS`) the replaced secret can
+- **the first report in two years** (`policy.fresh_replacement_interval_days`, 730) gets the new secret at
+  once. It counts after a week (`policy.report_probation_days`, rounded up to a Monday so the date tells only
+  the week), and the enrolled secret is revoked. For 90 days (`policy.contest_days`) the replaced secret can
   **block** it (below).
 - a later report within the two years suspends the enrolled secret and waits like any other request
   (90 days), and the new secret then has the usual forty weeks of probation.
@@ -192,8 +192,8 @@ secret gains: one more like on a post, once in two years.
 
 **The alarm.** Reports are counted per week and published with the rule. A week is high if it has at
 least 20 reports and at least three times the median of the twelve weeks before it (configurable:
-`alarm_min_reports`, `alarm_factor`). While any of the last four weeks is high, the **alarm cutoff** is
-28 days before the Monday of the earliest high week (`ALARM_REACH_DAYS`), and proofs show γ ≤ cutoff
+`policy.alarm`). While any of the last four weeks is high, the **alarm cutoff** is
+28 days before the Monday of the earliest high week (`policy.alarm.reach_days`), and proofs show γ ≤ cutoff
 instead of γ ≤ today. So secrets enrolled from about a month before a wave of reports stop counting
 until the alarm ends; older secrets are not touched. The cutoff is in `/v1/params`, the holder proves
 against it and names it in each request, and the directory refuses a proof made under another cutoff

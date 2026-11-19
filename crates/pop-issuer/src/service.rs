@@ -29,16 +29,13 @@ pub struct IssuerConfig {
     pub min_loa: Loa,
     /// override "today" (tests)
     pub clock: Option<Clock>,
-    /// Recovery level 2 without the guardian key: days a replacement waits, during which a re-check
-    /// with the old app cancels it (docs/recovery.md).
-    pub replace_wait_days: u32,
-    /// when "it wasn't me" reports raise the alarm (`GET /v1/reports`)
-    pub alarm: crate::reports::AlarmRule,
+    /// every number the rules chose: waits, probations, the alarm (published at `GET /v1/policy`)
+    pub policy: crate::policy::Policy,
 }
 
 impl Default for IssuerConfig {
     fn default() -> Self {
-        IssuerConfig { keys_dir: None, provider_code: 1, min_loa: Loa::Substantial, clock: None, replace_wait_days: 90, alarm: Default::default() }
+        IssuerConfig { keys_dir: None, provider_code: 1, min_loa: Loa::Substantial, clock: None, policy: Default::default() }
     }
 }
 
@@ -56,11 +53,10 @@ pub(crate) struct RevState {
 /// being made when it changed. Kept short: a secret revoked or suspended a moment ago can prove against
 /// that root, so it must stop working within minutes, not at the next revocation (which in a quiet
 /// period could be days away).
-pub const PREVIOUS_ROOT_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
-
+/// (`policy.previous_root_grace_secs`, two minutes by default)
 impl RevState {
-    pub(crate) fn previous_root(&self) -> Option<&str> {
-        self.previous_root.as_deref().filter(|_| self.changed_at.elapsed() < PREVIOUS_ROOT_GRACE)
+    pub(crate) fn previous_root(&self, grace_secs: u64) -> Option<&str> {
+        self.previous_root.as_deref().filter(|_| self.changed_at.elapsed() < std::time::Duration::from_secs(grace_secs))
     }
 }
 
@@ -187,7 +183,7 @@ impl Issuer {
         store: SharedStore,
         cfg: IssuerConfig,
     ) -> anyhow::Result<Arc<Self>> {
-        anyhow::ensure!(cfg.replace_wait_days <= 3650, "replace_wait_days must be at most 3650");
+        cfg.policy.validate().map_err(anyhow::Error::msg)?;
         let mut rng = ChaCha20Rng::from_entropy();
         let key = load_or(&cfg.keys_dir, "issuer.key", || { let k = IssuerKey::generate(&mut rng); let b = k.to_bytes(); (k, b) }, |b| IssuerKey::from_bytes(b).ok());
         let witness = load_or(&cfg.keys_dir, "witness.key", || { let k = WitnessKey::generate(&mut rng); let b = k.to_bytes(); (k, b) }, |b| WitnessKey::from_bytes(b).ok());
@@ -321,7 +317,7 @@ impl Issuer {
         let rv = self.rev.read().unwrap();
         let total = rv.revoked.len() as u64;
         let from = since.min(total);
-        Revocations { epoch: rv.epoch, from, total, revoked: rv.revoked[from as usize..].to_vec(), root: rv.root.clone(), previous_root: rv.previous_root().map(String::from) }
+        Revocations { epoch: rv.epoch, from, total, revoked: rv.revoked[from as usize..].to_vec(), root: rv.root.clone(), previous_root: rv.previous_root(self.cfg.policy.previous_root_grace_secs).map(String::from) }
     }
 }
 
@@ -442,6 +438,7 @@ pub fn router(issuer: Arc<Issuer>) -> Router {
         .route("/v1/revocations", get(revocations).layer(tower_http::compression::CompressionLayer::new()))
         .route("/v1/revoke", post(revoke))
         .route("/v1/reports", get(crate::reports::reports))
+        .route("/v1/policy", get(policy))
         .route("/v1/recheck", post(crate::recovery::recheck))
         .route("/v1/replace", post(crate::recovery::replace))
         .route("/v1/replace/claim", post(crate::recovery::claim))
@@ -656,13 +653,13 @@ pub(crate) async fn authenticated_session(s: &Issuer, id: &str, purpose: Purpose
 }
 
 /// A proof's date must be within a day of the issuer's, and its revocation root the current one, or the
-/// previous one for [`PREVIOUS_ROOT_GRACE`] after a change.
+/// previous one for `policy.previous_root_grace_secs` after a change.
 pub(crate) fn check_date_and_root(s: &Issuer, proof_today: Day, proof_root: &str) -> Result<pop_crypto::params::Fr, ApiErr> {
     if proof_today.abs_diff(s.today()) > 1 {
         return Err(err(StatusCode::BAD_REQUEST, "date out of window"));
     }
     let rv = s.rev.read().unwrap();
-    if proof_root != rv.root && Some(proof_root) != rv.previous_root() {
+    if proof_root != rv.root && Some(proof_root) != rv.previous_root(s.cfg.policy.previous_root_grace_secs) {
         return Err(err(StatusCode::CONFLICT, "stale revocation root; fetch /v1/revocations"));
     }
     Ok(pop_crypto::root_from_hex(proof_root)?)
@@ -728,4 +725,9 @@ async fn revoke(State(s): State<St>, Json(req): Json<RevokeRequest>) -> Result<J
     s.store.put(T_ENROL, &d, serde_json::to_value(rec)?).await?;
     s.revoke_handle(req.handle).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(json!({"revoked": true})))
+}
+
+/// `GET /v1/policy`: the rules' numbers in force, so that anyone can check what a deployment applies.
+async fn policy(State(s): State<St>) -> Json<crate::policy::Policy> {
+    Json(s.cfg.policy.clone())
 }

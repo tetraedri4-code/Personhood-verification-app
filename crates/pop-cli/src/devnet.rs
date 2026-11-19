@@ -192,9 +192,7 @@ pub async fn start(o: DevnetOpts) -> anyhow::Result<Devnet> {
         provider_code: 1,
         uniqueness: uniq_file,
         uniqueness_key: None,
-        replace_wait_days: o.replace_wait_days,
-        alarm_min_reports: None,
-        alarm_factor: None,
+        policy: pop_issuer::Policy { replace_wait_days: o.replace_wait_days.unwrap_or(pop_issuer::Policy::default().replace_wait_days), ..Default::default() },
     })
     .await?;
     serve(l_iss, pop_issuer::router(issuer));

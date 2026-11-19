@@ -154,7 +154,7 @@ nothing new.
 
 | # | Problem | Effect | Fix | Test |
 |---|---|---|---|---|
-| 32 | Proofs against the issuer's previous revocation root were taken until the next revocation, and the directory trusted its cached roots until an unknown root arrived | A secret suspended (or revoked) a moment ago could keep renewing, binding and liking against the root from before, for days in a quiet period. "Suspended at once" would not have held | The issuer offers the previous root for two minutes after a change (`PREVIOUS_ROOT_GRACE`); the directory fetches the roots again when they are older than 30 seconds | `a_theft_report_suspends_and_a_recheck_lifts_it`, `it_wasnt_me_suspends_...` |
+| 32 | Proofs against the issuer's previous revocation root were taken until the next revocation, and the directory trusted its cached roots until an unknown root arrived | A secret suspended (or revoked) a moment ago could keep renewing, binding and liking against the root from before, for days in a quiet period. "Suspended at once" would not have held | The issuer offers the previous root for two minutes after a change (`policy.previous_root_grace_secs`); the directory fetches the roots again when they are older than 30 seconds | `a_theft_report_suspends_and_a_recheck_lifts_it`, `it_wasnt_me_suspends_...` |
 | 33 | The rollout window (`rollout_certified`) backdated every first enrolment to the launch | Enrolments made during the window, which is when stolen logins would be used, could never be reached by an alarm | Removed: γ is always the Monday of the week of issue. First enrolments count at once anyway | `many_reports_raise_the_alarm_...` |
 
 Checked and found sound: a lift needs the record's current handle, a suspension on it, and a proof
@@ -205,6 +205,17 @@ ends after 90 days and is cleared then; a block does not give back the two-year 
 who keeps the eID gets one quick replacement in two years, and later ones wait and have full
 probation; reports still count once per person per 30 days. Left as is: likes counted between the end
 of the week and a block stay counted, because likes cannot be linked to the secret that made them.
+
+### Review of the issuer's policy settings, 19 November 2026
+
+Every number the rules chose is now a setting (`policy` in the issuer configuration, published at
+`GET /v1/policy`; the badge lease is `pop directory --lease-days`). Two passes; the second found
+nothing new.
+
+| # | Problem | Effect | Fix | Test |
+|---|---|---|---|---|
+| 38 | Day settings had no upper bound once they became settings | A huge value would overflow the date sums (wrapping in a release build), so a wait or a block window could end at once, or a probation date fall outside the proofs' 16-bit range | Every day setting must be 1 to 3650 (the directory's lease 7 to 3650); rules between settings are checked too (whole-week probation, block window longer than the probation it guards, quick-replacement interval at least the block window) | `settings_that_break_a_rule_are_refused` |
+| 39 | Unknown fields in the issuer configuration were ignored | The examples still carried `rollout_certified`, removed earlier; an operator setting `replace_wait_days` at the old place would have believed it applied | The configuration, the policy and the alarm rule refuse unknown fields; the examples are checked by a test | `the_example_configurations_parse` |
 
 ### Checked and found sound
 

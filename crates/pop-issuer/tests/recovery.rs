@@ -3,7 +3,7 @@
 //! tests can also send what an honest app never would.
 use pop_crypto::{dates, root_to_hex, BlindRequest, Credential, Day, HandleSignature, HolderSecrets, IssuerPublicKey, ProofSystem, Scheme, SchemeConfig, WitnessPublicKey};
 use pop_idp::StaticProvider;
-use pop_issuer::{HmacUniqueness, Issuer, IssuerConfig};
+use pop_issuer::{HmacUniqueness, Issuer, IssuerConfig, Policy};
 use pop_protocol::api::*;
 use pop_protocol::http::HttpClient;
 use rand::rngs::OsRng;
@@ -17,6 +17,7 @@ struct World {
     ipk: IssuerPublicKey,
     wpk: WitnessPublicKey,
     day: Arc<AtomicU32>,
+    url: String,
 }
 
 struct Person {
@@ -34,10 +35,10 @@ fn status(e: &ApiError) -> u16 {
 }
 
 async fn world(wait: u32) -> World {
-    world_with(wait, pop_issuer::reports::AlarmRule::default()).await
+    world_with(Policy { replace_wait_days: wait, ..Default::default() }).await
 }
 
-async fn world_with(wait: u32, alarm: pop_issuer::reports::AlarmRule) -> World {
+async fn world_with(policy: Policy) -> World {
     let config = SchemeConfig { proof_system: ProofSystem::Bulletproofs, tree_depth: 4, slots: 3, bp_gens_log2: 13 };
     let day = Arc::new(AtomicU32::new(dates::from_civil(2026, 11, 16)));
     let d2 = day.clone();
@@ -46,15 +47,16 @@ async fn world_with(wait: u32, alarm: pop_issuer::reports::AlarmRule) -> World {
         Arc::new(StaticProvider { country: 246 }),
         Arc::new(HmacUniqueness::new(vec![vec![7u8; 32]]).unwrap()),
         pop_storage::MemoryStore::shared(),
-        IssuerConfig { clock: Some(Arc::new(move || d2.load(Ordering::SeqCst))), replace_wait_days: wait, alarm, ..Default::default() },
+        IssuerConfig { clock: Some(Arc::new(move || d2.load(Ordering::SeqCst))), policy, ..Default::default() },
     )
     .await
     .unwrap();
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let api = HttpClient::new(&format!("http://{}", l.local_addr().unwrap()));
+    let url = format!("http://{}", l.local_addr().unwrap());
+    let api = HttpClient::new(&url);
     tokio::spawn(async move { axum::serve(l, pop_issuer::router(issuer)).await.unwrap() });
     let p = api.params().await.unwrap();
-    World { scheme: Arc::new(Scheme::new(p.config)), ipk: IssuerPublicKey::from_hex(&p.issuer_public_key).unwrap(), wpk: WitnessPublicKey::from_hex(&p.witness_public_key).unwrap(), api, day }
+    World { scheme: Arc::new(Scheme::new(p.config)), ipk: IssuerPublicKey::from_hex(&p.issuer_public_key).unwrap(), wpk: WitnessPublicKey::from_hex(&p.witness_public_key).unwrap(), api, day, url }
 }
 
 impl World {
@@ -235,7 +237,7 @@ async fn replacement_with_the_guardian_key() {
     assert!(w.api.revocations().await.unwrap().revoked.contains(&old_handle), "the old secret is revoked");
     // probation starts over: forty weeks from this week's Monday
     let q = dates::quarter_of(w.today());
-    assert_eq!(new.cred.attrs.certified, dates::week_start(w.today()) + dates::PROBATION_DAYS);
+    assert_eq!(new.cred.attrs.certified, dates::week_start(w.today()) + Policy::default().probation_days);
     assert_eq!(new.cred.attrs.first_quarter, q, "the quarter of first enrolment stays");
     // ... so the new secret cannot like yet, nor show a counted badge
     let (tree, _) = w.tree().await;
@@ -323,7 +325,7 @@ async fn replacement_without_the_guardian_key_waits_and_can_be_refused() {
     assert_eq!(status(&w.api.replace_claim(&ClaimRequest { claim_token: t2.clone(), blind_request: wrong }).await.unwrap_err()), 400);
     let cred = w.claim(&t2, &s2).await.unwrap();
     assert!(w.api.revocations().await.unwrap().revoked.contains(&handle));
-    assert_eq!(cred.attrs.certified, dates::week_start(w.today()) + dates::PROBATION_DAYS);
+    assert_eq!(cred.attrs.certified, dates::week_start(w.today()) + Policy::default().probation_days);
     assert!(w.renew(&mut alice).await.is_err(), "the old secret is revoked once the new one is issued");
     assert_eq!(status(&w.claim(&t2, &s2).await.err().unwrap()), 404, "a claim works once");
 
@@ -506,7 +508,7 @@ async fn a_report_counts_quickly_only_once_in_two_years() {
     let ReplaceResponse::Pending { claim_token: t2, suspended: true, .. } = r else { panic!() };
     w.advance(90);
     let c2 = w.claim(&t2, &s2).await.unwrap();
-    assert_eq!(c2.attrs.certified, dates::week_start(w.today()) + dates::PROBATION_DAYS);
+    assert_eq!(c2.attrs.certified, dates::week_start(w.today()) + Policy::default().probation_days);
     let (tree, _) = w.tree().await;
     assert!(!can_like(&w, &c2, &tree, w.today()));
     assert!(w.renew(&mut alice).await.is_err());
@@ -519,7 +521,7 @@ async fn a_report_counts_quickly_only_once_in_two_years() {
     let ReplaceResponse::Pending { claim_token: t3, suspended: false, .. } = r else { panic!() };
     w.advance(90);
     let c3 = w.claim(&t3, &s3).await.unwrap();
-    assert_eq!(c3.attrs.certified, dates::week_start(w.today()) + dates::PROBATION_DAYS);
+    assert_eq!(c3.attrs.certified, dates::week_start(w.today()) + Policy::default().probation_days);
 
     // two years after the first, a report is served at once again
     w.advance(730 - 31 - 90 - 31 - 90);
@@ -531,7 +533,7 @@ async fn a_report_counts_quickly_only_once_in_two_years() {
 
 #[tokio::test]
 async fn many_reports_raise_the_alarm_and_fresh_enrolments_stop_counting() {
-    let w = world_with(90, pop_issuer::reports::AlarmRule { min_reports: 2, factor: 3 }).await;
+    let w = world_with(Policy { alarm: pop_issuer::reports::AlarmRule { min_reports: 2, factor: 3, ..Default::default() }, ..Default::default() }).await;
     let mut bob = w.enrol("bob").await;
     w.advance(60);
     w.renew(&mut bob).await.unwrap();
@@ -543,7 +545,7 @@ async fn many_reports_raise_the_alarm_and_fresh_enrolments_stop_counting() {
         let (_, _, r) = w.replace_with(who, None, true).await.unwrap();
         assert!(matches!(r, ReplaceResponse::Issued { .. }));
     }
-    let cut = dates::week_start(w.today()) - dates::ALARM_REACH_DAYS;
+    let cut = dates::week_start(w.today()) - Policy::default().alarm.reach_days;
     let rep = w.api.reports().await.unwrap();
     assert_eq!(rep.alarm_cutoff, Some(cut));
     assert!(!rep.rule.is_empty());
@@ -557,4 +559,19 @@ async fn many_reports_raise_the_alarm_and_fresh_enrolments_stop_counting() {
     assert_eq!(w.api.params().await.unwrap().alarm_cutoff, Some(cut));
     w.advance(7);
     assert_eq!(w.api.params().await.unwrap().alarm_cutoff, None);
+}
+
+#[tokio::test]
+async fn the_policy_is_a_setting_and_is_published() {
+    let policy = Policy { report_probation_days: 14, contest_days: 30, ..Default::default() };
+    let w = world_with(policy.clone()).await;
+    let mut first = w.enrol("alice").await;
+    let (secrets, _, r) = w.replace_with("alice", None, true).await.unwrap();
+    let ReplaceResponse::Issued { issuance } = r else { panic!() };
+    let c = w.finish(&secrets, &issuance);
+    assert!(c.attrs.certified >= w.today() + 14 && c.attrs.certified < w.today() + 21);
+    w.advance(31);
+    assert_eq!(status(&w.recheck(&mut first, "alice").await.err().unwrap()), 403, "30 days to block, not 90");
+    let published: Policy = reqwest::get(format!("{}/v1/policy", w.url)).await.unwrap().json().await.unwrap();
+    assert_eq!(published, policy);
 }

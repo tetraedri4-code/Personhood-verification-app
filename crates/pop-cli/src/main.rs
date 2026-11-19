@@ -43,6 +43,9 @@ enum Cmd {
         data_dir: Option<PathBuf>,
         #[command(flatten)]
         platforms: PlatformArgs,
+        /// lease of a badge, in days (default nine months)
+        #[arg(long, default_value_t = 274, value_parser = clap::value_parser!(u32).range(7..=3650))]
+        lease_days: u32,
     },
     /// Run the mock identity provider alone
     MockIdp {
@@ -838,12 +841,12 @@ async fn main() -> anyhow::Result<()> {
             println!("Issuer listening on http://{listen}");
             serve(listen, pop_issuer::router(issuer)).await?;
         }
-        Cmd::Directory { listen, issuer_url, data_dir, platforms } => {
+        Cmd::Directory { listen, issuer_url, data_dir, platforms, lease_days } => {
             let d = Directory::connect(
                 Arc::new(HttpClient::new(&issuer_url)),
                 wiring::platforms(&platforms.into()),
                 wiring::store(data_dir.as_deref(), "directory-db")?,
-                DirectoryConfig::default(),
+                DirectoryConfig { lease_days, ..Default::default() },
             )
             .await?;
             println!("Directory listening on http://{listen}");

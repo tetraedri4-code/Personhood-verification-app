@@ -45,9 +45,7 @@ fn issuer_file(dir: &Path) -> IssuerFile {
         provider_code: 1,
         uniqueness: UniquenessFile::Hmac,
         uniqueness_key: None,
-        replace_wait_days: None,
-        alarm_min_reports: None,
-        alarm_factor: None,
+        policy: Default::default(),
     }
 }
 

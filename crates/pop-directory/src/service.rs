@@ -18,9 +18,16 @@ use tower_http::{compression::CompressionLayer, cors::CorsLayer};
 
 pub type Clock = Arc<dyn Fn() -> Day + Send + Sync>;
 
-#[derive(Default)]
 pub struct DirectoryConfig {
     pub clock: Option<Clock>,
+    /// lease of a badge, in days (design §4.5: nine months)
+    pub lease_days: u32,
+}
+
+impl Default for DirectoryConfig {
+    fn default() -> Self {
+        DirectoryConfig { clock: None, lease_days: 274 }
+    }
 }
 
 pub struct Directory {
@@ -57,6 +64,7 @@ fn key(a: &str, b: &str) -> String {
 impl Directory {
     /// Fetch the issuer's public parameters (and LegoGroth16 verifying keys) and start.
     pub async fn connect(issuer_api: Arc<dyn IssuerApi>, platforms: PlatformRegistry, store: SharedStore, cfg: DirectoryConfig) -> anyhow::Result<Arc<Self>> {
+        anyhow::ensure!((7..=3650).contains(&cfg.lease_days), "lease_days must be between 7 and 3650");
         let p = issuer_api.params().await?;
         let scheme = Arc::new(Scheme::new(p.config.clone()));
         for k in &p.statements {
@@ -293,7 +301,7 @@ impl Directory {
             slot: req.proof.slot,
             nym: fingerprint(&req.proof.nym),
             bound_on: today,
-            lease_until: today + dates::LEASE_DAYS,
+            lease_until: today + self.cfg.lease_days,
             counted: req.proof.probation_cleared,
             code_seen_on: None,
             proved_alarm: if req.proof.probation_cleared { alarm } else { None },

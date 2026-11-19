@@ -10,37 +10,55 @@ use crate::service::{ApiErr, St};
 use axum::{extract::State, Json};
 use pop_crypto::{dates, Day};
 use pop_protocol::api::Reports;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
 
 pub(crate) const T_REPORTS: &str = "theft_reports";
-/// The weeks before a week that set what "usual" is.
-const BASELINE_WEEKS: u32 = 12;
-/// The alarm stays on while any of this many latest weeks (the current one included) was high.
-const ALARM_WEEKS: u32 = 4;
 /// Weeks shown in `GET /v1/reports`.
 const SHOWN_WEEKS: u32 = 26;
 
-/// Thresholds of the rule. A week is high if its count is at least `min_reports` and at least
-/// `factor` times the median of the 12 weeks before it.
-#[derive(Clone, Copy, Debug)]
+/// The rule (part of [`crate::Policy`]). A week is high if its count is at least `min_reports` and
+/// at least `factor` times the median of the `baseline_weeks` weeks before it. While any of the latest
+/// `alarm_weeks` weeks is high, the cutoff is `reach_days` before the Monday of the earliest of them.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
 pub struct AlarmRule {
     pub min_reports: u64,
     pub factor: u64,
+    /// the weeks before a week that set what "usual" is
+    pub baseline_weeks: u32,
+    /// the alarm stays on while any of this many latest weeks (the current one included) was high
+    pub alarm_weeks: u32,
+    /// how far before the first high week enrolments stop counting
+    pub reach_days: u32,
 }
 
 impl Default for AlarmRule {
     fn default() -> Self {
-        AlarmRule { min_reports: 20, factor: 3 }
+        AlarmRule { min_reports: 20, factor: 3, baseline_weeks: 12, alarm_weeks: 4, reach_days: 28 }
     }
 }
 
 impl AlarmRule {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.min_reports == 0 || self.factor == 0 {
+            return Err("policy.alarm.min_reports and policy.alarm.factor must be at least 1".into());
+        }
+        if !(1..=104).contains(&self.baseline_weeks) || !(1..=52).contains(&self.alarm_weeks) {
+            return Err("policy.alarm.baseline_weeks must be 1 to 104, and policy.alarm.alarm_weeks 1 to 52".into());
+        }
+        if self.reach_days > 366 {
+            return Err("policy.alarm.reach_days must be at most 366".into());
+        }
+        Ok(())
+    }
+
     pub fn describe(&self) -> String {
         format!(
             "A week is high if its count is at least {} and at least {} times the median of the {} weeks before it. \
              While any of the latest {} weeks is high, the cutoff is {} days before the Monday of the earliest of them.",
-            self.min_reports, self.factor, BASELINE_WEEKS, ALARM_WEEKS, dates::ALARM_REACH_DAYS
+            self.min_reports, self.factor, self.baseline_weeks, self.alarm_weeks, self.reach_days
         )
     }
 
@@ -49,22 +67,22 @@ impl AlarmRule {
         let this_week = dates::week_start(today);
         let count = |w: Day| counts.get(&w).copied().unwrap_or(0);
         let high = |w: Day| {
-            let mut before: Vec<u64> = (1..=BASELINE_WEEKS).map(|i| w.checked_sub(7 * i).map_or(0, count)).collect();
+            let mut before: Vec<u64> = (1..=self.baseline_weeks).map(|i| w.checked_sub(7 * i).map_or(0, count)).collect();
             before.sort_unstable();
             let median = before[before.len() / 2];
             count(w) >= self.min_reports.max(self.factor.saturating_mul(median))
         };
-        (0..ALARM_WEEKS)
+        (0..self.alarm_weeks)
             .rev()
             .filter_map(|i| this_week.checked_sub(7 * i))
             .find(|w| high(*w))
-            .map(|w| w.saturating_sub(dates::ALARM_REACH_DAYS))
+            .map(|w| w.saturating_sub(self.reach_days))
     }
 }
 
 impl crate::service::Issuer {
     pub(crate) fn alarm_cutoff(&self) -> Option<Day> {
-        self.cfg.alarm.cutoff(&self.reports.read().unwrap(), self.today())
+        self.cfg.policy.alarm.cutoff(&self.reports.read().unwrap(), self.today())
     }
 
     /// Count one report in this week. Called with the records lock held.
@@ -85,7 +103,7 @@ pub(crate) async fn reports(State(s): State<St>) -> Result<Json<Reports>, ApiErr
         .filter_map(|i| this_week.checked_sub(7 * i))
         .map(|w| (w, counts.get(&w).copied().unwrap_or(0)))
         .collect();
-    Ok(Json(Reports { weeks, alarm_cutoff: s.alarm_cutoff(), rule: s.cfg.alarm.describe() }))
+    Ok(Json(Reports { weeks, alarm_cutoff: s.alarm_cutoff(), rule: s.cfg.policy.alarm.describe() }))
 }
 
 #[cfg(test)]
@@ -94,7 +112,7 @@ mod tests {
 
     #[test]
     fn rule() {
-        let r = AlarmRule { min_reports: 5, factor: 3 };
+        let r = AlarmRule { min_reports: 5, factor: 3, ..Default::default() };
         let today = dates::week_start(400) + 2;
         let w = dates::week_start(today);
         let mut c = BTreeMap::new();

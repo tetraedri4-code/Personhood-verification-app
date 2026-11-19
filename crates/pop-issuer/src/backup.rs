@@ -19,8 +19,7 @@ use sha2::{Digest, Sha256};
 
 const T_BACKUPS: &str = "backups";
 const T_TICKETS: &str = "backup_tickets";
-/// base64 characters; a wallet with a few bindings is about 3 kB
-pub const MAX_BLOB_CHARS: usize = 44_000;
+// (the largest backup is `policy.max_backup_chars`; a wallet with a few bindings is about 3 kB)
 
 fn sha_hex(s: &str) -> String {
     hex::encode(Sha256::digest(s.as_bytes()))
@@ -42,7 +41,7 @@ pub(crate) async fn put(State(s): State<St>, Json(req): Json<BackupPut>) -> Resu
     if !is_hex(&req.id, 32) || !is_hex(&req.write_key, 64) {
         return Err(err(StatusCode::BAD_REQUEST, "bad backup id or write key"));
     }
-    if req.blob.len() > MAX_BLOB_CHARS || !req.blob.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=') {
+    if req.blob.len() > s.cfg.policy.max_backup_chars || !req.blob.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=') {
         return Err(err(StatusCode::PAYLOAD_TOO_LARGE, "backup too large or not base64"));
     }
     let key_hash = sha_hex(&req.write_key);

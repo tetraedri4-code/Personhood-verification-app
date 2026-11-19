@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 /// Configuration file of `pop issuer` (JSON). See docs/real-identity-provider.md.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IssuerFile {
     /// directory for keys and the JSON store; omit for in-memory
     pub data_dir: Option<PathBuf>,
@@ -33,16 +34,10 @@ pub struct IssuerFile {
     /// `data_dir/uniqueness-keys/`. It counts as the oldest key.
     #[serde(default)]
     pub uniqueness_key: Option<String>,
-    /// Days a replacement of a lost secret waits when the old guardian key did not sign it; a
-    /// re-check with the old app cancels it in that time. Default 90.
+    /// The rules' numbers: waits, probations, intervals, the alarm. Every field is optional and
+    /// defaults to the agreed value; see `pop_issuer::Policy` and docs/real-servers.md.
     #[serde(default)]
-    pub replace_wait_days: Option<u32>,
-    /// alarm rule for theft reports (docs/recovery.md): a week is high with at least this many reports
-    #[serde(default)]
-    pub alarm_min_reports: Option<u64>,
-    /// ... and at least this many times the median of the 12 weeks before
-    #[serde(default)]
-    pub alarm_factor: Option<u64>,
+    pub policy: pop_issuer::Policy,
 }
 
 /// The `uniqueness` section of the issuer configuration.
@@ -192,11 +187,7 @@ pub async fn build_issuer(f: &IssuerFile) -> anyhow::Result<Arc<Issuer>> {
         provider_code: f.provider_code,
         min_loa,
         clock: None,
-        replace_wait_days: f.replace_wait_days.unwrap_or(90),
-        alarm: {
-            let d = pop_issuer::reports::AlarmRule::default();
-            pop_issuer::reports::AlarmRule { min_reports: f.alarm_min_reports.unwrap_or(d.min_reports).max(1), factor: f.alarm_factor.unwrap_or(d.factor).max(1) }
-        },
+        policy: f.policy.clone(),
     };
     Issuer::new(scheme, idp, uniq, db, cfg).await
 }
@@ -256,5 +247,25 @@ pub fn proof_system(s: &str) -> anyhow::Result<ProofSystem> {
         "lego" | "legogroth16" => Ok(ProofSystem::LegoGroth16),
         "bp" | "bulletproofs" => Ok(ProofSystem::Bulletproofs),
         _ => anyhow::bail!("proof system must be legogroth16 or bulletproofs"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The examples must parse: a field the issuer no longer reads is an error, so that nobody runs
+    /// with a setting they believe applies.
+    #[test]
+    fn the_example_configurations_parse() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+        for f in ["issuer.mock.json", "issuer.broker.example.json", "issuer.threshold.example.json"] {
+            let f: IssuerFile = serde_json::from_slice(&std::fs::read(dir.join(f)).unwrap()).unwrap_or_else(|e| panic!("{f}: {e}"));
+            f.policy.validate().unwrap();
+        }
+        let mut old: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("issuer.mock.json")).unwrap()).unwrap();
+        old["replace_wait_days"] = 90.into();
+        let e = serde_json::from_value::<IssuerFile>(old).unwrap_err().to_string();
+        assert!(e.contains("replace_wait_days"), "{e}");
     }
 }

@@ -7,12 +7,6 @@ pub type Day = u32;
 /// Unix time of the scheme epoch, 2026-01-01T00:00:00Z.
 pub const EPOCH_UNIX: i64 = 1_767_225_600;
 
-/// Lease length of a badge, nine months (design §4.5), in days.
-pub const LEASE_DAYS: u32 = 274;
-/// Probation of a replaced secret: 40 weeks, about nine months (design §4.5). It counts from the
-/// Monday this many days after the Monday of the week it was issued in. A first enrolment has no
-/// probation of its own; see [`alarm_cutoff`] for when fresh enrolments stop counting.
-pub const PROBATION_DAYS: u32 = 280;
 
 /// The scheme epoch, 1 January 2026, was a Thursday; weeks start on Monday.
 pub fn week_start(day: Day) -> Day {
@@ -25,9 +19,6 @@ pub fn count_cutoff(today: Day, alarm: Option<Day>) -> Day {
     alarm.map_or(today, |a| a.min(today))
 }
 
-/// How far back an alarm reaches: enrolments from this many days before the first week with too many
-/// reports stop counting until the alarm ends.
-pub const ALARM_REACH_DAYS: u32 = 28;
 /// Re-check period, 24 months (design §4.6), in days.
 pub const RECHECK_DAYS: u32 = 730;
 /// A credential that expired less than 12 months ago can still renew (design §4.6).
