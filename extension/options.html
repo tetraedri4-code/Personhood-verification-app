@@ -17,6 +17,9 @@
 <label for="directoryUrl">Directory address</label>
 <input type="text" id="directoryUrl">
 <p class="note">The public list of verified accounts and like counts. Downloaded whole; the directory is never asked about a single account or post.</p>
+<label for="relayUrl">Relay address (optional)</label>
+<input type="text" id="relayUrl" placeholder="https://relay.example/directory">
+<p class="note">With a relay, requests to the directory go through it, encrypted so that only the directory can read them. The directory then does not see your internet address, and the relay does not see what you ask. Leave empty to ask the directory directly.</p>
 <label for="holderUrl">Holder app address</label>
 <input type="text" id="holderUrl">
 <p class="note">Your own app on this computer. It holds your secret; this extension does not.</p>

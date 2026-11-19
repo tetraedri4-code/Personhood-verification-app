@@ -49,6 +49,7 @@ with their eID. The services keep running:
 | Mock identity provider | http://127.0.0.1:4001 |
 | Issuer | http://127.0.0.1:4002 |
 | Directory | http://127.0.0.1:4003 |
+| Relay (Oblivious HTTP); the demo's holders and the extension's test go through it | http://127.0.0.1:4004/issuer, /directory |
 | Alice's holder app (for the extension); eID help at `/help/reset-eid` | http://127.0.0.1:4010 |
 | Uniqueness operators (three with a share, one standby) | four free ports, printed at start |
 
@@ -93,6 +94,7 @@ The directory must be started with `--bluesky` to accept Bluesky bindings.
 cargo test --release --workspace             # crypto, adapters, servers, end-to-end, security checks
 POP_PAIRING_TOKEN=0123456789abcdef0123 pop demo &
 POP_PAIRING_TOKEN=0123456789abcdef0123 node extension/test/e2e.mjs   # extension in a real Chromium
+node extension/test/ohttp.mjs                # the extension's relay client against the Rust gateway
 cargo audit                                  # dependency advisories
 ```
 
@@ -112,6 +114,7 @@ crates/
   pop-platform-bluesky    platform adapter: Bluesky
   pop-mock-idp            local mock identity provider (OpenID Connect)
   pop-mockfeed            local mock social network
+  pop-ohttp               Oblivious HTTP: gateway in front of a server, relay, client transport
   pop-cli                 the `pop` command; the only crate that knows all the others
 extension/                browser extension (Manifest V3), one adapter file per platform
 docs/                     how to replace each mock with the real thing
@@ -130,5 +133,6 @@ No part depends on another part's implementation, only on the interfaces in `pop
 | Understand the two-year re-check, backups and replacing a lost secret | [docs/recovery.md](docs/recovery.md) |
 | Add a platform | [docs/adding-a-platform.md](docs/adding-a-platform.md) |
 | Change the proof system or understand the cryptography | [docs/crypto.md](docs/crypto.md) |
+| Hide holders' addresses from the servers with a relay | [docs/relay.md](docs/relay.md) |
 | Know how much data the app uses | [docs/data-usage.md](docs/data-usage.md) |
 | Know what was checked and what is still unsafe | [docs/security.md](docs/security.md) |

@@ -1,0 +1,24 @@
+[package]
+name = "pop-ohttp"
+description = "Oblivious HTTP (RFC 9458): a gateway in front of a service, a relay, and a client transport, so that a server does not see who sends a request"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ohttp = { version = "0.8", default-features = false, features = ["client", "server", "rust-hpke"] }
+bhttp = "0.8"
+pop-protocol.workspace = true
+axum.workspace = true
+tower = { version = "0.5", features = ["util"] }
+reqwest.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+url.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+reqwest.workspace = true

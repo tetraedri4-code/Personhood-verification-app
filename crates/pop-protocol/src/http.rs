@@ -1,14 +1,47 @@
-//! HTTP clients for [`IssuerApi`] and [`DirectoryApi`]. To route traffic through a relay (design §4.7),
-//! give the clients a `reqwest::Client` configured with a proxy, or implement the traits differently.
+//! HTTP clients for [`IssuerApi`] and [`DirectoryApi`]. How a request reaches the server is a
+//! [`Transport`]: [`Direct`] sends it as it is; `pop_ohttp::Oblivious` sends it through an Oblivious HTTP
+//! relay (RFC 9458), so that the server does not learn who sent it (design §4.7).
 use crate::api::*;
 use async_trait::async_trait;
 use pop_crypto::StatementKind;
 use serde::{de::DeserializeOwned, Serialize};
+use std::sync::Arc;
+
+/// A response as the transport received it.
+pub struct RawResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
+}
+
+/// Carries one request to a server. `base` is the server's address (scheme and host), `path` starts with
+/// `/` and may hold a query; a body is always JSON.
+#[async_trait]
+pub trait Transport: Send + Sync {
+    async fn send(&self, method: &str, base: &str, path: &str, json_body: Option<Vec<u8>>) -> Result<RawResponse, ApiError>;
+}
+
+/// Straight to the server: it sees this computer's address.
+pub struct Direct(pub reqwest::Client);
+
+#[async_trait]
+impl Transport for Direct {
+    async fn send(&self, method: &str, base: &str, path: &str, json_body: Option<Vec<u8>>) -> Result<RawResponse, ApiError> {
+        let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| ApiError::Transport(e.to_string()))?;
+        let mut rb = self.0.request(method, format!("{base}{path}"));
+        if let Some(b) = json_body {
+            rb = rb.header(reqwest::header::CONTENT_TYPE, "application/json").body(b);
+        }
+        let r = rb.send().await.map_err(|e| ApiError::Transport(e.to_string()))?;
+        let status = r.status().as_u16();
+        let body = r.bytes().await.map_err(|e| ApiError::Transport(e.to_string()))?.to_vec();
+        Ok(RawResponse { status, body })
+    }
+}
 
 #[derive(Clone)]
 pub struct HttpClient {
     base: String,
-    client: reqwest::Client,
+    transport: Arc<dyn Transport>,
 }
 
 impl HttpClient {
@@ -16,41 +49,38 @@ impl HttpClient {
         Self::with_client(base, reqwest::Client::new())
     }
     pub fn with_client(base: &str, client: reqwest::Client) -> Self {
-        HttpClient { base: base.trim_end_matches('/').to_string(), client }
+        Self::with_transport(base, Arc::new(Direct(client)))
+    }
+    pub fn with_transport(base: &str, transport: Arc<dyn Transport>) -> Self {
+        HttpClient { base: base.trim_end_matches('/').to_string(), transport }
     }
     pub fn base(&self) -> &str {
         &self.base
     }
 
-    async fn check(resp: reqwest::Response) -> Result<reqwest::Response, ApiError> {
-        let status = resp.status();
-        if status.is_success() {
-            return Ok(resp);
+    async fn send(&self, method: &str, path: &str, body: Option<Vec<u8>>) -> Result<Vec<u8>, ApiError> {
+        let r = self.transport.send(method, &self.base, path, body).await?;
+        if (200..300).contains(&r.status) {
+            return Ok(r.body);
         }
-        let text = resp.text().await.unwrap_or_default();
+        let text = String::from_utf8_lossy(&r.body).into_owned();
         let message = serde_json::from_str::<ErrorBody>(&text).map(|e| e.error).unwrap_or(text);
-        Err(ApiError::Server { status: status.as_u16(), message })
+        Err(ApiError::Server { status: r.status, message })
     }
 
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, ApiError> {
-        let r = self.client.get(format!("{}{}", self.base, path)).send().await.map_err(|e| ApiError::Transport(e.to_string()))?;
-        Self::check(r).await?.json().await.map_err(|e| ApiError::Decode(e.to_string()))
+        let b = self.send("GET", path, None).await?;
+        serde_json::from_slice(&b).map_err(|e| ApiError::Decode(e.to_string()))
     }
 
     pub async fn get_bytes(&self, path: &str) -> Result<Vec<u8>, ApiError> {
-        let r = self.client.get(format!("{}{}", self.base, path)).send().await.map_err(|e| ApiError::Transport(e.to_string()))?;
-        Ok(Self::check(r).await?.bytes().await.map_err(|e| ApiError::Decode(e.to_string()))?.to_vec())
+        self.send("GET", path, None).await
     }
 
     pub async fn post<B: Serialize + ?Sized, T: DeserializeOwned>(&self, path: &str, body: &B) -> Result<T, ApiError> {
-        let r = self
-            .client
-            .post(format!("{}{}", self.base, path))
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| ApiError::Transport(e.to_string()))?;
-        Self::check(r).await?.json().await.map_err(|e| ApiError::Decode(e.to_string()))
+        let body = serde_json::to_vec(body).map_err(|e| ApiError::Decode(e.to_string()))?;
+        let b = self.send("POST", path, Some(body)).await?;
+        serde_json::from_slice(&b).map_err(|e| ApiError::Decode(e.to_string()))
     }
 }
 

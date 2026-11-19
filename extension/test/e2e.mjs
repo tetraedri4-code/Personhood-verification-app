@@ -27,7 +27,8 @@ const ctx = await chromium.launchPersistentContext(profile, {
 });
 try {
   const sw = ctx.serviceWorkers()[0] ?? (await ctx.waitForEvent("serviceworker"));
-  await sw.evaluate((t) => chrome.storage.local.set({ token: t, reportLikes: true }), token);
+  // directory requests go through the demo's relay (ohttp.js)
+  await sw.evaluate((t) => chrome.storage.local.set({ token: t, reportLikes: true, relayUrl: "http://127.0.0.1:4004/directory" }), token);
 
   const page = await ctx.newPage();
   const badgeAfter = (handle) => page.locator(`[data-pop-account][data-pop-handle="${handle}"] + .pop-badge`);
@@ -76,6 +77,9 @@ try {
   await page.reload();
   await count("p4").waitFor();
   assert.equal(await count("p4").textContent(), "0 verified");
+
+  // every directory request above went through the relay
+  assert.ok((await sw.evaluate(() => PopOhttp.sent)) > 0, "directory requests went through the relay");
 
   // A web page cannot use the holder app: no token, and no CORS for web origins
   const r = await page.evaluate(async () => {

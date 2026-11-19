@@ -229,6 +229,24 @@ entry is ignored; the issuer rebuilds them at start. Two passes; the second foun
 |---|---|---|---|---|
 | 40 | Moving a record to the newest uniqueness key (at login) did not hold the records lock (there before this change) | A claim timed to run during the thief's own login after a key change was written to the old key and deleted with it: the record kept the old handle and the waiting request, so the token could be claimed a second time, and the first new secret was never revoked, giving one person two working secrets | The move holds the same lock as revoke, re-check, replace and claim | none (a race); the lock is the one the other writers hold |
 
+### Review of the Oblivious HTTP relay, 19 November 2026
+
+Holder and extension requests can go through a relay to a gateway in front of the issuer and the
+directory ([relay.md](relay.md)). Two passes; the second found nothing new.
+
+| # | Problem | Effect | Fix | Test |
+|---|---|---|---|---|
+| 41 | The relay fetched the gateway's key again whenever a request could not be decrypted | Anyone, the server's operator included, could empty the relay's copy by sending garbage; a server doing so could give each client that fetched next a key of its own, and so recognise all its requests | The relay keeps a key at least ten minutes whatever the gateway answers | `the_relay_keeps_one_key_for_everyone_for_a_while` |
+| 42 | The gateway would encrypt any answer up to 256 MB | Each request in flight holds about three copies: a few parallel requests for a large answer could exhaust memory | 32 MB cap (the largest answer today is under 2 MB) | none |
+
+Checked and found sound: the gateway passes on only `content-type` and `accept` (so no
+`accept-encoding`: no compression inside, and nothing of the sender's), refuses inner requests to its
+own routes or to a full address, and refuses requests it cannot decrypt before they reach the server;
+the relay forwards only to the gateways it is set up for (not an open proxy), sends only the body on,
+and validates gateway names; both clients accept only https or loopback relay addresses and check the
+content types; the answer is authenticated (AES-GCM) before the extension parses it; the extension's
+HPKE code gives the same bytes as the Rust gateway expects (tested against it).
+
 ### Checked and found sound
 
 - **Proof verification.** Points are subgroup-checked on decoding; identity elements are rejected where
@@ -267,9 +285,11 @@ These are limits of the prototype, in rough order of weight:
 3. **The secret is in a plain file** (`wallet.json`, mode 0600). Anything running as the same user can
    copy it and become that person. A real app wraps it with a hardware key.
 4. **Not constant-time.** Timing side channels on the proving device are possible.
-5. **No relays.** The directory sees the address and time of every binding and like report, which can
-   link them to a person despite the cryptography. Enrolment followed at once by a binding is linkable
-   by timing, the more so with few users.
+5. **Relays are optional and do not delay.** Without one, the directory sees the address and time of
+   every binding and like report, which can link them to a person despite the cryptography. With one
+   ([relay.md](relay.md)) it sees no address, but still the time: enrolment followed at once by a
+   binding is linkable by timing, the more so with few users. A server could give a different key in
+   each ten-minute window and so tell apart clients that fetched it in different windows.
 6. **A removed code keeps its badge.** The directory checks the code when a claim is made or re-checked,
    and an extension remembers a code it saw. If an account is sold or hijacked and the code removed, the
    badge can stay until the lease ends (nine months). Periodic re-checks and a shorter memory in the

@@ -17,8 +17,8 @@ use tokio::net::TcpListener;
 pub struct DevnetOpts {
     pub scheme: SchemeConfig,
     pub data_dir: Option<PathBuf>,
-    /// ports for feed, idp, issuer, directory; 0 = any free port
-    pub ports: [u16; 4],
+    /// ports for feed, idp, issuer, directory, relay; 0 = any free port
+    pub ports: [u16; 5],
     pub uniqueness: UniquenessMode,
     /// days a replacement without the old guardian key waits (None = the issuer's default, 90)
     pub replace_wait_days: Option<u32>,
@@ -35,7 +35,7 @@ pub enum UniquenessMode {
 
 impl Default for DevnetOpts {
     fn default() -> Self {
-        DevnetOpts { scheme: SchemeConfig::default(), data_dir: None, ports: [4000, 4001, 4002, 4003], uniqueness: UniquenessMode::Hmac, replace_wait_days: None }
+        DevnetOpts { scheme: SchemeConfig::default(), data_dir: None, ports: [4000, 4001, 4002, 4003, 4004], uniqueness: UniquenessMode::Hmac, replace_wait_days: None }
     }
 }
 
@@ -45,8 +45,17 @@ pub struct Devnet {
     pub idp_url: String,
     pub issuer_url: String,
     pub directory_url: String,
+    /// an Oblivious HTTP relay for both (`{relay_url}/issuer`, `{relay_url}/directory`), see docs/relay.md
+    pub relay_url: String,
     /// the threshold uniqueness operators, if any
     pub uniqueness: Option<UniquenessCluster>,
+}
+
+impl Devnet {
+    /// The holder's relay addresses for this devnet.
+    pub fn relays(&self) -> wiring::Relays {
+        wiring::Relays { issuer: Some(format!("{}/issuer", self.relay_url)), directory: Some(format!("{}/directory", self.relay_url)) }
+    }
 }
 
 /// What the devnet knows about its uniqueness operators: enough to run rounds against them.
@@ -166,6 +175,7 @@ pub async fn start(o: DevnetOpts) -> anyhow::Result<Devnet> {
     let (l_idp, idp_url) = listen(o.ports[1]).await?;
     let (l_iss, issuer_url) = listen(o.ports[2]).await?;
     let (l_dir, directory_url) = listen(o.ports[3]).await?;
+    let (l_relay, relay_url) = listen(o.ports[4]).await?;
 
     serve(l_feed, pop_mockfeed::router());
 
@@ -195,7 +205,7 @@ pub async fn start(o: DevnetOpts) -> anyhow::Result<Devnet> {
         policy: pop_issuer::Policy { replace_wait_days: o.replace_wait_days.unwrap_or(pop_issuer::Policy::default().replace_wait_days), ..Default::default() },
     })
     .await?;
-    serve(l_iss, pop_issuer::router(issuer));
+    serve(l_iss, wiring::with_gateway(pop_issuer::router(issuer))?);
 
     let platforms = wiring::platforms(&PlatformOpts { mockfeed_url: Some(feed_url.clone()), ..Default::default() });
     let dir = Directory::connect(
@@ -205,9 +215,11 @@ pub async fn start(o: DevnetOpts) -> anyhow::Result<Devnet> {
         DirectoryConfig::default(),
     )
     .await?;
-    serve(l_dir, pop_directory::router(dir));
+    serve(l_dir, wiring::with_gateway(pop_directory::router(dir))?);
+    // in a real deployment someone other than the operator of the servers runs the relay
+    serve(l_relay, pop_ohttp::relay::router([("issuer".to_string(), issuer_url.clone()), ("directory".to_string(), directory_url.clone())].into())?);
 
-    Ok(Devnet { feed_url, idp_url, issuer_url, directory_url, uniqueness })
+    Ok(Devnet { feed_url, idp_url, issuer_url, directory_url, relay_url, uniqueness })
 }
 
 /// Complete the mock identity check without a browser: the mock IdP logs `subject` in at once when

@@ -23,6 +23,7 @@ pop-mockfeed.workspace = true
 pop-platform-mockfeed.workspace = true
 pop-platform-bluesky.workspace = true
 pop-holder.workspace = true
+pop-ohttp.workspace = true
 axum.workspace = true
 tokio.workspace = true
 serde.workspace = true

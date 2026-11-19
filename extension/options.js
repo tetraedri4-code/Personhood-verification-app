@@ -1,4 +1,4 @@
-const KEYS = { directoryUrl: "http://127.0.0.1:4003", holderUrl: "http://127.0.0.1:4010", token: "", reportLikes: false };
+const KEYS = { directoryUrl: "http://127.0.0.1:4003", relayUrl: "", holderUrl: "http://127.0.0.1:4010", token: "", reportLikes: false };
 const $ = (id) => document.getElementById(id);
 const out = (t) => ($("out").textContent = t);
 

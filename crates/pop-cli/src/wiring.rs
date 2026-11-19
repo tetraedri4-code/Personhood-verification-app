@@ -226,6 +226,32 @@ pub fn build_holder(issuer_url: &str, directory_url: &str, platforms: PlatformRe
     Holder::new(Arc::new(HttpClient::new(issuer_url)), Arc::new(HttpClient::new(directory_url)), platforms, wallet)
 }
 
+/// Oblivious HTTP relays the holder sends its requests through (docs/relay.md). With the relay of
+/// `pop relay`, the address for a server is the relay's address followed by the server's name there
+/// (`https://relay.example/directory`). None: straight to the server.
+#[derive(Clone, Debug, Default)]
+pub struct Relays {
+    pub issuer: Option<String>,
+    pub directory: Option<String>,
+}
+
+fn client(url: &str, relay: Option<&str>) -> anyhow::Result<HttpClient> {
+    Ok(match relay {
+        Some(r) => HttpClient::with_transport(url, Arc::new(pop_ohttp::Oblivious::new(r)?)),
+        None => HttpClient::new(url),
+    })
+}
+
+/// A holder whose requests go through the given relays.
+pub fn build_holder_via(issuer_url: &str, directory_url: &str, relays: &Relays, platforms: PlatformRegistry, wallet: Arc<dyn WalletStore>) -> anyhow::Result<Holder> {
+    Ok(Holder::new(Arc::new(client(issuer_url, relays.issuer.as_deref())?), Arc::new(client(directory_url, relays.directory.as_deref())?), platforms, wallet))
+}
+
+/// A server's routes with an Oblivious HTTP gateway in front (`POST /ohttp`, `GET /ohttp/keys`).
+pub fn with_gateway(app: axum::Router) -> anyhow::Result<axum::Router> {
+    Ok(pop_ohttp::gateway::wrap(app, pop_ohttp::gateway::Gateway::generate()?))
+}
+
 pub fn mock_oidc(idp_url: &str, issuer_url: &str) -> OidcConfig {
     OidcConfig {
         name: "mock-idp".into(),

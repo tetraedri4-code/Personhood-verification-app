@@ -47,6 +47,16 @@ enum Cmd {
         #[arg(long, default_value_t = 274, value_parser = clap::value_parser!(u32).range(7..=3650))]
         lease_days: u32,
     },
+    /// Run an Oblivious HTTP relay (RFC 9458) in front of the issuer's and directory's gateways, so
+    /// that they do not see the holder's address (docs/relay.md). Someone other than their operator
+    /// should run it.
+    Relay {
+        #[arg(long, default_value = "127.0.0.1:4004")]
+        listen: SocketAddr,
+        /// a server to relay to, as name=address (repeat): `--gateway directory=https://dir.example`
+        #[arg(long = "gateway", required = true)]
+        gateways: Vec<String>,
+    },
     /// Run the mock identity provider alone
     MockIdp {
         #[arg(long, default_value = "127.0.0.1:4001")]
@@ -379,6 +389,13 @@ struct HolderArgs {
     issuer_url: String,
     #[arg(long, default_value = "http://127.0.0.1:4003")]
     directory_url: String,
+    /// send requests to the issuer through this Oblivious HTTP relay (with `pop relay`: its address
+    /// followed by `/issuer`), so that the issuer does not see this computer's address
+    #[arg(long, env = "POP_ISSUER_RELAY")]
+    issuer_relay: Option<String>,
+    /// the same for the directory (with `pop relay`: its address followed by `/directory`)
+    #[arg(long, env = "POP_DIRECTORY_RELAY")]
+    directory_relay: Option<String>,
     #[command(flatten)]
     platforms: PlatformArgs,
     #[command(subcommand)]
@@ -477,6 +494,7 @@ fn print_devnet(d: &devnet::Devnet) {
     println!("Mock ID provider   {}", d.idp_url);
     println!("Issuer             {}", d.issuer_url);
     println!("Directory          {}", d.directory_url);
+    println!("Relay (OHTTP)      {}/issuer, {}/directory", d.relay_url, d.relay_url);
     if let Some(c) = &d.uniqueness {
         for m in &c.members {
             println!("Uniqueness op {}    {}  (holds a share, {}-of-{})", m.index, m.url, c.threshold, c.members.len());
@@ -487,7 +505,8 @@ fn print_devnet(d: &devnet::Devnet) {
 
 fn holder_for(wallet: PathBuf, d: &devnet::Devnet, as_handle: &str) -> anyhow::Result<Holder> {
     let p = wiring::platforms(&PlatformOpts { mockfeed_url: Some(d.feed_url.clone()), mockfeed_as: Some(as_handle.into()), ..Default::default() });
-    Ok(wiring::build_holder(&d.issuer_url, &d.directory_url, p, Arc::new(FileWallet::open(wallet)?)))
+    // the demo's holders go through the devnet's relay
+    wiring::build_holder_via(&d.issuer_url, &d.directory_url, &d.relays(), p, Arc::new(FileWallet::open(wallet)?))
 }
 
 async fn demo(a: DevnetArgs) -> anyhow::Result<()> {
@@ -658,7 +677,8 @@ async fn login(url: &str, mock_login: Option<String>) -> anyhow::Result<String> 
 
 async fn holder_cmd(a: HolderArgs) -> anyhow::Result<()> {
     let wallet_dir = a.wallet.clone();
-    let h = Arc::new(wiring::build_holder(&a.issuer_url, &a.directory_url, wiring::platforms(&a.platforms.into()), Arc::new(FileWallet::open(&a.wallet)?)));
+    let relays = wiring::Relays { issuer: a.issuer_relay.clone(), directory: a.directory_relay.clone() };
+    let h = Arc::new(wiring::build_holder_via(&a.issuer_url, &a.directory_url, &relays, wiring::platforms(&a.platforms.into()), Arc::new(FileWallet::open(&a.wallet)?))?);
     match a.cmd {
         HolderCmd::Enrol { mock_login } => {
             let code = login(&h.enrol_start().await?, mock_login).await?;
@@ -839,7 +859,7 @@ async fn main() -> anyhow::Result<()> {
             let f: IssuerFile = serde_json::from_slice(&std::fs::read(&config).with_context(|| format!("cannot read {}", config.display()))?)?;
             let issuer = wiring::build_issuer(&f).await?;
             println!("Issuer listening on http://{listen}");
-            serve(listen, pop_issuer::router(issuer)).await?;
+            serve(listen, wiring::with_gateway(pop_issuer::router(issuer))?).await?;
         }
         Cmd::Directory { listen, issuer_url, data_dir, platforms, lease_days } => {
             let d = Directory::connect(
@@ -850,7 +870,16 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
             println!("Directory listening on http://{listen}");
-            serve(listen, pop_directory::router(d)).await?;
+            serve(listen, wiring::with_gateway(pop_directory::router(d))?).await?;
+        }
+        Cmd::Relay { listen, gateways } => {
+            let mut m = std::collections::BTreeMap::new();
+            for g in gateways {
+                let (name, url) = g.split_once('=').context("--gateway takes name=address")?;
+                m.insert(name.to_string(), url.to_string());
+            }
+            println!("Relay listening on http://{listen} for {}", m.keys().cloned().collect::<Vec<_>>().join(", "));
+            serve(listen, pop_ohttp::relay::router(m)?).await?;
         }
         Cmd::MockIdp { listen, public_url, client_id, client_secret, redirect_uri } => {
             println!("Mock identity provider listening on http://{listen}");

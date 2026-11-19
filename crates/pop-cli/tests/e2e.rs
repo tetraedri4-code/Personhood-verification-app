@@ -22,7 +22,7 @@ async fn net() -> &'static Devnet {
                 let d = devnet::start(DevnetOpts {
                     scheme: SchemeConfig { proof_system: ProofSystem::LegoGroth16, tree_depth: 4, slots: 3, bp_gens_log2: 13 },
                     data_dir: None,
-                    ports: [0; 4],
+                    ports: [0; 5],
                     uniqueness: devnet::UniquenessMode::Hmac,
                     replace_wait_days: None,
                 })
@@ -39,7 +39,8 @@ async fn net() -> &'static Devnet {
 
 fn holder(d: &Devnet, as_handle: &str) -> Holder {
     let p = wiring::platforms(&PlatformOpts { mockfeed_url: Some(d.feed_url.clone()), mockfeed_as: Some(as_handle.into()), ..Default::default() });
-    wiring::build_holder(&d.issuer_url, &d.directory_url, p, Arc::new(MemoryWallet::default()))
+    // every holder of these tests sends its requests through the devnet's Oblivious HTTP relay
+    wiring::build_holder_via(&d.issuer_url, &d.directory_url, &d.relays(), p, Arc::new(MemoryWallet::default())).unwrap()
 }
 
 async fn enrolled(d: &Devnet, as_handle: &str, id: &str) -> Holder {

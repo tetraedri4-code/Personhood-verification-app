@@ -2,8 +2,11 @@
 //  * directory (public, no credentials): the list of verified accounts and the table of counts, kept in
 //    chrome.storage.local and brought up to date with only the changes since the last download
 //  * holder app on 127.0.0.1 (pairing token): report a like, read which posts this person liked
+//  * with a relay set, every directory request goes through it, encrypted to the directory (ohttp.js):
+//    the directory does not see this computer's address, the relay does not see the request
 // Settings live in chrome.storage.local.
-const DEFAULTS = { directoryUrl: "http://127.0.0.1:4003", holderUrl: "http://127.0.0.1:4010", token: "", reportLikes: false };
+importScripts("ohttp.js");
+const DEFAULTS = { directoryUrl: "http://127.0.0.1:4003", relayUrl: "", holderUrl: "http://127.0.0.1:4010", token: "", reportLikes: false };
 const TTL_MS = 60_000;
 const cache = new Map();
 
@@ -25,6 +28,25 @@ async function cached(key, load) {
   const value = await load();
   cache.set(key, { at: Date.now(), value });
   return value;
+}
+
+// A relay address keeps its path (one relay can serve several servers under different paths).
+function relayAddr(url) {
+  if (!url) return null;
+  const u = new URL(url);
+  const loopback = u.hostname === "127.0.0.1" || u.hostname === "localhost";
+  if (u.protocol !== "https:" && !(u.protocol === "http:" && loopback)) throw new Error("relay address must be https, or http on this computer");
+  if (u.search || u.hash) throw new Error("relay address must not have a query");
+  return u.origin + u.pathname.replace(/\/+$/, "");
+}
+
+// A GET to the directory: through the relay when one is set, else straight.
+async function dirJson(s, url) {
+  const relay = relayAddr(s.relayUrl);
+  if (!relay) return getJson(url);
+  const r = await PopOhttp.request(relay, "GET", url);
+  if (r.status < 200 || r.status >= 300) throw new Error(`${r.status}`);
+  return JSON.parse(new TextDecoder().decode(r.body));
 }
 
 async function getJson(url, init) {
@@ -52,7 +74,7 @@ const PLATFORM_RE = /^[a-z0-9-]{1,32}$/;
 const SYNC_VERSION = 1;
 const syncing = new Map();
 
-async function synced(dir, platform) {
+async function synced(s, dir, platform) {
   const key = `sync|${dir}|${platform}`;
   let st = (await chrome.storage.local.get(key))[key];
   if (!st || st.v !== SYNC_VERSION) st = { v: SYNC_VERSION, at: 0, today: 0, instance: "", listSeq: 0, entries: {}, countSeq: 0, counts: {} };
@@ -62,7 +84,7 @@ async function synced(dir, platform) {
     syncing.set(key, (async () => {
       try {
         const inst = encodeURIComponent(st.instance || "");
-        const list = await getJson(`${dir}/v1/bindings?platform=${platform}&since=${st.listSeq}&instance=${inst}`);
+        const list = await dirJson(s, `${dir}/v1/bindings?platform=${platform}&since=${st.listSeq}&instance=${inst}`);
         if (list.full) st.entries = {};
         for (const g of list.gone || []) delete st.entries[`${g.account_id}|${g.nym}`];
         for (const e of list.entries || []) st.entries[`${e.account_id}|${e.nym}`] = e;
@@ -71,7 +93,7 @@ async function synced(dir, platform) {
         st.alarm = Number.isInteger(list.alarm_cutoff) ? list.alarm_cutoff : null;
         // claims whose lease ran out are not announced as gone: drop them here
         for (const [k, e] of Object.entries(st.entries)) if (e.lease_until < list.today) delete st.entries[k];
-        const table = await getJson(`${dir}/v1/likes/table?platform=${platform}&since=${st.countSeq}&instance=${inst}`);
+        const table = await dirJson(s, `${dir}/v1/likes/table?platform=${platform}&since=${st.countSeq}&instance=${inst}`);
         if (table.full) st.counts = {};
         for (const [k, n] of Object.entries(table.counts || {})) if (k !== "__proto__" && Number.isSafeInteger(n)) st.counts[k] = n;
         st.countSeq = table.seq;
@@ -102,7 +124,7 @@ async function handle(msg) {
   if (msg.type === "data") {
     if (!PLATFORM_RE.test(msg.platform)) throw new Error("bad platform");
     const dir = base(s.directoryUrl);
-    const st = await synced(dir, msg.platform);
+    const st = await synced(s, dir, msg.platform);
     const seen = (await chrome.storage.local.get("seen")).seen || {};
     const entries = Object.values(st.entries).sort((a, b) => (a.account_id < b.account_id ? -1 : a.account_id > b.account_id ? 1 : 0));
     return { settings: { reportLikes: !!s.reportLikes }, today: st.today, alarm: st.alarm ?? null, entries, counts: st.counts, seen: seen[msg.platform] || {} };

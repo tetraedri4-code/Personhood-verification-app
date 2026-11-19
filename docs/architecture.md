@@ -30,6 +30,7 @@
 | Interface | Defined in | Implementations here | Used by |
 |---|---|---|---|
 | `IssuerApi`, `DirectoryApi` | `pop-protocol::api` | `HttpClient` | holder, directory |
+| `Transport` (how `HttpClient` reaches a server) | `pop-protocol::http` | `Direct`, `Oblivious` (in `pop-ohttp`, through a relay) | holder |
 | `Platform` | `pop-protocol::platform` | `MockFeed`, `Bluesky` | holder, directory |
 | `IdentityProvider` | `pop-idp` | `OidcProvider`, `StaticProvider` | issuer |
 | `UniquenessService` | `pop-protocol::uniqueness` | `HmacUniqueness` (in `pop-issuer`), `ThresholdUniqueness` (in `pop-uniqueness`) | issuer |
@@ -54,10 +55,13 @@ These hold today (check with `cargo tree`), and a change that breaks one is a de
 7. `pop-uniqueness` depends only on `pop-crypto` and `pop-protocol`. The issuer does not depend on it:
    it sees the `UniquenessService` trait and nothing else.
 8. Only `pop-cli` names concrete implementations (`crates/pop-cli/src/wiring.rs`).
+9. `pop-ohttp` (relay, gateway, client) depends only on `pop-protocol`. No server and not the holder
+   depend on it: `pop-cli` puts the gateway in front of a server's routes and gives the holder an
+   `Oblivious` transport ([relay.md](relay.md)).
 
 The extension follows the same split: `core.js` knows no site's markup, each file in `adapters/` knows
 one site and nothing about the directory or the holder app, and `background.js` is the only file that
-touches the network.
+touches the network (with `ohttp.js` for requests through a relay).
 
 ## Flows
 
@@ -95,6 +99,6 @@ that counts after a week; for 90 days the replaced secret can block it with a re
 ## What the prototype leaves out
 
 Compared with design v2 and the voluntary-app report: a threshold issuer, the public witnessed log,
-delaying relays and cover traffic, the desk for disputed takeovers, split backups and passkey-wrapped
+delays and cover traffic in the relays, the desk for disputed takeovers, split backups and passkey-wrapped
 backup keys (the prototype has the paper code only), hardware-wrapped secrets, phone apps, Bluesky
 labels and feed generator. Each has a seam where it would go; the docs name it.

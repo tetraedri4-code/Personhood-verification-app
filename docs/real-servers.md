@@ -190,9 +190,11 @@ person. Cap it at the proxy and prune posts with a single tag from the table if 
 
 ## 6. Network privacy
 
-The design routes every proof through delaying relays (§4.7). The prototype sends them directly, so the
-directory sees the sender's address and the time. Both clients take a `reqwest::Client`
-(`HttpClient::with_client`), which is where an Oblivious HTTP relay or a proxy goes.
+`pop issuer` and `pop directory` serve an Oblivious HTTP gateway (`POST /ohttp`, `GET /ohttp/keys`).
+Have someone else run a relay (`pop relay`, or a hosted RFC 9458 relay) and give holders and the
+extension its address: the servers then do not see their addresses. See [relay.md](relay.md). Keep
+`/ohttp` out of any per-address rate limit at your proxy (every request comes from the relay); limit at
+the relay instead. The design's relays also delay and mix reports (§4.7); this one does not.
 
 ## 7. Before real people use it
 
