@@ -2,8 +2,9 @@
 // (src/adapters/*.js) find accounts and posts in the page and this file decides what to draw.
 //
 // Privacy rules this file keeps:
-//  * It never asks a server about an account or a post. It downloads the whole public list of verified
-//    accounts and the whole table of counts through the background worker, and looks things up locally.
+//  * It never asks a server about an account or a post. The background worker keeps the whole public
+//    list of verified accounts and the whole table of counts (syncing only changes), and this file
+//    looks things up locally.
 //  * A like is reported only if the person switched reporting on in the options.
 //  * Everything from the directory and from the page is treated as untrusted text: it reaches the DOM
 //    only through textContent and title, never as HTML.

@@ -19,7 +19,7 @@
 │                    │────────────────────────────────────────────▶│ platform         │
 └─────────▲──────────┘ publish the code                            │ (mock feed,      │
           │ local API, pairing token                               │  Bluesky)        │
-┌─────────┴──────────┐  download whole list and counts table       └────────▲─────────┘
+┌─────────┴──────────┐  sync whole list and counts table           └────────▲─────────┘
 │ browser extension  │───────────────▶ directory                            │
 │  core + adapters   │──────────────────────────────────────────────────────┘
 └────────────────────┘  reads the page it is shown

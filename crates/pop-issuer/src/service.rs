@@ -68,6 +68,8 @@ pub struct Issuer {
     /// replace, claim), so two requests about one person cannot both act on the old record.
     /// A deployment with several issuer processes needs compare-and-swap in its store instead.
     pub(crate) records: tokio::sync::Mutex<()>,
+    /// one revocation at a time, so positions in the list are unique
+    revoking: tokio::sync::Mutex<()>,
 }
 
 pub(crate) const T_SESSIONS: &str = "enrol_sessions";
@@ -178,11 +180,20 @@ impl Issuer {
                 lego.insert(kind, bytes);
             }
         }
-        let revoked: Vec<u64> = store.list(T_REVOKED).await?.iter().filter_map(|(k, _)| k.parse().ok()).collect();
+        // Holders keep the list and ask only for its end, so the order must survive a restart: each
+        // entry stores its position. Entries from before positions were stored go first, by handle.
+        let mut listed: Vec<(u64, u64)> = store
+            .list(T_REVOKED)
+            .await?
+            .iter()
+            .filter_map(|(k, v)| Some((v.get("seq").and_then(|x| x.as_u64()).unwrap_or(0), k.parse().ok()?)))
+            .collect();
+        listed.sort();
+        let revoked: Vec<u64> = listed.into_iter().map(|(_, h)| h).collect();
         let tree = scheme.revocation_tree(&revoked)?;
         check_key_versions(&*uniq, &store).await?;
         let rev = RevState { epoch: 0, root: root_to_hex(&tree.root()), previous_root: None, revoked, tree };
-        Ok(Arc::new(Issuer { scheme, key, witness, lego, idp, uniq, store, cfg, rev: RwLock::new(rev), rng: Mutex::new(rng), records: tokio::sync::Mutex::new(()), backups: tokio::sync::Mutex::new(()) }))
+        Ok(Arc::new(Issuer { scheme, key, witness, lego, idp, uniq, store, cfg, rev: RwLock::new(rev), rng: Mutex::new(rng), records: tokio::sync::Mutex::new(()), revoking: tokio::sync::Mutex::new(()), backups: tokio::sync::Mutex::new(()) }))
     }
 
     pub fn today(&self) -> Day {
@@ -241,11 +252,16 @@ impl Issuer {
     }
 
     pub(crate) async fn revoke_handle(&self, handle: u64) -> anyhow::Result<()> {
-        self.store.put(T_REVOKED, &handle.to_string(), json!({"on": self.today()})).await?;
+        let _g = self.revoking.lock().await;
+        let seq = {
+            let rv = self.rev.read().unwrap();
+            if rv.revoked.contains(&handle) {
+                return Ok(());
+            }
+            rv.revoked.len() as u64 + 1
+        };
+        self.store.put(T_REVOKED, &handle.to_string(), json!({"on": self.today(), "seq": seq})).await?;
         let mut rv = self.rev.write().unwrap();
-        if rv.revoked.contains(&handle) {
-            return Ok(());
-        }
         let mut revoked = rv.revoked.clone();
         revoked.push(handle);
         let tree = self.scheme.revocation_tree(&revoked)?;
@@ -258,8 +274,14 @@ impl Issuer {
     }
 
     pub fn revocations(&self) -> Revocations {
+        self.revocations_since(0)
+    }
+
+    pub fn revocations_since(&self, since: u64) -> Revocations {
         let rv = self.rev.read().unwrap();
-        Revocations { epoch: rv.epoch, revoked: rv.revoked.clone(), root: rv.root.clone(), previous_root: rv.previous_root.clone() }
+        let total = rv.revoked.len() as u64;
+        let from = since.min(total);
+        Revocations { epoch: rv.epoch, from, total, revoked: rv.revoked[from as usize..].to_vec(), root: rv.root.clone(), previous_root: rv.previous_root.clone() }
     }
 }
 
@@ -376,7 +398,8 @@ pub fn router(issuer: Arc<Issuer>) -> Router {
         .route("/v1/enrol/status", get(enrol_status))
         .route("/v1/enrol/finish", post(enrol_finish))
         .route("/v1/renew", post(renew))
-        .route("/v1/revocations", get(revocations))
+        // public answers only: compressing a response that holds a secret could leak it (BREACH)
+        .route("/v1/revocations", get(revocations).layer(tower_http::compression::CompressionLayer::new()))
         .route("/v1/revoke", post(revoke))
         .route("/v1/recheck", post(crate::recovery::recheck))
         .route("/v1/replace", post(crate::recovery::replace))
@@ -616,8 +639,14 @@ async fn renew(State(s): State<St>, Json(req): Json<RenewRequest>) -> Result<Jso
     Ok(Json(RenewResponse { signature: sig, new_expiry }))
 }
 
-async fn revocations(State(s): State<St>) -> Json<Revocations> {
-    Json(s.revocations())
+#[derive(Deserialize)]
+struct SinceQ {
+    #[serde(default)]
+    since: u64,
+}
+
+async fn revocations(State(s): State<St>, Query(q): Query<SinceQ>) -> Json<Revocations> {
+    Json(s.revocations_since(q.since))
 }
 
 async fn revoke(State(s): State<St>, Json(req): Json<RevokeRequest>) -> Result<Json<serde_json::Value>, ApiErr> {

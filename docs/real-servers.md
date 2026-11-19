@@ -127,8 +127,11 @@ files are unused and can be deleted.
 
 ## 4. Revocation list
 
-`GET /v1/revocations` returns every revoked handle, and each holder rebuilds the tree to find its own
-path without telling anyone its handle. That stops scaling in the tens of thousands. The design's answer
+`GET /v1/revocations?since=N` returns the revoked handles from position N on, in the order they were
+revoked. The holder keeps the list (in its wallet cache), asks only for the rest, and rebuilds the tree
+to find its own path without telling anyone its handle. A new device still downloads the whole list
+once (about 20 bytes per revoked credential, less with gzip), and every holder keeps it, which stops
+scaling somewhere in the millions. The design's answer
 (§4.6) is a bucketed lookup: the holder asks for the bucket of leaves around its handle plus the path
 above. `IssuerApi::revocations` is the one method to change, with `Holder::tree`.
 
@@ -137,9 +140,13 @@ The tree depth is in the scheme configuration: capacity is 4^depth − 1 revoked
 
 ## 5. Like counts
 
-The extension downloads the whole counts table (`GET /v1/likes/table`) so the directory does not learn
-which posts a person looks at. At scale, serve it in buckets by a prefix of the hashed post id, so a
-request reveals only a bucket. An enrolled person can report likes for post ids that do not exist; the
+The extension keeps the whole counts table of a platform and syncs it (`GET /v1/likes/table?since=N`),
+so the directory does not learn which posts a person looks at; the same holds for the list of bound
+accounts (`GET /v1/bindings?since=N`). The first download is still the whole table. At scale, split it
+into buckets by a prefix of the hashed post id, so a reader keeps only the buckets of posts it has seen
+and a request reveals only a bucket. Removed claims are remembered for 30 days; a reader away longer
+gets the whole list again. A store that keeps change numbers needs them to be atomic with the write,
+which the prototype gets from the directory's write lock. An enrolled person can report likes for post ids that do not exist; the
 directory only checks the id's form. Tags are unlinkable by design, so this cannot be limited per
 person. Cap it at the proxy and prune posts with a single tag from the table if it becomes a problem.
 

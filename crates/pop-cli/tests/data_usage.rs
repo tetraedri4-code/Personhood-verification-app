@@ -69,6 +69,9 @@ impl IssuerApi for Counting {
     async fn revocations(&self) -> Result<Revocations, ApiError> {
         counted!(self, "revocation list", 0, self.inner.revocations())
     }
+    async fn revocations_since(&self, since: u64) -> Result<Revocations, ApiError> {
+        counted!(self, "revocation list", 0, self.inner.revocations_since(since))
+    }
     async fn revoke(&self, req: &RevokeRequest) -> Result<(), ApiError> {
         counted!(self, "revoke", len(req), self.inner.revoke(req))
     }
@@ -167,11 +170,38 @@ async fn data_usage() {
         h.replace_finish(&code).await.unwrap();
         report("replace the secret, incl. backup update");
 
-        // what the browser extension downloads
-        let http = reqwest::Client::new();
-        let list = http.get(format!("{}/v1/bindings?platform=mockfeed", d.directory_url)).send().await.unwrap().bytes().await.unwrap();
-        let entries = serde_json::from_slice::<BindingList>(&list).unwrap().entries.len();
-        let table = http.get(format!("{}/v1/likes/table?platform=mockfeed", d.directory_url)).send().await.unwrap().bytes().await.unwrap();
-        println!("extension: binding list {} B for {entries} entries; likes table {} B: {}", list.len(), table.len(), String::from_utf8_lossy(&table).chars().take(200).collect::<String>());
+        // what the browser extension downloads: the first sync, then a sync after one more like
+        let http = reqwest::Client::builder().no_gzip().build().unwrap();
+        let get = |path: String, gzip: bool| {
+            let mut r = http.get(format!("{}{path}", d.directory_url));
+            if gzip {
+                r = r.header("accept-encoding", "gzip");
+            }
+            async move { r.send().await.unwrap().bytes().await.unwrap() }
+        };
+        let list = get("/v1/bindings?platform=mockfeed&since=0".into(), false).await;
+        let list_gz = get("/v1/bindings?platform=mockfeed&since=0".into(), true).await;
+        let parsed = serde_json::from_slice::<BindingList>(&list).unwrap();
+        let table = get("/v1/likes/table?platform=mockfeed&since=0".into(), false).await;
+        let t: CountTable = serde_json::from_slice(&table).unwrap();
+        println!("extension, first sync: binding list {} B ({} B gzip) for {} entries; likes table {} B for {} posts", list.len(), list_gz.len(), parsed.entries.len(), table.len(), t.counts.len());
+        let empty = get(format!("/v1/bindings?platform=mockfeed&since={}&instance={}", parsed.seq, parsed.instance), false).await;
+        let empty_t = get(format!("/v1/likes/table?platform=mockfeed&since={}&instance={}", t.seq, t.instance), false).await;
+        println!("extension, sync with no changes: {} B + {} B", empty.len(), empty_t.len());
+        // a larger list, to see per-entry sizes and what gzip does to them
+        let mut big = parsed.clone();
+        big.entries = (0..1000).map(|i| {
+            let mut e = parsed.entries[0].clone();
+            e.account_id = format!("did:plc:{:024x}", i * 7919);
+            e.handle = format!("user{i}.example.social");
+            e.nym = pop_crypto::fingerprint(&format!("n{i}"));
+            e.code = format!("pop1-{:04x}-{:04x}-{:04x}", i, i * 3, i * 7);
+            e
+        }).collect();
+        let raw = serde_json::to_vec(&big).unwrap();
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut enc, &raw).unwrap();
+        let gz = enc.finish().unwrap();
+        println!("1,000 synthetic entries: {} B, {} B gzip", raw.len(), gz.len());
     }
 }

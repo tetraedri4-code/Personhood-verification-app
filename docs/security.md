@@ -124,6 +124,28 @@ Checked and found sound in this change:
 - **Nothing is revealed before every dealer has committed**, and no share is erased before every
   receiver has confirmed its new one on disk.
 
+### Review of syncing only changes, 19 November 2026
+
+The directory's list and like table, and the issuer's revocation list, are now synced: a reader keeps
+what it has and asks only for what changed after a change number (see [data-usage.md](data-usage.md)).
+Three passes; the third found nothing new.
+
+| # | Problem | Effect | Fix | Test |
+|---|---|---|---|---|
+| 28 | Reading the list right after a change number was taken but before the change was stored | A reader would skip that change for good: a badge missing, or a withdrawn one still shown | Writers take the number and store the change under the write lock; a reader takes that lock for a moment before reading, so every number it is given is complete | `readers_download_only_changes` |
+| 29 | A reader whose numbers came from another store (the directory was reset or moved) | Its old claims would stay until their lease ran out | Every answer names the store; a reader sends the name back, and a different one gets the whole list | same |
+| 30 | Moving the platform check out of the write lock had put it before the replay check | A replayed public proof would make the directory query the platform again each time | The proof's nonce is used up first, then the platform is asked | existing replay tests |
+| 31 | A public re-check of an account rewrote the claim even when nothing changed | Anyone could make every reader download claims again, at will; a slow check could also overwrite a renewal made meanwhile | Only the result of the check is taken over, and only a real change gets a new number | `readers_download_only_changes` |
+
+Checked and found sound in this change: the holder's rebuilt revocation tree must match the issuer's
+root whatever its cache held (a stale or damaged cache means one full download, never a wrong tree);
+the holder asks from a multiple of 64, so where it asks from says little about when it last asked;
+the issuer keeps the order of revocations across restarts; compression is used only on public answers
+(the directory, and the issuer's revocation list), so it cannot leak a secret as in the BREACH attack;
+the extension ignores a `__proto__` key and anything but whole numbers in counts. Left as is: the
+extension sends its exact change number, which tells the directory roughly when that browser last
+synced. The browser's address tells it more, which is what relays are for (design §4.7).
+
 ### Checked and found sound
 
 - **Proof verification.** Points are subgroup-checked on decoding; identity elements are rejected where

@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+tower-http.workspace = true
 pop-crypto.workspace = true
 pop-protocol.workspace = true
 pop-storage.workspace = true

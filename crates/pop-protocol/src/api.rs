@@ -224,11 +224,19 @@ pub struct BackupBlob {
     pub blob: String,
 }
 
-/// `GET /v1/revocations`: the full list, so a holder computes its path without revealing its handle.
-/// At scale this becomes a bucketed lookup (design §4.6).
+/// `GET /v1/revocations?since=N`: the revoked handles in the order they were revoked, from position
+/// `from` on (`since` is clamped to the list's length). A holder keeps the list it has, asks only for
+/// the rest, and checks the rebuilt tree against `root`; it never names its own handle. Asking with
+/// `since=0` returns the whole list. At scale this becomes a bucketed lookup (design §4.6).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Revocations {
     pub epoch: u64,
+    /// position in the full list of the first handle in `revoked`
+    #[serde(default)]
+    pub from: u64,
+    /// length of the full list
+    #[serde(default)]
+    pub total: u64,
     pub revoked: Vec<u64>,
     pub root: String,
     /// root of the previous epoch, still accepted by verifiers
@@ -281,11 +289,49 @@ pub struct BindingEntry {
     pub code_seen_on: Option<Day>,
 }
 
+/// `GET /v1/bindings?platform=P&since=N&instance=I`. With `since=0`, with an `instance` other than
+/// the directory's, or when the directory no longer has the
+/// changes since N, `full` is true and `entries` is the whole current list. Otherwise `entries` are the
+/// claims added or changed after change number N, and `gone` the claims removed after it. Claims whose
+/// lease has run out are not listed as gone: a reader drops them by `lease_until` and `today`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BindingList {
     pub platform: String,
     pub today: Day,
+    /// names the directory's store; send it back with `since`
+    #[serde(default)]
+    pub instance: String,
+    /// the directory's change number at the time of this answer: ask with `since` set to it next time
+    #[serde(default)]
+    pub seq: u64,
+    #[serde(default = "yes")]
+    pub full: bool,
     pub entries: Vec<BindingEntry>,
+    #[serde(default)]
+    pub gone: Vec<GoneEntry>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// A claim removed from the list (withdrawn, or its pseudonym moved to another account).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct GoneEntry {
+    pub account_id: String,
+    /// fingerprint of the pseudonym, as in [`BindingEntry::nym`]
+    pub nym: String,
+}
+
+/// `GET /v1/likes/table?platform=P&since=N&instance=I`: like counts changed after change number N, or every
+/// non-zero count when `full` is true. Counts only grow, so there is nothing to remove.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CountTable {
+    pub platform: String,
+    pub instance: String,
+    pub seq: u64,
+    pub full: bool,
+    pub counts: BTreeMap<String, u64>,
 }
 
 /// Full record with its proof, for anyone who wants to re-verify. `GET /v1/bindings/{platform}/{account}`
@@ -294,6 +340,9 @@ pub struct BindingList {
 pub struct BindingRecord {
     pub entry: BindingEntry,
     pub request: BindRequest,
+    /// the directory's change number when the claim was stored or last updated
+    #[serde(default)]
+    pub seq: u64,
 }
 
 /// `POST /v1/bindings/withdraw`: switch the badge off. Needs a binding proof over `withdraw_context`.
@@ -348,6 +397,16 @@ pub trait IssuerApi: Send + Sync {
     async fn enrol_finish(&self, req: &EnrolFinishRequest) -> Result<IssuanceResponse, ApiError>;
     async fn renew(&self, req: &RenewRequest) -> Result<RenewResponse, ApiError>;
     async fn revocations(&self) -> Result<Revocations, ApiError>;
+    /// The revoked handles from position `since` on. The default asks for the whole list and cuts it.
+    async fn revocations_since(&self, since: u64) -> Result<Revocations, ApiError> {
+        let mut r = self.revocations().await?;
+        let total = r.revoked.len() as u64;
+        let from = since.min(total);
+        r.revoked.drain(..from as usize);
+        r.from = from;
+        r.total = total;
+        Ok(r)
+    }
     async fn revoke(&self, req: &RevokeRequest) -> Result<(), ApiError>;
     async fn identity_recheck(&self, req: &RecheckRequest) -> Result<RecheckResponse, ApiError>;
     async fn replace(&self, req: &ReplaceRequest) -> Result<ReplaceResponse, ApiError>;
@@ -364,6 +423,12 @@ pub trait DirectoryApi: Send + Sync {
     async fn withdraw(&self, req: &WithdrawRequest) -> Result<(), ApiError>;
     async fn recheck(&self, platform: &str, account_id: &str) -> Result<Vec<BindingEntry>, ApiError>;
     async fn list(&self, platform: &str) -> Result<BindingList, ApiError>;
+    /// Changes to the list after change number `since` (see [`BindingList`]). The default returns the
+    /// whole list.
+    async fn list_since(&self, platform: &str, since: u64, instance: &str) -> Result<BindingList, ApiError> {
+        let _ = (since, instance);
+        self.list(platform).await
+    }
     async fn like(&self, req: &LikeRequest) -> Result<LikeResponse, ApiError>;
     async fn counts(&self, req: &CountsRequest) -> Result<CountsResponse, ApiError>;
 }

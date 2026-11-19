@@ -81,6 +81,9 @@ impl IssuerApi for HttpClient {
     async fn revocations(&self) -> Result<Revocations, ApiError> {
         self.get("/v1/revocations").await
     }
+    async fn revocations_since(&self, since: u64) -> Result<Revocations, ApiError> {
+        self.get(&format!("/v1/revocations?since={since}")).await
+    }
     async fn revoke(&self, req: &RevokeRequest) -> Result<(), ApiError> {
         let _: serde_json::Value = self.post("/v1/revoke", req).await?;
         Ok(())
@@ -120,6 +123,9 @@ impl DirectoryApi for HttpClient {
     }
     async fn list(&self, platform: &str) -> Result<BindingList, ApiError> {
         self.get(&format!("/v1/bindings?platform={}", enc(platform))).await
+    }
+    async fn list_since(&self, platform: &str, since: u64, instance: &str) -> Result<BindingList, ApiError> {
+        self.get(&format!("/v1/bindings?platform={}&since={since}&instance={}", enc(platform), enc(instance))).await
     }
     async fn like(&self, req: &LikeRequest) -> Result<LikeResponse, ApiError> {
         self.post("/v1/likes", req).await

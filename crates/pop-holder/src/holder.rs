@@ -97,7 +97,25 @@ pub struct Holder {
     scheme: tokio::sync::OnceCell<(Arc<Scheme>, String, String)>,
     /// one proof at a time, and no interleaved wallet writes
     pub(crate) busy: tokio::sync::Mutex<()>,
+    /// the issuer's parameters, reused for a few minutes instead of fetched before every proof
+    params: std::sync::Mutex<Option<(std::time::Instant, Params)>>,
+    /// the revocation list and its tree, so that only new revocations are downloaded
+    revs: tokio::sync::Mutex<Option<RevCache>>,
 }
+
+struct RevCache {
+    revoked: Vec<u64>,
+    tree: Arc<RevocationTree>,
+    root: String,
+}
+
+/// How long the issuer's parameters are reused. Its date may then be up to this much old, which the
+/// one-day window of every verifier absorbs.
+const PARAMS_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The holder asks for revocations from a multiple of this, not from the exact length of its list,
+/// so that the position it asks from says little about when it last asked.
+const REV_STEP: u64 = 64;
 
 fn nonce() -> String {
     hex::encode(rand::random::<[u8; 16]>())
@@ -105,11 +123,22 @@ fn nonce() -> String {
 
 impl Holder {
     pub fn new(issuer: Arc<dyn IssuerApi>, directory: Arc<dyn DirectoryApi>, platforms: PlatformRegistry, wallet: Arc<dyn WalletStore>) -> Self {
-        Holder { issuer, directory, platforms, wallet, scheme: tokio::sync::OnceCell::new(), busy: tokio::sync::Mutex::new(()) }
+        Holder { issuer, directory, platforms, wallet, scheme: tokio::sync::OnceCell::new(), busy: tokio::sync::Mutex::new(()), params: std::sync::Mutex::new(None), revs: tokio::sync::Mutex::new(None) }
+    }
+
+    async fn params(&self) -> Result<Params> {
+        if let Some((at, p)) = self.params.lock().unwrap().as_ref() {
+            if at.elapsed() < PARAMS_TTL && p.today == dates::today() {
+                return Ok(p.clone());
+            }
+        }
+        let p = self.issuer.params().await?;
+        *self.params.lock().unwrap() = Some((std::time::Instant::now(), p.clone()));
+        Ok(p)
     }
 
     pub(crate) async fn ctx(&self) -> Result<Ctx> {
-        let p = self.issuer.params().await?;
+        let p = self.params().await?;
         let (scheme, ipk, wpk) = self
             .scheme
             .get_or_try_init(|| async {
@@ -156,15 +185,51 @@ impl Holder {
         Ok(Credential::from_json(state.credential.as_ref().ok_or(HolderError::NotEnrolled)?)?)
     }
 
+    /// The revocation tree at the issuer's current root. Only the handles revoked since the last call
+    /// are downloaded; the list is kept on disk too. Whatever the cache holds, the rebuilt tree must
+    /// match the issuer's root, and if it does not the whole list is fetched again.
     pub(crate) async fn tree(&self, cx: &Ctx) -> Result<(Arc<RevocationTree>, String)> {
-        let rv = self.issuer.revocations().await?;
-        let scheme = cx.scheme.clone();
-        let tree = tokio::task::spawn_blocking(move || scheme.revocation_tree(&rv.revoked)).await.map_err(|e| HolderError::Internal(e.to_string()))??;
-        let root = pop_crypto::root_to_hex(&tree.root());
-        if root != rv.root {
-            return Err(HolderError::Internal("issuer's revocation root does not match its list".into()));
+        let mut cache = self.revs.lock().await;
+        let file = self.scheme.get().map(|(_, ipk, _)| format!("revoked-{}.json", pop_crypto::fingerprint(ipk)));
+        let mut known: Vec<u64> = match (cache.as_ref(), &file) {
+            (Some(c), _) => c.revoked.clone(),
+            (None, Some(f)) => self.wallet.cache_get(f).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default(),
+            (None, None) => vec![],
+        };
+        for attempt in 0..2 {
+            let since = if attempt == 0 { (known.len() as u64 / REV_STEP) * REV_STEP } else { 0 };
+            let rv = self.issuer.revocations_since(since).await?;
+            if rv.from > known.len() as u64 || (rv.from != since && rv.total >= since) {
+                known.clear();
+                continue;
+            }
+            known.truncate(rv.from as usize);
+            known.extend_from_slice(&rv.revoked);
+            if let Some(c) = cache.as_ref() {
+                if c.root == rv.root && c.revoked == known {
+                    return Ok((c.tree.clone(), c.root.clone()));
+                }
+            }
+            let scheme = cx.scheme.clone();
+            let list = known.clone();
+            let tree = tokio::task::spawn_blocking(move || scheme.revocation_tree(&list)).await.map_err(|e| HolderError::Internal(e.to_string()))??;
+            let root = pop_crypto::root_to_hex(&tree.root());
+            if root != rv.root {
+                // a stale or damaged cache, or a list the issuer reordered: start again from nothing
+                known.clear();
+                *cache = None;
+                continue;
+            }
+            let tree = Arc::new(tree);
+            if let Some(f) = &file {
+                if let Ok(b) = serde_json::to_vec(&known) {
+                    self.wallet.cache_put(f, &b);
+                }
+            }
+            *cache = Some(RevCache { revoked: known, tree: tree.clone(), root: root.clone() });
+            return Ok((tree, root));
         }
-        Ok((Arc::new(tree), root))
+        Err(HolderError::Internal("issuer's revocation root does not match its list".into()))
     }
 
     // ------------------------------------------------------------ enrolment

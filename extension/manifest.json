@@ -3,7 +3,7 @@
   "name": "Personhood badges (prototype)",
   "version": "0.1.0",
   "description": "Shows which accounts belong to one enrolled person, and how many likes come from enrolled people. Research prototype.",
-  "permissions": ["storage"],
+  "permissions": ["storage", "unlimitedStorage"],
   "host_permissions": [
     "http://127.0.0.1/*",
     "http://localhost/*",

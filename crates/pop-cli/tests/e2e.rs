@@ -186,8 +186,51 @@ async fn directory_rejects_replays_unknown_platforms_and_bad_posts() {
     assert!(alice.like("made-up", "p1").await.is_err());
     // the directory serves the counts table without being asked about single posts
     alice.like("mockfeed", "p4").await.unwrap();
-    let t: CountsResponse = dir(d).get("/v1/likes/table?platform=mockfeed").await.unwrap();
-    assert!(t.counts["p4"] >= 1);
+    let t: CountTable = dir(d).get("/v1/likes/table?platform=mockfeed").await.unwrap();
+    assert!(t.full && t.counts["p4"] >= 1);
+}
+
+#[tokio::test]
+async fn readers_download_only_changes() {
+    let d = net().await;
+    let c = dir(d);
+    let first = c.list_since("mockfeed", 0, "").await.unwrap();
+    assert!(first.full);
+    let table: CountTable = c.get("/v1/likes/table?platform=mockfeed&since=0").await.unwrap();
+    assert!(table.full);
+
+    let erin = enrolled(d, "bob", "T-SYNC-ERIN").await;
+    let a = erin.bind("mockfeed", "bob", 2, CodePlacement::Bio).await.unwrap();
+    let delta = c.list_since("mockfeed", first.seq, &first.instance).await.unwrap();
+    assert!(!delta.full && delta.seq > first.seq);
+    assert!(delta.entries.iter().any(|e| e.nym == a.entry.nym && e.account_id == a.entry.account_id), "the new claim is in the changes");
+    assert!(delta.entries.iter().all(|e| !first.entries.contains(e)), "nothing already known is sent again");
+
+    // withdrawing is announced as a removal
+    erin.unbind("mockfeed", "bob").await.unwrap();
+    let after = c.list_since("mockfeed", delta.seq, &first.instance).await.unwrap();
+    assert!(!after.full);
+    assert!(after.gone.contains(&GoneEntry { account_id: a.entry.account_id.clone(), nym: a.entry.nym.clone() }));
+    assert!(!after.entries.iter().any(|e| e.nym == a.entry.nym));
+
+    // only changed counts come back
+    erin.like("mockfeed", "p2").await.unwrap();
+    let t2: CountTable = c.get(&format!("/v1/likes/table?platform=mockfeed&since={}&instance={}", after.seq, first.instance)).await.unwrap();
+    assert!(!t2.full && t2.counts.contains_key("p2"));
+    assert!(t2.counts.len() <= table.counts.len() + 1);
+    // a number from the future (for example from before a reset) gets the whole list
+    assert!(c.list_since("mockfeed", u64::MAX, &first.instance).await.unwrap().full);
+    // numbers from another directory's store get the whole list
+    assert!(c.list_since("mockfeed", delta.seq, "0000000000000000").await.unwrap().full);
+
+    // the issuer's revocation list comes in pieces too
+    let iss = HttpClient::new(&d.issuer_url);
+    let all = iss.revocations_since(0).await.unwrap();
+    assert_eq!(all.total as usize, all.revoked.len());
+    let tail = iss.revocations_since(all.total).await.unwrap();
+    assert!(tail.revoked.is_empty() && tail.root == all.root && tail.from == all.total);
+    let clamped = iss.revocations_since(all.total + 100).await.unwrap();
+    assert_eq!(clamped.from, clamped.total);
 }
 
 #[tokio::test]
