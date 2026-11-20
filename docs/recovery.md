@@ -181,12 +181,20 @@ the report gave, whatever has happened to it since: replacing it again with its 
 revoking it, does not end the 90 days. If it is the thief who blocks or lifts, the real person's eID is
 still not safe: they secure it and report again.
 
-**Why a week, and why the allowance stays used.** If a thief made the report, the owner is most likely
+**Why a week, and when the allowance comes back.** If a thief made the report, the owner is most likely
 active, sees the warning in their app and blocks within the week, before any of the thief's likes
 count. Likes cannot be linked to the secret that made them, so likes counted before a block stay
 counted: what a false report gains is at most the likes between the end of the week and the block.
-A block does not give the two-year allowance back, so a thief who keeps access to the eID cannot repeat
-this every month; their next reports wait 90 days and then nine months, and the owner blocks them.
+
+A block **before the replacement starts counting** gives the two-year allowance back: that secret
+never counted, so nothing was gained. This matters to an owner whose own report a thief blocked (the
+thief holding the old phone and the eID): once the owner has secured the eID, they can report again
+and be served at once (after the 30 days between replacements). A thief who reports again gains
+nothing either, because the owner blocks again before the week ends.
+
+A block **after** that day does not give the allowance back, so a thief who keeps access to the eID
+cannot get a counting secret every month by reporting from a device of their own; their next reports
+wait 90 days and then nine months, and the owner blocks them. (Osama's decision, 20 November 2026.)
 Each new secret can like every post again, so the allowance also bounds what a report about one's own
 secret gains: one more like on a post, once in two years.
 

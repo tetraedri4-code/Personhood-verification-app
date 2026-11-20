@@ -29,6 +29,10 @@ pub(crate) struct Contest {
     pub(crate) old_guardian: String,
     /// last day a block is possible
     pub(crate) until: Day,
+    /// the day the replacement starts counting, and the person's two-year allowance as it was before
+    /// it: a block before that day gives the allowance back (the replacement never counted)
+    #[serde(default)]
+    pub(crate) refund: Option<(Day, Option<Day>)>,
 }
 
 /// How long a new secret waits before it counts.
@@ -122,9 +126,16 @@ pub(crate) async fn recheck(State(s): State<St>, Json(req): Json<RecheckRequest>
     let new_handle = new_handle.map(|h| (h, s.witness.sign_handle(&mut *s.rng.lock().unwrap(), h).to_hex()));
     if let (true, Some((h, _))) = (blocking, &new_handle) {
         // The replaced secret and the eID together: the report was not the owner's. The secret it
-        // gave is revoked, the old one works again under a new handle. The two-year allowance stays
-        // used, so a thief who keeps the eID cannot repeat this every month.
+        // gave is revoked, the old one works again under a new handle. Blocked before it counted, the
+        // replacement gave nothing, and the two-year allowance comes back (an owner who blocked a
+        // thief, or whose own report a thief blocked, can use it once the eID is safe). Blocked
+        // later, it stays used, so a thief who keeps the eID cannot get a counting secret every month.
         let c = rec.contest.take().expect("blocking");
+        if let Some((counts_from, before)) = c.refund {
+            if today < counts_from {
+                rec.fresh_replacement_on = before;
+            }
+        }
         s.revoke_handle(rec.handle).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         rec.handle = *h;
         rec.guardian = c.old_guardian;
@@ -231,8 +242,10 @@ pub(crate) async fn replace(State(s): State<St>, Json(req): Json<ReplaceRequest>
             s.count_report().await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
             rec.reported_on = Some(today);
         }
-        let contest = Contest { old_handle: rec.handle, old_guardian: rec.guardian.clone(), until: today + s.cfg.policy.contest_days };
+        let mut contest = Contest { old_handle: rec.handle, old_guardian: rec.guardian.clone(), until: today + s.cfg.policy.contest_days, refund: None };
+        let before = rec.fresh_replacement_on;
         let issuance = issue_replacement(&s, &d, &mut rec, &req.blind_request, req.session.as_bytes(), &req.guardian_public_key, today, Probation::Report).await?;
+        contest.refund = Some((issuance.attrs.certified, before));
         rec.contest = Some(contest);
         crate::index::put_record(&s, &d, &rec).await?;
         drop_session(&s, &req.session, &sess).await?;

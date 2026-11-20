@@ -201,9 +201,9 @@ nothing new.
 
 Checked and found sound: a block needs a login of the same person and a proof with the replaced
 secret's own handle, against the revocation list as it was before that handle went on it; the block
-ends after 90 days and is cleared then; a block does not give back the two-year allowance, so a thief
-who keeps the eID gets one quick replacement in two years, and later ones wait and have full
-probation; reports still count once per person per 30 days. Left as is: likes counted between the end
+ends after 90 days and is cleared then; a block does not give back the two-year allowance once the replacement has counted (one made
+before then does, since nothing was gained; added 20 November), so a thief who keeps the eID gets at most
+one counting quick replacement in two years, and later ones wait and have full probation; reports still count once per person per 30 days. Left as is: likes counted between the end
 of the week and a block stay counted, because likes cannot be linked to the secret that made them.
 
 ### Review of the issuer's policy settings, 19 November 2026

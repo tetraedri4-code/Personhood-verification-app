@@ -494,6 +494,33 @@ async fn a_replacement_after_a_report_can_be_blocked_for_90_days_only() {
 }
 
 #[tokio::test]
+async fn a_block_before_the_replacement_counts_gives_the_allowance_back() {
+    let w = world(90).await;
+    let mut first = w.enrol("alice").await;
+    // a report, blocked within the week: the replacement never counted
+    let (secrets, _, r) = w.replace_with("alice", None, true).await.unwrap();
+    let ReplaceResponse::Issued { issuance } = r else { panic!() };
+    let reporter = w.finish(&secrets, &issuance);
+    w.advance(3);
+    assert!(w.today() < reporter.attrs.certified);
+    w.recheck(&mut first, "alice").await.unwrap();
+    // so the next report (after the 30 days between replacements) is served at once again
+    w.advance(31);
+    w.renew(&mut first).await.unwrap();
+    let (secrets, _, r) = w.replace_with("alice", None, true).await.unwrap();
+    let ReplaceResponse::Issued { issuance } = r else { panic!("the allowance came back") };
+    let reporter = w.finish(&secrets, &issuance);
+    // blocked once it counts: the allowance stays used
+    w.advance(14);
+    assert!(w.today() >= reporter.attrs.certified);
+    w.recheck(&mut first, "alice").await.unwrap();
+    w.advance(31);
+    w.renew(&mut first).await.unwrap();
+    let (_, _, r) = w.replace_with("alice", None, true).await.unwrap();
+    assert!(matches!(r, ReplaceResponse::Pending { suspended: true, .. }), "a late block gives nothing back");
+}
+
+#[tokio::test]
 async fn a_report_counts_quickly_only_once_in_two_years() {
     let w = world(90).await;
     let _first = w.enrol("alice").await;
