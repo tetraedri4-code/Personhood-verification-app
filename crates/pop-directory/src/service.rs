@@ -27,15 +27,17 @@ pub struct DirectoryConfig {
     /// Larger is more private and costs more data. While all posts of a platform fit in one bucket,
     /// readers download the whole table and sync only its changes instead.
     pub bucket_posts: u32,
-    /// like proofs checked together at most (docs/crypto.md); 1: each by itself
+    /// like proofs checked together at most (docs/crypto.md); 1: each by itself. The size adjusts
+    /// between `like_batch_min` and this to the recent share of false proofs.
     pub like_batch_max: usize,
+    pub like_batch_min: usize,
     /// how long the first like of a batch waits for others, in milliseconds
     pub like_batch_wait_ms: u64,
 }
 
 impl Default for DirectoryConfig {
     fn default() -> Self {
-        DirectoryConfig { clock: None, lease_days: 274, bucket_posts: 32, like_batch_max: 64, like_batch_wait_ms: 50 }
+        DirectoryConfig { clock: None, lease_days: 274, bucket_posts: 32, like_batch_max: 256, like_batch_min: 16, like_batch_wait_ms: 50 }
     }
 }
 
@@ -69,6 +71,8 @@ pub struct Directory {
     store: SharedStore,
     cfg: DirectoryConfig,
     write: tokio::sync::Mutex<()>,
+    /// held while the revocation roots are fetched from the issuer
+    roots_fetch: tokio::sync::Mutex<()>,
     buckets: RwLock<BucketIndex>,
     /// like proofs are checked in batches (started on the first like); None when like_batch_max is 1
     batcher: Option<crate::batch::Batcher>,
@@ -96,6 +100,7 @@ impl Directory {
         anyhow::ensure!((7..=3650).contains(&cfg.lease_days), "lease_days must be between 7 and 3650");
         anyhow::ensure!((1..=100_000).contains(&cfg.bucket_posts), "bucket_posts must be between 1 and 100000");
         anyhow::ensure!((1..=4096).contains(&cfg.like_batch_max), "like_batch_max must be between 1 and 4096");
+        anyhow::ensure!((1..=cfg.like_batch_max).contains(&cfg.like_batch_min), "like_batch_min must be between 1 and like_batch_max");
         anyhow::ensure!(cfg.like_batch_wait_ms <= 10_000, "like_batch_wait_ms must be at most 10000");
         let mut buckets = BucketIndex::new();
         for (k, v) in store.list(T_COUNTS).await? {
@@ -115,7 +120,7 @@ impl Directory {
         let issuer_pk = IssuerPublicKey::from_hex(&p.issuer_public_key)?;
         let witness_pk = WitnessPublicKey::from_hex(&p.witness_public_key)?;
         let batcher = (cfg.like_batch_max > 1).then(|| {
-            crate::batch::Batcher::start(scheme.clone(), issuer_pk.clone(), witness_pk.clone(), cfg.like_batch_max, std::time::Duration::from_millis(cfg.like_batch_wait_ms))
+            crate::batch::Batcher::start(scheme.clone(), issuer_pk.clone(), witness_pk.clone(), cfg.like_batch_min, cfg.like_batch_max, std::time::Duration::from_millis(cfg.like_batch_wait_ms))
         });
         Ok(Arc::new(Directory {
             scheme,
@@ -129,6 +134,7 @@ impl Directory {
             store,
             cfg,
             write: tokio::sync::Mutex::new(()),
+            roots_fetch: tokio::sync::Mutex::new(()),
             buckets: RwLock::new(buckets),
         }))
     }
@@ -211,15 +217,34 @@ impl Directory {
     async fn check_root(&self, root: &str) -> Result<(), ApiErr> {
         let known = |r: &(String, Option<String>, std::time::Instant)| r.0 == root || r.1.as_deref() == Some(root);
         let stale = || err(StatusCode::CONFLICT, "stale revocation root; fetch the issuer's /v1/revocations and prove again");
+        // ask the issuer again, but not more than every few seconds whatever proofs arrive. A root newer
+        // than the last fetch waits for the next one instead of being refused: a holder who fetched
+        // right after a revocation is ahead of the directory, not behind it.
+        const MIN_GAP: std::time::Duration = std::time::Duration::from_secs(2);
+        for attempt in 0..2 {
+            let wait = {
+                let r = self.roots.read().unwrap();
+                let age = r.2.elapsed();
+                if age < Self::ROOTS_TTL && known(&r) {
+                    return Ok(());
+                }
+                MIN_GAP.saturating_sub(age)
+            };
+            if wait.is_zero() {
+                break;
+            }
+            if attempt == 1 {
+                // another request refreshed meanwhile and the root is still unknown
+                return Err(stale());
+            }
+            tokio::time::sleep(wait).await;
+        }
+        // one fetch at a time: requests that waited together do not all ask the issuer
+        let _f = self.roots_fetch.lock().await;
         {
             let r = self.roots.read().unwrap();
-            let age = r.2.elapsed();
-            if age < Self::ROOTS_TTL && known(&r) {
-                return Ok(());
-            }
-            // ask the issuer again, but not more than every few seconds whatever proofs arrive
-            if age < std::time::Duration::from_secs(2) {
-                return Err(stale());
+            if r.2.elapsed() < MIN_GAP {
+                return if known(&r) { Ok(()) } else { Err(stale()) };
             }
         }
         let rv = self.issuer_api.revocations().await.map_err(|e| err(StatusCode::BAD_GATEWAY, e.to_string()))?;

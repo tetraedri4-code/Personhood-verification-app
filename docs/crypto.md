@@ -60,8 +60,11 @@ people). The fix is a multi-party ceremony per statement, or Bulletproofs.
 ## Checking many like proofs at once
 
 The directory checks like proofs in batches: likes that arrive within `like_batch_wait_ms` (default
-50 ms) of the first, up to `like_batch_max` (default 64), are checked together (`pop directory
---like-batch-max`, `--like-batch-wait-ms`; 1 checks each alone). `Scheme::verify_likes` accepts a batch
+50 ms) of the first, up to the current batch size, are checked together. The size follows the share f of
+false proofs among about the last 4,096 checked: about 0.3 / f, a power of two between `like_batch_min`
+(default 16) and `like_batch_max` (default 256), so the largest while almost everything is valid and
+smaller during a campaign of false proofs (see "Batch size" below; `pop directory --like-batch-min`,
+`--like-batch-max`, `--like-batch-wait-ms`; a largest of 1 checks each alone). `Scheme::verify_likes` accepts a batch
 only if every proof would pass `verify_like`; `Scheme::sieve_likes`, which the directory uses, says which
 ones are valid, checking halves of a failed batch (binary search) so that false proofs cannot sink the
 true ones they arrived with. Halving costs about n (log2 m + 2) proofs' worth of combined checks for m
@@ -116,7 +119,8 @@ over 256):
 With a share f of false proofs, a batch of b holds about f·b of them (Poisson). Weighting the rows that
 way (an estimate from the table; 3 or more false per batch was not measured): at f = 0.1% sizes 64 to 256
 all cost about 3.8 ms per LegoGroth16 proof; at f = 1% size 32 is best at about 5.0 ms, 64 gives about
-5.4 and 256 about 7 or more. The default, 64, is close to the best in both cases.
+5.4 and 256 about 7 or more. A batch is cheapest when it holds about a third of a false proof on
+average, which is what the directory aims for (`FalseShare` in crates/pop-directory/src/batch.rs).
 
 ## Adding a third proof system
 
