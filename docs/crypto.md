@@ -97,6 +97,27 @@ had to stay per proof. The false proofs in the last columns are well formed (a c
 issuer), so only the combined check sees them; with 4 among 512, the budget falls back to one-by-one
 checks.
 
+### Batch size
+
+The directory's check (`sieve_likes`) per proof, by batch size, with 0, 1 or 2 well-formed false proofs
+in every batch (`cargo test --release -p pop-crypto --test batch measure_batch_sizes -- --ignored
+--nocapture --test-threads 1`, 20 November 2026, one core; LegoGroth16 over 512 proofs, Bulletproofs
+over 256):
+
+| Batch | LegoGroth16 0 / 1 / 2 false | Bulletproofs 0 / 1 / 2 false |
+|---|---|---|
+| alone | 9.2 ms | 178 ms |
+| 16 | 4.4 / 9.0 / 11.7 ms | 38 / 65 / 82 ms |
+| 32 | 3.8 / 8.0 / 9.9 ms | 34 / 52 / 70 ms |
+| 64 | 3.5 / 7.0 / 8.6 ms | 32 / 44 / 61 ms |
+| 128 | 3.5 / 5.9 / 7.7 ms | 32 / 37 / 55 ms |
+| 256 | 3.2 / 5.4 / 7.0 ms | 33 / 34 / 51 ms |
+
+With a share f of false proofs, a batch of b holds about f·b of them (Poisson). Weighting the rows that
+way (an estimate from the table; 3 or more false per batch was not measured): at f = 0.1% sizes 64 to 256
+all cost about 3.8 ms per LegoGroth16 proof; at f = 1% size 32 is best at about 5.0 ms, 64 gives about
+5.4 and 256 about 7 or more. The default, 64, is close to the best in both cases.
+
 ## Adding a third proof system
 
 The seam is the `Backend` enum in `statement.rs`: `prove` and `verify` match on it in two places each

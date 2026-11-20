@@ -201,3 +201,53 @@ fn measure_batch_lego() {
 fn measure_batch_bulletproofs() {
     measure(ProofSystem::Bulletproofs, 128, &[1, 4, 16, 64, 128]);
 }
+
+/// Per-proof cost of the directory's check (sieve) by batch size, with 0, 1 or 2 false proofs in every
+/// batch (well formed: another issuer's credential, so only the combined check sees them).
+fn measure_sizes(ps: ProofSystem, n: usize, sizes: &[usize]) {
+    let mut rng = ChaCha20Rng::seed_from_u64(11);
+    let w = world(ps, 8, &mut rng);
+    let tree = w.scheme.revocation_tree(&[5, 1 << 50]).unwrap();
+    let vc = VerifyCtx { issuer: &w.ik.public, witness: &w.wk.public, today: TODAY, revocation_root: tree.root() };
+    let ls = likes(&w, &mut rng, 8, n, &tree);
+    let items: Vec<(&str, &str, &LikeProof)> = ls.iter().map(|(p, l)| (CTX, p.as_str(), l)).collect();
+    let fposts: Vec<String> = (0..2).map(|k| format!("forged-{k}")).collect();
+    let forg: Vec<LikeProof> = fposts.iter().map(|p| forged(&w, &mut rng, &tree, p)).collect();
+    let t = Instant::now();
+    for (c, p, l) in &items {
+        w.scheme.verify_like(&vc, TODAY, c, p, l).unwrap();
+    }
+    eprintln!("{ps:?}: one by one {:.2} ms per proof", t.elapsed().as_secs_f64() * 1000.0 / n as f64);
+    for &b in sizes {
+        let mut line = format!("{ps:?}: batch {b:>3}:");
+        for m in 0..=2usize {
+            let mut total = 0.0;
+            let mut done = 0;
+            while done + b <= n {
+                let mut batch = items[done..done + b].to_vec();
+                for k in 0..m {
+                    batch[(k * b) / 2 + b / 4] = (CTX, fposts[k].as_str(), &forg[k]);
+                }
+                let t = Instant::now();
+                let flags = w.scheme.sieve_likes(&mut rng, &vc, TODAY, &batch).unwrap();
+                total += t.elapsed().as_secs_f64();
+                assert_eq!(flags.iter().filter(|f| !**f).count(), m);
+                done += b;
+            }
+            line += &format!("  {m} false: {:.2} ms", total * 1000.0 / done as f64);
+        }
+        eprintln!("{line}");
+    }
+}
+
+#[test]
+#[ignore]
+fn measure_batch_sizes_lego() {
+    measure_sizes(ProofSystem::LegoGroth16, 512, &[16, 32, 64, 128, 256]);
+}
+
+#[test]
+#[ignore]
+fn measure_batch_sizes_bulletproofs() {
+    measure_sizes(ProofSystem::Bulletproofs, 256, &[16, 32, 64, 128, 256]);
+}
