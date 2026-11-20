@@ -53,6 +53,17 @@ Almost all of it is the uploaded like proofs: about 3 kB each in bodies, 4 to 5 
 who reports no likes uses under 150 kB a year after the first day. The rough column is an estimate of
 HTTP and TLS overhead, not a measurement.
 
+**How many likes is that?** Ten a day is about average, not generous. Companies' own totals divided by
+their daily users give 6 to 14 likes per daily user a day: Instagram 4.2 billion likes a day with
+300 million daily users in 2016 ([Adweek](https://www.adweek.com/digital/instagram-500-million-monthly-active-users-300-million-daily-active-users/)),
+Facebook over 4.5 billion like clicks a day ([Webrazzi, reporting Facebook's "A Focus on Efficiency"](https://webrazzi.com/2013/09/17/facebookun-begen-dugmesine-her-gun-4-5-milyar-kez-tikliyoruz))
+with 728 million daily users in September 2013 ([10-Q](https://www.sec.gov/Archives/edgar/data/0001326801/000132680113000031/fb-9302013x10q.htm)).
+These include likes by bots and fake accounts, so they overstate a real person's average. Facebook's
+logs of 269 consenting users in 2010 showed 14 likes a month on average, and nearly 5% over 100 a
+month ([Pew](https://www.pewresearch.org/internet/2012/02/03/part-2-facebook-activity/)): heavy users
+like several times the average. Applying that ratio to Instagram gives roughly 100 likes a day for a
+heavy user (an extrapolation): about 110 MB a year in bodies, and about 70 s of proving a day on a desktop.
+
 ## The browser extension
 
 The extension shows badges and counts for every account and post on a page, without telling the
