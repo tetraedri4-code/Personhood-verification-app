@@ -20,6 +20,13 @@ What it does:
 - **Verified like counts.** When you like a post, your app can report a tag that is unique per person
   and post. One person counts once however many accounts they have, and tags for different posts
   cannot be linked.
+- **Stolen identities.** A first enrolment counts at once. If someone enrolled with your eID before
+  you, your enrolment is refused and the app sends you to [sourced instructions for securing your
+  eID](docs/reset-eid/README.md) (every EU state, in English and its official languages). Then you report "it
+  wasn't me": the other secret is revoked at once and you get a new one that counts after a week
+  (the other side can block it for 90 days with its app and your eID), and when many such reports come in, recent
+  enrolments stop counting for a while ([recovery.md](docs/recovery.md) §4; a proposed change to the
+  design, not yet folded into it).
 
 ## Try it
 
@@ -31,8 +38,10 @@ cargo run --release -p pop-cli -- demo
 
 The first start takes about a minute (proof-system setup), then prints a walk-through: enrolment, a
 refused second enrolment, binding, a like farm of 40 bots against 1 verified like, an impostor copying
-a code, blind renewal, and the uniqueness operators refreshing their key shares and replacing one of
-their number while Alice stays recognised. The services keep running:
+a code, blind renewal, the uniqueness operators refreshing their key shares and replacing one of
+their number while Alice stays recognised, the two-year identity re-check, a backup restored on a new
+device with a paper code, a lost secret being replaced, and a person reporting that someone enrolled
+with their eID. The services keep running:
 
 | Service | Address |
 |---|---|
@@ -40,7 +49,8 @@ their number while Alice stays recognised. The services keep running:
 | Mock identity provider | http://127.0.0.1:4001 |
 | Issuer | http://127.0.0.1:4002 |
 | Directory | http://127.0.0.1:4003 |
-| Alice's holder app (for the extension) | http://127.0.0.1:4010 |
+| Relay (Oblivious HTTP); the demo's holders and the extension's test go through it | http://127.0.0.1:4004/issuer, /directory |
+| Alice's holder app (for the extension); eID help at `/help/reset-eid` | http://127.0.0.1:4010 |
 | Uniqueness operators (three with a share, one standby) | four free ports, printed at start |
 
 ![The mock feed with the extension: badges on two accounts, 40 likes but 1 verified on the farmed post](docs/img/mockfeed-with-extension.png)
@@ -55,8 +65,14 @@ Step by step instead of the scripted demo:
 pop devnet                                   # terminal 1: the four services
 pop holder enrol                             # terminal 2: opens the mock bank ID in your browser
 pop holder --mockfeed-url http://127.0.0.1:4000 --mockfeed-as alice bind mockfeed alice
-pop holder --mockfeed-url http://127.0.0.1:4000 like mockfeed p3
+pop holder --mockfeed-url http://127.0.0.1:4000 like mockfeed p3   # sent at a random moment of the next window
 pop holder serve                             # local API for the extension
+pop holder recheck                           # the two-year identity re-check
+pop holder backup                            # encrypted backup; prints a paper code
+pop holder restore                           # on a new device: asks for the paper code
+pop holder replace                           # lost or stolen secret: a new one after an eID login
+pop holder replace --not-me                  # someone else enrolled with your eID: report it
+pop holder veto                              # refuse a replacement, or lift a suspension
 ```
 
 (`pop` is `cargo run --release -p pop-cli --`.)
@@ -76,8 +92,9 @@ The directory must be started with `--bluesky` to accept Bluesky bindings.
 
 ```sh
 cargo test --release --workspace             # crypto, adapters, servers, end-to-end, security checks
-POP_PAIRING_TOKEN=0123456789abcdef0123 pop demo &
+POP_PAIRING_TOKEN=0123456789abcdef0123 pop demo --like-window-secs 2 &   # add --bucket-posts 1 for bucket mode
 POP_PAIRING_TOKEN=0123456789abcdef0123 node extension/test/e2e.mjs   # extension in a real Chromium
+node extension/test/ohttp.mjs                # the extension's relay client against the Rust gateway
 cargo audit                                  # dependency advisories
 ```
 
@@ -97,6 +114,8 @@ crates/
   pop-platform-bluesky    platform adapter: Bluesky
   pop-mock-idp            local mock identity provider (OpenID Connect)
   pop-mockfeed            local mock social network
+  pop-ohttp               Oblivious HTTP: gateway in front of a server, relay, client transport
+  pop-mailbox             mailbox for likes from a paired computer without the app (uses: Store)
   pop-cli                 the `pop` command; the only crate that knows all the others
 extension/                browser extension (Manifest V3), one adapter file per platform
 docs/                     how to replace each mock with the real thing
@@ -112,6 +131,10 @@ No part depends on another part's implementation, only on the interfaces in `pop
 | Use a real identity provider (bank ID broker, EUDI wallet) | [docs/real-identity-provider.md](docs/real-identity-provider.md) |
 | Run real servers and storage | [docs/real-servers.md](docs/real-servers.md) |
 | Share the uniqueness key among operators, refresh it, rotate it | [docs/uniqueness.md](docs/uniqueness.md) |
+| Understand the two-year re-check, backups and replacing a lost secret | [docs/recovery.md](docs/recovery.md) |
 | Add a platform | [docs/adding-a-platform.md](docs/adding-a-platform.md) |
 | Change the proof system or understand the cryptography | [docs/crypto.md](docs/crypto.md) |
+| Hide holders' addresses from the servers with a relay | [docs/relay.md](docs/relay.md) |
+| Like from a computer without the app (library computer): pairing words, mailbox, approval | [docs/pairing.md](docs/pairing.md) |
+| Know how much data the app uses | [docs/data-usage.md](docs/data-usage.md) |
 | Know what was checked and what is still unsafe | [docs/security.md](docs/security.md) |

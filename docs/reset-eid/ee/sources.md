@@ -1,0 +1,5 @@
+- id.ee, what to do if an ID card or other digital document is lost or stolen: https://www.id.ee/en/article/what-to-do-if-an-id-card-or-other-digital-document-is-lost-or-stolen-3/
+- id.ee, suspending Mobile-ID certificates: https://www.id.ee/en/article/suspending-mobile-id-certificates/
+- id.ee, ID card: https://www.id.ee/en/id-card/
+- Smart-ID, phone stolen or lost: https://www.smart-id.com/help/faq/closing-the-account/phone-got-stolen-lost/
+- Smart-ID customer service: https://www.smart-id.com/help/customer-service/

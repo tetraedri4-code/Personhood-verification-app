@@ -1,0 +1,4 @@
+- Federal Police, Loss or theft of your Belgian identity document: https://www.police.be/shape/en/questions/lost-or-stolen/loss-or-theft-of-your-belgian-identity-document
+- Police, DOC STOP: https://www.police.be/5283/contact/numeros-durgence/doc-stop
+- IBZ, Loss or theft of identity cards or passports: https://ibz.be/en/node/2283
+- itsme help: https://www.itsme-id.com/help

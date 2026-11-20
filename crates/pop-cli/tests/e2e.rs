@@ -22,9 +22,11 @@ async fn net() -> &'static Devnet {
                 let d = devnet::start(DevnetOpts {
                     scheme: SchemeConfig { proof_system: ProofSystem::LegoGroth16, tree_depth: 4, slots: 3, bp_gens_log2: 13 },
                     data_dir: None,
-                    ports: [0; 4],
-                    rollout: true,
+                    ports: [0; 5],
                     uniqueness: devnet::UniquenessMode::Hmac,
+                    replace_wait_days: None,
+                    bucket_posts: None,
+                    like_window_secs: Some(1),
                 })
                 .await
                 .unwrap();
@@ -39,7 +41,8 @@ async fn net() -> &'static Devnet {
 
 fn holder(d: &Devnet, as_handle: &str) -> Holder {
     let p = wiring::platforms(&PlatformOpts { mockfeed_url: Some(d.feed_url.clone()), mockfeed_as: Some(as_handle.into()), ..Default::default() });
-    wiring::build_holder(&d.issuer_url, &d.directory_url, p, Arc::new(MemoryWallet::default()))
+    // every holder of these tests sends its requests through the devnet's Oblivious HTTP relay
+    wiring::build_holder_via(&d.issuer_url, &d.directory_url, &d.relays(), p, Arc::new(MemoryWallet::default())).unwrap()
 }
 
 async fn enrolled(d: &Devnet, as_handle: &str, id: &str) -> Holder {
@@ -70,7 +73,7 @@ async fn full_flow() {
     // binding publishes the code and the directory sees it
     let out = alice.bind("mockfeed", "@alice", 1, CodePlacement::Bio).await.unwrap();
     assert!(out.code_published);
-    assert!(out.entry.counted, "rollout window: counted at once");
+    assert!(out.entry.counted, "a first enrolment counts at once");
     assert!(out.entry.code_seen_on.is_some());
     let list = dir(d).list("mockfeed").await.unwrap();
     assert!(list.entries.iter().any(|e| e.handle == "alice" && e.code == out.entry.code));
@@ -148,7 +151,7 @@ async fn the_redirect_state_is_not_the_session() {
     // whoever sees the redirect (the identity provider, browser history) must not be able to finish
     let d = net().await;
     let issuer = HttpClient::new(&d.issuer_url);
-    let r = IssuerApi::enrol_start(&issuer).await.unwrap();
+    let r = IssuerApi::enrol_start(&issuer, Purpose::Enrol).await.unwrap();
     let state = reqwest::Url::parse(&r.authorize_url).unwrap().query_pairs().find(|(k, _)| k == "state").unwrap().1.to_string();
     assert_ne!(state, r.session);
     let e = issuer.enrol_status(&state).await.unwrap_err();
@@ -185,14 +188,58 @@ async fn directory_rejects_replays_unknown_platforms_and_bad_posts() {
     assert!(alice.like("made-up", "p1").await.is_err());
     // the directory serves the counts table without being asked about single posts
     alice.like("mockfeed", "p4").await.unwrap();
-    let t: CountsResponse = dir(d).get("/v1/likes/table?platform=mockfeed").await.unwrap();
-    assert!(t.counts["p4"] >= 1);
+    let t: CountTable = dir(d).get("/v1/likes/table?platform=mockfeed").await.unwrap();
+    assert!(t.full && t.counts["p4"] >= 1);
+}
+
+#[tokio::test]
+async fn readers_download_only_changes() {
+    let d = net().await;
+    let c = dir(d);
+    let first = c.list_since("mockfeed", 0, "").await.unwrap();
+    assert!(first.full);
+    let table: CountTable = c.get("/v1/likes/table?platform=mockfeed&since=0").await.unwrap();
+    assert!(table.full);
+
+    let erin = enrolled(d, "bob", "T-SYNC-ERIN").await;
+    let a = erin.bind("mockfeed", "bob", 2, CodePlacement::Bio).await.unwrap();
+    let delta = c.list_since("mockfeed", first.seq, &first.instance).await.unwrap();
+    assert!(!delta.full && delta.seq > first.seq);
+    assert!(delta.entries.iter().any(|e| e.nym == a.entry.nym && e.account_id == a.entry.account_id), "the new claim is in the changes");
+    assert!(delta.entries.iter().all(|e| !first.entries.contains(e)), "nothing already known is sent again");
+
+    // withdrawing is announced as a removal
+    erin.unbind("mockfeed", "bob").await.unwrap();
+    let after = c.list_since("mockfeed", delta.seq, &first.instance).await.unwrap();
+    assert!(!after.full);
+    assert!(after.gone.contains(&GoneEntry { account_id: a.entry.account_id.clone(), nym: a.entry.nym.clone() }));
+    assert!(!after.entries.iter().any(|e| e.nym == a.entry.nym));
+
+    // only changed counts come back
+    erin.like("mockfeed", "p2").await.unwrap();
+    let t2: CountTable = c.get(&format!("/v1/likes/table?platform=mockfeed&since={}&instance={}", after.seq, first.instance)).await.unwrap();
+    assert!(!t2.full && t2.counts.contains_key("p2"));
+    assert!(t2.counts.len() <= table.counts.len() + 1);
+    // a number from the future (for example from before a reset) gets the whole list
+    assert!(c.list_since("mockfeed", u64::MAX, &first.instance).await.unwrap().full);
+    // numbers from another directory's store get the whole list
+    assert!(c.list_since("mockfeed", delta.seq, "0000000000000000").await.unwrap().full);
+
+    // the issuer's revocation list comes in pieces too
+    let iss = HttpClient::new(&d.issuer_url);
+    let all = iss.revocations_since(0).await.unwrap();
+    assert_eq!(all.total as usize, all.revoked.len());
+    let tail = iss.revocations_since(all.total).await.unwrap();
+    assert!(tail.revoked.is_empty() && tail.root == all.root && tail.from == all.total);
+    let clamped = iss.revocations_since(all.total + 100).await.unwrap();
+    assert_eq!(clamped.from, clamped.total);
 }
 
 #[tokio::test]
 async fn holder_local_api_needs_the_pairing_token() {
     let d = net().await;
     let h = Arc::new(enrolled(d, "alice", "T-LOCAL-1").await);
+    let h2 = h.clone();
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", l.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(l, pop_holder::local_api::router(h, "correct-token-0123".into())).await.unwrap() });
@@ -214,6 +261,15 @@ async fn holder_local_api_needs_the_pairing_token() {
     assert!(r.headers().get("access-control-allow-origin").is_none());
     let r = c.post(format!("{base}/v1/like")).header("x-pop-token", "correct-token-0123").json(&body).send().await.unwrap();
     assert_eq!(r.status(), 200);
+    // the like is queued, then proved and sent after a random wait (at most 2 s in this devnet)
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(v["queued"], true);
+    assert!(h2.has_liked("mockfeed", "p3"), "a queued like counts as liked for the person at once");
+    assert!(h2.queued_likes() <= 1);
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    // sent: out of the queue and still liked (a like the directory refused would be neither)
+    assert_eq!(h2.queued_likes(), 0);
+    assert!(h2.has_liked("mockfeed", "p3"), "the queued like reached the directory");
 }
 
 #[tokio::test]
@@ -231,4 +287,323 @@ async fn a_false_claim_cannot_remove_someone_elses_badge() {
     let claims: Vec<_> = list.entries.iter().filter(|e| e.handle == "carol").collect();
     assert!(claims.iter().any(|e| e.code == real.entry.code && e.code_seen_on.is_some()), "Carol's confirmed claim is still there");
     assert!(claims.iter().any(|e| e.code == fake.entry.code && e.code_seen_on.is_none()));
+}
+
+#[tokio::test]
+async fn recheck_backup_and_restore_keep_the_same_person() {
+    let d = net().await;
+    let phone = enrolled(d, "carol", "T-BACKUP-1").await;
+    let out = phone.bind("mockfeed", "carol", 2, CodePlacement::Bio).await.unwrap();
+
+    // the two-year re-check: a new login, the same secret, the same code on the account
+    let url = phone.recheck_start().await.unwrap();
+    let code = devnet::mock_login(&url, "T-BACKUP-1").await.unwrap();
+    phone.recheck_finish(&code).await.unwrap();
+    assert_eq!(phone.bind("mockfeed", "carol", 2, CodePlacement::Bio).await.unwrap().entry.code, out.entry.code);
+    // someone else's login does not re-check this credential
+    let _other = enrolled(d, "bob", "T-BACKUP-2").await;
+    let url = phone.recheck_start().await.unwrap();
+    let code = devnet::mock_login(&url, "T-BACKUP-2").await.unwrap();
+    match phone.recheck_finish(&code).await {
+        Err(HolderError::Api(e)) => assert_eq!(status(&e), 403, "{e}"),
+        other => panic!("re-check with another person's login: {other:?}"),
+    }
+
+    let code = phone.backup_create().await.unwrap();
+    assert_eq!(code.replace('-', "").len(), 26);
+    assert!(phone.status().unwrap().backup);
+
+    // a new device with the paper code: same secret, so the same pseudonym and code
+    let tablet = holder(d, "carol");
+    assert!(matches!(tablet.restore("AAAAA-AAAAA-AAAAA-AAAAA-AAAAA-A").await, Err(HolderError::NoBackup)));
+    assert!(matches!(tablet.restore("not a code").await, Err(HolderError::NoBackup)));
+    tablet.restore(&code.to_lowercase().replace('-', " ")).await.unwrap();
+    let st = tablet.status().unwrap();
+    assert!(st.enrolled && st.bindings.len() == 1 && st.bindings[0].code == out.entry.code);
+    tablet.renew().await.unwrap();
+    assert_eq!(tablet.bind("mockfeed", "carol", 2, CodePlacement::Bio).await.unwrap().entry.code, out.entry.code);
+    // restoring onto a device that has a credential is refused
+    assert!(matches!(phone.restore(&code).await, Err(HolderError::AlreadyEnrolled)));
+
+    // Binding an account does not touch the backup (its host must not see when a known person
+    // binds); the new binding reaches the backup with the next renewal.
+    phone.bind("mockfeed", "bob", 3, CodePlacement::Bio).await.unwrap();
+    let probe = holder(d, "carol");
+    probe.restore(&code).await.unwrap();
+    assert_eq!(probe.status().unwrap().bindings.len(), 1);
+    phone.renew().await.unwrap();
+    let probe = holder(d, "carol");
+    probe.restore(&code).await.unwrap();
+    assert_eq!(probe.status().unwrap().bindings.len(), 2);
+
+    // a new code replaces the old one
+    let code2 = phone.backup_create().await.unwrap();
+    assert_ne!(code, code2);
+    assert!(matches!(holder(d, "carol").restore(&code).await, Err(HolderError::NoBackup)));
+    holder(d, "carol").restore(&code2).await.unwrap();
+
+    // revoking deletes the backup: there is nothing left to restore
+    phone.revoke().await.unwrap();
+    assert!(matches!(holder(d, "carol").restore(&code2).await, Err(HolderError::NoBackup)));
+}
+
+#[tokio::test]
+async fn replacing_the_secret() {
+    let d = net().await;
+    let phone = enrolled(d, "alice", "T-REPLACE-1").await;
+    phone.like("mockfeed", "p1").await.unwrap();
+
+    // a new device has only the eID: the request waits, and the old app sees it and refuses
+    let thief = holder(d, "bob");
+    let url = thief.replace_start().await.unwrap();
+    let code = devnet::mock_login(&url, "T-REPLACE-1").await.unwrap();
+    assert!(matches!(thief.replace_finish(&code, false).await.unwrap(), pop_holder::ReplaceOutcome::Waiting { .. }));
+    assert!(thief.status().unwrap().replacement_waits_until.is_some());
+    assert!(matches!(thief.replace_claim().await, Err(HolderError::ClaimTooEarly(_))));
+    assert!(phone.pending_replacement().await.unwrap().is_some(), "the old app is warned");
+    let stranger = enrolled(d, "carol", "T-REPLACE-2").await;
+    assert!(stranger.pending_replacement().await.unwrap().is_none(), "nobody else is");
+    // she refuses with a re-check: her eID and the old secret together
+    let url = phone.recheck_start().await.unwrap();
+    let code = devnet::mock_login(&url, "T-REPLACE-1").await.unwrap();
+    phone.recheck_finish(&code).await.unwrap();
+    assert!(phone.pending_replacement().await.unwrap().is_none());
+    assert!(thief.replace_claim().await.is_err());
+    // the old secret was never touched
+    phone.renew().await.unwrap();
+
+    // the device that holds the guardian key replaces at once; the new secret starts probation
+    let url = phone.replace_start().await.unwrap();
+    let code = devnet::mock_login(&url, "T-REPLACE-1").await.unwrap();
+    assert!(matches!(phone.replace_finish(&code, false).await.unwrap(), pop_holder::ReplaceOutcome::Issued { .. }));
+    assert!(matches!(phone.like("mockfeed", "p1").await, Err(HolderError::Probation(_))));
+    let out = phone.bind("mockfeed", "alice", 1, CodePlacement::Bio).await.unwrap();
+    assert!(!out.entry.counted, "a replaced secret is not counted");
+    phone.renew().await.unwrap();
+    // a person with no enrolment cannot replace anything
+    let nobody = holder(d, "bob");
+    let url = nobody.replace_start().await.unwrap();
+    let code = devnet::mock_login(&url, "T-REPLACE-NOBODY").await.unwrap();
+    assert!(matches!(nobody.replace_finish(&code, false).await, Err(HolderError::EnrolNotReady(EnrolStatus::NotEnrolled))));
+}
+
+#[tokio::test]
+async fn it_wasnt_me_replaces_at_once_and_the_old_app_can_block_it() {
+    let d = net().await;
+    let thief = enrolled(d, "bob", "T-THEFT-1").await;
+    thief.like("mockfeed", "p2").await.unwrap();
+    // the real person's enrolment is refused, and they report it
+    let me = holder(d, "carol");
+    let url = me.enrol_start().await.unwrap();
+    let code = devnet::mock_login(&url, "T-THEFT-1").await.unwrap();
+    assert!(matches!(me.enrol_finish(&code).await, Err(HolderError::EnrolNotReady(EnrolStatus::AlreadyEnrolled))));
+    let url = me.replace_start().await.unwrap();
+    let code = devnet::mock_login(&url, "T-THEFT-1").await.unwrap();
+    // the first report in two years is served at once, and counts after a week
+    assert!(matches!(me.replace_finish(&code, true).await.unwrap(), pop_holder::ReplaceOutcome::Issued { .. }));
+    assert!(!me.suspended().await.unwrap());
+    assert!(me.like("mockfeed", "p2").await.is_err(), "no likes in the first week");
+    // the thief's app sees the suspension, and its likes and badges stop
+    assert!(thief.suspended().await.unwrap());
+    assert!(thief.like("mockfeed", "p3").await.is_err());
+    // whoever has the old secret and the eID blocks the replacement (here the thief: the eID was
+    // not secured). The reporter's secret is revoked.
+    let url = thief.recheck_start().await.unwrap();
+    let code = devnet::mock_login(&url, "T-THEFT-1").await.unwrap();
+    thief.recheck_finish(&code).await.unwrap();
+    assert!(!thief.suspended().await.unwrap());
+    thief.like("mockfeed", "p3").await.unwrap();
+    assert!(me.suspended().await.unwrap());
+    // one report this week, published
+    let r = HttpClient::new(&d.issuer_url).reports().await.unwrap();
+    assert!(r.weeks.last().unwrap().1 >= 1);
+}
+
+#[tokio::test]
+async fn the_help_page_is_public_and_the_directory_checks_the_alarm() {
+    let d = net().await;
+    let h = Arc::new(enrolled(d, "alice", "T-HELP-1").await);
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, pop_holder::local_api::router(h, "correct-token-0123".into())).await.unwrap() });
+    let r = reqwest::get(format!("{base}{}", pop_holder::RESET_EID_PATH)).await.unwrap();
+    assert_eq!(r.status(), 200);
+    let csp = r.headers().get("content-security-policy").unwrap().to_str().unwrap().to_string();
+    assert!(csp.contains("default-src 'none'"));
+    let body = r.text().await.unwrap();
+    assert!(body.contains("<datalist id=countries>") && body.contains("Finland (Suomi)"), "the index offers the searchable list");
+    // picking a country redirects to its page, keeping the chosen language when the page has it
+    let nf = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let r = nf.get(format!("{base}{}?lang=en&country=Finland+%28Suomi%29", pop_holder::RESET_EID_PATH)).send().await.unwrap();
+    assert!(r.status().is_redirection());
+    assert_eq!(r.headers()["location"], "/help/reset-eid/fi?lang=en");
+    let r = nf.get(format!("{base}{}?country=%3Cscript%3E", pop_holder::RESET_EID_PATH)).send().await.unwrap();
+    let body = r.text().await.unwrap();
+    assert!(body.contains("role=alert") && !body.contains("<script>"), "an unknown country is not echoed");
+    // a country page defaults to the country's main language, and English is offered
+    let body = reqwest::get(format!("{base}{}/fi", pop_holder::RESET_EID_PATH)).await.unwrap().text().await.unwrap();
+    assert!(body.contains("<html lang=fi>") && body.contains("617/2009") && body.contains("hreflang=en"));
+    let body = reqwest::get(format!("{base}{}/fi?lang=en", pop_holder::RESET_EID_PATH)).await.unwrap().text().await.unwrap();
+    assert!(body.contains("<html lang=en>") && body.contains("<table>"));
+    assert_eq!(reqwest::get(format!("{base}{}/xx", pop_holder::RESET_EID_PATH)).await.unwrap().status(), 404);
+
+    // a proof made against a cutoff the directory does not know is refused before it is checked
+    let alice = enrolled(d, "dailytruth", "T-HELP-2").await;
+    alice.bind("mockfeed", "dailytruth", 1, CodePlacement::Bio).await.unwrap();
+    let recs: Vec<BindingRecord> = dir(d).get("/v1/bindings/mockfeed/u4").await.unwrap();
+    let mut req = recs.into_iter().last().unwrap().request;
+    req.alarm_cutoff = Some(1);
+    req.nonce = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into();
+    assert_eq!(status(&dir(d).bind(&req).await.unwrap_err()), 409);
+}
+
+#[tokio::test]
+async fn count_buckets_partition_the_table() {
+    let d = net().await;
+    let alice = enrolled(d, "alice", "T-BUCKET-1").await;
+    alice.like("mockfeed", "p1").await.unwrap();
+    alice.like("mockfeed", "p4").await.unwrap();
+    let c = dir(d);
+    let bits: serde_json::Value = c.get("/v1/likes/buckets?platform=mockfeed").await.unwrap();
+    assert!(bits["bits"].as_u64().unwrap() <= 20);
+    // the four buckets at 2 bits hold exactly the table, each post in the bucket of its hash
+    let r: serde_json::Value = c.post("/v1/likes/buckets", &serde_json::json!({"platform": "mockfeed", "bits": 2, "buckets": [0, 1, 2, 3]})).await.unwrap();
+    let mut seen = std::collections::BTreeMap::new();
+    for (b, m) in r["buckets"].as_object().unwrap() {
+        for (post, n) in m.as_object().unwrap() {
+            assert_eq!((pop_directory::bucket_hash("mockfeed", post) >> 30).to_string(), *b);
+            seen.insert(post.clone(), n.as_u64().unwrap());
+        }
+    }
+    let table: CountTable = c.get("/v1/likes/table?platform=mockfeed").await.unwrap();
+    for (post, n) in &seen {
+        assert!(table.counts.get(post).is_some_and(|t| t >= n), "{post}");
+    }
+    assert!(seen.contains_key("p1") && seen.contains_key("p4"));
+    // one bucket only: the posts of the other buckets are not in the answer
+    let b = pop_directory::bucket_hash("mockfeed", "p1") >> 30;
+    let one: serde_json::Value = c.post("/v1/likes/buckets", &serde_json::json!({"platform": "mockfeed", "bits": 2, "buckets": [b]})).await.unwrap();
+    for post in one["buckets"][b.to_string()].as_object().unwrap().keys() {
+        assert_eq!(pop_directory::bucket_hash("mockfeed", post) >> 30, b);
+    }
+    // limits
+    for bad in [
+        serde_json::json!({"platform": "mockfeed", "bits": 21, "buckets": [0]}),
+        serde_json::json!({"platform": "mockfeed", "bits": 2, "buckets": [4]}),
+        serde_json::json!({"platform": "mockfeed", "bits": 2, "buckets": []}),
+        serde_json::json!({"platform": "mockfeed", "bits": 0, "buckets": [0, 0]}),
+        serde_json::json!({"platform": "mockfeed", "bits": 10, "buckets": (0..65).collect::<Vec<u32>>()}),
+    ] {
+        assert_eq!(status(&c.post::<_, serde_json::Value>("/v1/likes/buckets", &bad).await.unwrap_err()), 400, "{bad}");
+    }
+}
+
+#[tokio::test]
+async fn likes_checked_in_one_batch_get_each_their_own_answer() {
+    let d = net().await;
+    let alice = enrolled(d, "alice", "T-BATCH-ALICE").await;
+    let bob = enrolled(d, "bob", "T-BATCH-BOB").await;
+    alice.bind("mockfeed", "alice", 1, CodePlacement::Bio).await.unwrap();
+    // a false like: a binding proof (public in the directory's records) sent as a like proof. It is
+    // well formed, so only the combined check can refuse it, and it must not sink the true likes.
+    let recs: Vec<BindingRecord> = dir(d).get("/v1/bindings/mockfeed/u1").await.unwrap();
+    let rec = recs.into_iter().next().unwrap().request;
+    let fake = |post: &str| LikeRequest {
+        platform: "mockfeed".into(),
+        post_id: post.into(),
+        today: rec.today,
+        alarm_cutoff: rec.alarm_cutoff,
+        revocation_root: rec.revocation_root.clone(),
+        proof: pop_crypto::LikeProof { tag: rec.proof.nym.clone(), proof: rec.proof.proof.clone() },
+    };
+    let c = dir(d);
+    let (x5, x6) = (fake("p5"), fake("p6"));
+    let (a, b, f1, f2) = tokio::join!(alice.like("mockfeed", "p5"), bob.like("mockfeed", "p5"), c.like(&x5), c.like(&x6));
+    assert!(a.is_ok() && b.is_ok(), "{a:?} {b:?}");
+    assert_eq!(status(&f1.unwrap_err()), 401);
+    assert_eq!(status(&f2.unwrap_err()), 401);
+    let t: CountTable = dir(d).get("/v1/likes/table?platform=mockfeed").await.unwrap();
+    assert!(t.counts["p5"] >= 2 && !t.counts.contains_key("p6"));
+}
+
+/// A computer without the app (here: plain requests, as the extension makes them) is paired by its
+/// words; its likes wait for approval, or go out at once with `auto`.
+#[tokio::test]
+async fn a_paired_computer_leaves_likes_for_approval() {
+    use pop_protocol::mailbox::*;
+    let d = net().await;
+    let alice = Arc::new(enrolled(d, "alice", "T-PAIR-ALICE").await);
+    let computer = dir(d);
+    let now = pop_mailbox::now_ms();
+    let open = |words: String, end_ms: u64| async move {
+        let k = tokio::task::spawn_blocking(move || PairingKeys::derive(&words).unwrap()).await.unwrap();
+        MailboxApi::open(&dir(d), &OpenRequest { mailbox: k.mailbox.clone(), end_ms, tag: k.end_tag(end_ms) }).await.unwrap();
+        k
+    };
+    let leave = |k: &PairingKeys, post: &str| {
+        let (item, dh) = k.seal(&PairedLike::new("mockfeed", post, now)).unwrap();
+        DepositRequest { mailbox: k.mailbox.clone(), item, dh }
+    };
+
+    let words = generate();
+    let k = open(words.clone(), now + 3_600_000).await;
+    computer.deposit(&leave(&k, "p701")).await.unwrap();
+    computer.deposit(&leave(&k, "p702")).await.unwrap();
+    // an item not made with the words is ignored and left alone
+    let stranger = PairingKeys::derive_canonical("zoo zone zinc zero zebra youth young yogurt yoga", 10);
+    computer.deposit(&DepositRequest { mailbox: k.mailbox.clone(), ..leave(&stranger, "p709") }).await.unwrap();
+
+    // typed in capitals, with a typo after the first four letters of one word
+    let typed = words.to_uppercase().replacen(' ', "XX ", 1);
+    let p = alice.pair(&typed, Some("library"), false).await.unwrap();
+    assert!(!p.ended && !p.auto);
+    assert!(matches!(alice.pair(&words, None, false).await, Err(HolderError::Pairing(_))));
+    let inbox = alice.inbox().unwrap();
+    assert_eq!(inbox.iter().map(|i| i.post.as_str()).collect::<Vec<_>>(), ["p701", "p702"]);
+    // collected likes are deleted from the mailbox; the stranger's item stays
+    assert_eq!(MailboxApi::list(&computer, &ListRequest { mailbox: k.mailbox.clone(), after: 0 }).await.unwrap().items.len(), 1);
+
+    let r = alice.approve(&[inbox[0].id]).await.unwrap();
+    assert!(r[0].queued, "{r:?}");
+    assert_eq!(alice.reject(&[inbox[1].id]).await.unwrap(), 1);
+    assert!(alice.inbox().unwrap().is_empty());
+    while alice.queued_likes() > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    let t: CountTable = dir(d).get("/v1/likes/table?platform=mockfeed").await.unwrap();
+    assert!(t.counts.get("p701").copied().unwrap_or(0) >= 1 && !t.counts.contains_key("p702"));
+
+    // unpaired: the computer can leave no more
+    alice.unpair("library").await.unwrap();
+    assert!(alice.pairings().unwrap().is_empty());
+    assert_eq!(status(&computer.deposit(&leave(&k, "p703")).await.unwrap_err()), 410);
+
+    // words nobody paired with
+    let e = alice.pair(&generate(), None, false).await.unwrap_err();
+    assert!(e.to_string().contains("no pairing has these words"), "{e}");
+
+    // automatic: queued without asking
+    let words = generate();
+    let k = open(words.clone(), now + 3_600_000).await;
+    alice.pair(&words, Some("own laptop"), true).await.unwrap();
+    computer.deposit(&leave(&k, "p704")).await.unwrap();
+    assert_eq!(alice.collect_pairings().await.unwrap(), 1);
+    assert!(alice.inbox().unwrap().is_empty());
+    while alice.queued_likes() > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    let t: CountTable = dir(d).get("/v1/likes/table?platform=mockfeed").await.unwrap();
+    assert!(t.counts.get("p704").copied().unwrap_or(0) >= 1);
+
+    // a pairing given after its end (words from paper): what was left before the end is collected
+    // once, and the pairing is not kept
+    let words = generate();
+    let k = open(words.clone(), now + 3_600_000).await;
+    computer.deposit(&leave(&k, "p705")).await.unwrap();
+    computer.close(&CloseRequest { mailbox: k.mailbox.clone() }).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    // (the end margin keeps it a few minutes; here the close is seconds old)
+    let p = alice.pair(&words, Some("paper"), false).await.unwrap();
+    assert!(p.ended);
+    assert!(alice.inbox().unwrap().iter().any(|i| i.post == "p705" && i.from == "paper"));
 }

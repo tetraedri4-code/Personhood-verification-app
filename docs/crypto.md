@@ -9,11 +9,11 @@ Everything is in `crates/pop-crypto`. The public API is `src/scheme.rs`; the fil
 | Design v2 | Here |
 |---|---|
 | §4.1 attributes (s, δ, r, τ, γ, ℓ, c, γ0, e) on BLS12-381 | `IssuedAttrs`, `HolderSecrets`; issuer-known values checked against grids (`check_grid`) |
-| §4.2 witness signature on each handle (Pointcheval–Sanders) | `WitnessKey::sign_handle`; every proof shows knowledge of it |
+| §4.2 witness signature on each handle (Pointcheval–Sanders in the design) | **BBS** here: `WitnessKey::sign_handle`; every proof shows knowledge of it (see below) |
 | §4.3 blind issuance | `BlindRequest::new`, `Scheme::issue_blind`, `finish_issuance` |
 | §4.4 pseudonym nym = H_G("nym", P, i)^x, x = H_p("nym"; P, s, i, 0) | `prove_binding`, `verify_binding` |
 | §4.5 quarterly badge tags, proof bound to the account | same proof: four tags for the quarters the lease touches |
-| §4.5 probation question | optional term γ ≤ today − 9 months (`probation_cleared`) |
+| §4.5 probation question | γ ≤ cutoff, where γ is the Monday the secret counts from and the cutoff is today or the public alarm cutoff; optional in a binding (`probation_cleared`), required in a like (proposed change, [recovery.md §4](recovery.md)) |
 | §4.6 blind renewal | `prove_renewal`, `reissue`, `finish_renewal` |
 | §4.6 revocation: sorted Poseidon tree, a < r < b inside the circuit | `revtree.rs` builds real trees; the benchmark's gadget proves the path |
 | report §3 row 9: like tag | `prove_like`: T = H_G("like", P, post)^x, x = H_p("like"; P, s, 0, post) |
@@ -26,6 +26,14 @@ Differences from the design, chosen for the prototype:
 - δ is range-checked at renewal (δ ≤ 4), not at issuance.
 - No recovery, so no commitment C_d in the enrolment record.
 - Dates are days since 1 January 2026.
+- The witness signature on the handle is a BBS signature on the one message r, not Pointcheval–Sanders
+  (since 20 November 2026). Its showing is two G1 relations and one pairing equation, which combine
+  across a batch; a PS showing needs a commitment in the target group. What PS keeps over BBS: simple
+  non-interactive threshold signing (Coconut, NDSS 2019); threshold BBS needs an interactive protocol
+  among the signers (Doerner et al., IEEE S&P 2023). The prototype has one witness key.
+- Proofs carry the Schnorr commitments, one per linear relation, instead of the challenge (proof format
+  version 2). The verifier computes the challenge from them; this is what lets the relations of many
+  proofs be checked as one sum.
 
 ## Choosing the proof system
 
@@ -34,8 +42,8 @@ Differences from the design, chosen for the prototype:
 | | LegoGroth16 (default) | Bulletproofs |
 |---|---|---|
 | Trusted setup | yes, one per statement | none |
-| Measured in this repository's tests | binding proof 1.7 KB, like proof 1.2 KB; a binding takes about 2 s end to end in the demo | binding proof 3.7 KB, like proof 2.9 KB; slower |
-| Benchmark (server core) | prove 0.7 s, verify 9 ms, 1.2 KB | prove 6–7 s, verify 0.3 s, 3 KB |
+| Measured in this repository's tests (format of 20 November 2026) | binding proof about 2.6 KB, like proof about 1.7 KB; a binding takes about 2 s end to end in the demo | binding proof about 5.1 KB, like proof about 3.7 KB; slower |
+| Benchmark (server core) | prove 0.7 s, verify 9 to 11 ms (3.4 ms in batches), 1.2 KB before the format change | prove 6–7 s, verify 0.2 to 0.3 s (33 ms in batches), 3 KB |
 | Trust | whoever ran the setup can forge proofs | discrete logarithm only |
 
 ```sh
@@ -48,6 +56,71 @@ on each.
 **The setup is the main thing to fix before LegoGroth16 is used for real.** `Scheme::lego_setup` is run
 by the issuer alone, which can therefore forge any proof (though it still cannot link pseudonyms to
 people). The fix is a multi-party ceremony per statement, or Bulletproofs.
+
+## Checking many like proofs at once
+
+The directory checks like proofs in batches: likes that arrive within `like_batch_wait_ms` (default
+50 ms) of the first, up to the current batch size, are checked together. The size follows the share f of
+false proofs among about the last 4,096 checked: about 0.3 / f, a power of two between `like_batch_min`
+(default 16) and `like_batch_max` (default 256), so the largest while almost everything is valid and
+smaller during a campaign of false proofs (see "Batch size" below; `pop directory --like-batch-min`,
+`--like-batch-max`, `--like-batch-wait-ms`; a largest of 1 checks each alone). `Scheme::verify_likes` accepts a batch
+only if every proof would pass `verify_like`; `Scheme::sieve_likes`, which the directory uses, says which
+ones are valid, checking halves of a failed batch (binary search) so that false proofs cannot sink the
+true ones they arrived with. Halving costs about n (log2 m + 2) proofs' worth of combined checks for m
+false proofs among n; past 3n, the rest are checked one by one, so a flood of false proofs costs about
+what checking each alone would.
+
+How: each proof's challenge is computed from its commitments (a hash). Everything else is one sum over
+the batch, every equation multiplied by a random scalar, so that a false proof makes the sum non-zero
+except with probability about 2^-255:
+
+- the Schnorr relations of all proofs: one multi-scalar multiplication, with bases shared by all proofs
+  (the attribute generators, the Pedersen and LegoGroth16 bases) once;
+- the pairing equations: the credential's BBS, the witness's BBS and LegoGroth16's, in one Miller loop
+  with one final exponentiation (one pairing per proof for LegoGroth16's A, B, three for the rest);
+- Bulletproofs: one multi-scalar multiplication for all (ark-bulletproofs `batch_verify`); the circuit's
+  scalars are still computed per proof.
+
+The random scalars come from the operating system: a prover who knew them could make a false proof
+cancel out. A single proof is checked the same way, as a batch of one.
+
+Measured on 20 November 2026 on one core of the development server, like proofs at the default settings
+(tree depth 8), `cargo test --release -p pop-crypto --test batch -- --ignored --nocapture --test-threads 1`.
+Per proof:
+
+| | One by one | Batches of 16 | Batches of 64 | Largest batch | Largest, 1 false | 4 false |
+|---|---|---|---|---|---|---|
+| LegoGroth16 (largest 256; with false ones, 512) | 9.5 ms | 4.2 ms | 3.6 ms | 3.4 ms (2.8x) | 5.8 ms | 10.6 ms |
+| Bulletproofs (largest 128) | 175 ms | 40 ms | 33 ms | 33 ms (5.2x) | 38 ms | 111 ms |
+
+Before the change of format (PS witness signature, challenge sent), the same measurement gave LegoGroth16
+10.7 ms one by one and 7.9 ms in batches, Bulletproofs 175 and 39 ms: the Schnorr part and the PS check
+had to stay per proof. The false proofs in the last columns are well formed (a credential from another
+issuer), so only the combined check sees them; with 4 among 512, the budget falls back to one-by-one
+checks.
+
+### Batch size
+
+The directory's check (`sieve_likes`) per proof, by batch size, with 0, 1 or 2 well-formed false proofs
+in every batch (`cargo test --release -p pop-crypto --test batch measure_batch_sizes -- --ignored
+--nocapture --test-threads 1`, 20 November 2026, one core; LegoGroth16 over 512 proofs, Bulletproofs
+over 256):
+
+| Batch | LegoGroth16 0 / 1 / 2 false | Bulletproofs 0 / 1 / 2 false |
+|---|---|---|
+| alone | 9.2 ms | 178 ms |
+| 16 | 4.4 / 9.0 / 11.7 ms | 38 / 65 / 82 ms |
+| 32 | 3.8 / 8.0 / 9.9 ms | 34 / 52 / 70 ms |
+| 64 | 3.5 / 7.0 / 8.6 ms | 32 / 44 / 61 ms |
+| 128 | 3.5 / 5.9 / 7.7 ms | 32 / 37 / 55 ms |
+| 256 | 3.2 / 5.4 / 7.0 ms | 33 / 34 / 51 ms |
+
+With a share f of false proofs, a batch of b holds about f·b of them (Poisson). Weighting the rows that
+way (an estimate from the table; 3 or more false per batch was not measured): at f = 0.1% sizes 64 to 256
+all cost about 3.8 ms per LegoGroth16 proof; at f = 1% size 32 is best at about 5.0 ms, 64 gives about
+5.4 and 256 about 7 or more. A batch is cheapest when it holds about a third of a false proof on
+average, which is what the directory aims for (`FalseShare` in crates/pop-directory/src/batch.rs).
 
 ## Adding a third proof system
 

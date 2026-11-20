@@ -1,0 +1,3 @@
+- Federal Chancellery, ID Austria: https://www.bundeskanzleramt.gv.at/agenda/digitalisierung/digitales-oesterreich/id-austria.html
+- oesterreich.gv.at, ID Austria leaflet: https://www.oesterreich.gv.at/dam/jcr:0c7d8ab4-c806-4138-94e3-b2f8a501f3c5/220923_Folder_ID_Austria_Web.pdf
+- ID Austria whitepaper for users (2021, read in summary): https://www.id-austria.gv.at/dam/jcr:1ee37fa4-5781-4db3-9839-b12417bd917f/ID-Austria-Whitepaper-fuer-EndanwenderInnen.docx.pdf

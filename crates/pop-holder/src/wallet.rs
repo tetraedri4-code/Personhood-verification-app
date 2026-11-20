@@ -16,6 +16,71 @@ pub struct WalletState {
     pub bindings: Vec<LocalBinding>,
     /// posts this person reported a like for: "platform|post"
     pub liked: Vec<String>,
+    /// likes waiting for their random wait to end before they are proved and sent: "platform|post"
+    #[serde(default)]
+    pub queued_likes: Vec<String>,
+    /// keys of the encrypted backup, derived from the paper code (the code itself is not kept)
+    #[serde(default)]
+    pub backup: Option<BackupKeys>,
+    /// one-time ticket from the issuer for creating a backup
+    #[serde(default)]
+    pub backup_ticket: Option<String>,
+    /// a replacement of the secret that waits for its veto period to pass
+    #[serde(default)]
+    pub claim: Option<PendingClaim>,
+    /// computers paired to leave likes in a mailbox (crate::paired)
+    #[serde(default)]
+    pub pairings: Vec<Pairing>,
+    /// likes collected from paired computers, waiting for the person's approval
+    #[serde(default)]
+    pub inbox: Vec<InboxLike>,
+    #[serde(default)]
+    pub next_inbox_id: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Pairing {
+    pub name: String,
+    pub keys: pop_protocol::mailbox::PairingKeys,
+    /// the end in force (Unix ms): the vouched end, or an earlier close
+    pub end_ms: u64,
+    /// queue collected likes at once instead of asking first
+    pub auto: bool,
+    /// the last item number collected
+    pub after: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct InboxLike {
+    pub id: u64,
+    /// the pairing it came from
+    pub from: String,
+    pub platform: String,
+    pub post: String,
+    /// when it was clicked, by the paired computer's clock
+    pub clicked_ms: u64,
+    /// why it was not queued at once, when automatic sending failed
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BackupKeys {
+    pub id: String,
+    pub write_key: String,
+    pub enc_key: String,
+}
+
+/// The new secret of a replacement that is not issued yet.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PendingClaim {
+    pub claim_token: String,
+    pub rho: String,
+    pub s: String,
+    pub delta: u64,
+    pub guardian_pkcs8: String,
+    pub claim_after: u32,
+    pub claim_before: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -24,6 +89,12 @@ pub struct PendingEnrolment {
     pub rho: String,
     pub s: String,
     pub delta: u64,
+    /// what the login is for (enrolment, re-check, replacement)
+    #[serde(default)]
+    pub purpose: pop_protocol::api::Purpose,
+    /// replacement only: the new guardian key, saved before the issuer hears of it
+    #[serde(default)]
+    pub new_guardian_pkcs8: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

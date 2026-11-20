@@ -11,7 +11,7 @@
 //! * [`client`]: [`ThresholdUniqueness`], the issuer's side. It implements
 //!   [`pop_protocol::uniqueness::UniquenessService`], so the issuer does not know which kind of
 //!   service it talks to.
-//! * [`admin`]: the coordinator's side of a round, used by `pop uniqueness ...`.
+//! * [`admin`]: the administrators' side of a round, used by `pop uniqueness ...`.
 //!
 //! ## The function
 //!
@@ -28,7 +28,9 @@
 //! across versions (`pop-issuer`).
 pub mod admin;
 pub mod client;
+pub mod ident;
 pub mod operator;
+pub mod round;
 pub mod shamir;
 pub mod wire;
 

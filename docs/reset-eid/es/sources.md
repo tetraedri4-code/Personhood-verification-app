@@ -1,0 +1,1 @@
+- Agencia Tributaria, revoke the Cl@ve Firma certificate: https://sede.agenciatributaria.gob.es/Sede/en_gb/ayuda/consultas-informaticas/firma-digital-sistema-clave-pin-tecnica/modificar-datos-renunciar-servicio-clave/revocar-certificado-clave-firma.html

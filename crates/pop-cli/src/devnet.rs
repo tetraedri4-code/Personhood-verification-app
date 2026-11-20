@@ -4,7 +4,7 @@ use crate::wiring::{self, IssuerFile, PlatformOpts, UniquenessFile};
 use pop_uniqueness::admin::{self, AdminEndpoint};
 use pop_uniqueness::{Operator, OperatorConfig, OperatorEndpoint, ThresholdConfig};
 use serde::{Deserialize, Serialize};
-use pop_crypto::{dates, SchemeConfig};
+use pop_crypto::SchemeConfig;
 use pop_directory::{Directory, DirectoryConfig};
 use pop_mock_idp::{MockClient, MockIdpConfig};
 use pop_protocol::http::HttpClient;
@@ -17,11 +17,16 @@ use tokio::net::TcpListener;
 pub struct DevnetOpts {
     pub scheme: SchemeConfig,
     pub data_dir: Option<PathBuf>,
-    /// ports for feed, idp, issuer, directory; 0 = any free port
-    pub ports: [u16; 4],
-    /// enrolments count at once (rollout window) instead of after nine months of probation
-    pub rollout: bool,
+    /// ports for feed, idp, issuer, directory, relay; 0 = any free port
+    pub ports: [u16; 5],
     pub uniqueness: UniquenessMode,
+    /// days a replacement without the old guardian key waits (None = the issuer's default, 90)
+    pub replace_wait_days: Option<u32>,
+    /// the directory's `bucket_posts` (None = its default, 32)
+    pub bucket_posts: Option<u32>,
+    /// the issuer's `like_window_secs` (None = 10 seconds here, so that trying it out is not slow;
+    /// the policy's default for a real deployment is 1800)
+    pub like_window_secs: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,7 +40,7 @@ pub enum UniquenessMode {
 
 impl Default for DevnetOpts {
     fn default() -> Self {
-        DevnetOpts { scheme: SchemeConfig::default(), data_dir: None, ports: [4000, 4001, 4002, 4003], rollout: true, uniqueness: UniquenessMode::Hmac }
+        DevnetOpts { scheme: SchemeConfig::default(), data_dir: None, ports: [4000, 4001, 4002, 4003, 4004], uniqueness: UniquenessMode::Hmac, replace_wait_days: None, bucket_posts: None, like_window_secs: None }
     }
 }
 
@@ -45,8 +50,17 @@ pub struct Devnet {
     pub idp_url: String,
     pub issuer_url: String,
     pub directory_url: String,
+    /// an Oblivious HTTP relay for both (`{relay_url}/issuer`, `{relay_url}/directory`), see docs/relay.md
+    pub relay_url: String,
     /// the threshold uniqueness operators, if any
     pub uniqueness: Option<UniquenessCluster>,
+}
+
+impl Devnet {
+    /// The holder's relay addresses for this devnet.
+    pub fn relays(&self) -> wiring::Relays {
+        wiring::Relays { issuer: Some(format!("{}/issuer", self.relay_url)), directory: Some(format!("{}/directory", self.relay_url)) }
+    }
 }
 
 /// What the devnet knows about its uniqueness operators: enough to run rounds against them.
@@ -60,7 +74,6 @@ pub struct UniquenessCluster {
     /// an operator that runs but holds no share yet
     pub standby: AdminEndpoint,
     eval_tokens: Vec<String>,
-    peer_token: String,
     #[serde(skip)]
     file: Option<std::path::PathBuf>,
 }
@@ -78,7 +91,6 @@ async fn start_uniqueness(n: u32, threshold: usize, data_dir: Option<&std::path:
         _ => None,
     };
     let total = n + 1;
-    let peer_token = saved.as_ref().map(|s| s.peer_token.clone()).unwrap_or_else(token);
     let mut admins = vec![];
     let mut endpoints = vec![];
     let mut eval_tokens = vec![];
@@ -90,10 +102,10 @@ async fn start_uniqueness(n: u32, threshold: usize, data_dir: Option<&std::path:
             index,
             eval_token: eval_token.clone(),
             admin_token: admin_token.clone(),
-            peer_token: peer_token.clone(),
             state_file: data_dir.map(|d| d.join(format!("uniqueness-operator-{index}.json"))),
             max_evals_per_minute: 6000,
             min_threshold: threshold.min(2),
+            test_fault: None,
         })?;
         let (l, url) = listen(0).await?;
         serve(l, pop_uniqueness::router(op));
@@ -114,7 +126,7 @@ async fn start_uniqueness(n: u32, threshold: usize, data_dir: Option<&std::path:
             (admin::dkg(&members, threshold).await?, members, admins[n as usize].clone())
         }
     };
-    let cluster = UniquenessCluster { key: key.clone(), threshold, members, standby, eval_tokens, peer_token, file };
+    let cluster = UniquenessCluster { key: key.clone(), threshold, members, standby, eval_tokens, file };
     cluster.save()?;
     Ok((cluster, ThresholdConfig { operators: endpoints, keys: vec![key] }))
 }
@@ -129,11 +141,9 @@ impl UniquenessCluster {
         Ok(())
     }
 
-    /// Refresh: every member gets a new share of the same key and erases the old one.
+    /// Refresh: every member gets a new share of the same key and erases the old one by itself.
     pub async fn refresh(&self) -> anyhow::Result<u64> {
-        let epoch = admin::reshare(&self.key, &self.members, &self.members, self.threshold).await?;
-        admin::finalize(&self.key, epoch, &self.members, &[]).await?;
-        Ok(epoch)
+        admin::reshare(&self.key, &self.members, &self.members, self.threshold).await
     }
 
     /// Replace the last member by the standby operator: the remaining members and the newcomer get
@@ -143,7 +153,6 @@ impl UniquenessCluster {
         let mut new_set: Vec<AdminEndpoint> = self.members[..self.members.len() - 1].to_vec();
         new_set.push(self.standby.clone());
         let epoch = admin::reshare(&self.key, &self.members, &new_set, self.threshold).await?;
-        admin::finalize(&self.key, epoch, &new_set, std::slice::from_ref(&leaver)).await?;
         let joined = self.standby.index;
         self.standby = leaver.clone();
         self.members = new_set;
@@ -171,6 +180,7 @@ pub async fn start(o: DevnetOpts) -> anyhow::Result<Devnet> {
     let (l_idp, idp_url) = listen(o.ports[1]).await?;
     let (l_iss, issuer_url) = listen(o.ports[2]).await?;
     let (l_dir, directory_url) = listen(o.ports[3]).await?;
+    let (l_relay, relay_url) = listen(o.ports[4]).await?;
 
     serve(l_feed, pop_mockfeed::router());
 
@@ -183,8 +193,6 @@ pub async fn start(o: DevnetOpts) -> anyhow::Result<Devnet> {
         }),
     );
 
-    // a quarter start more than nine months back, so demo badges are "counted" at once
-    let rollout = o.rollout.then(|| dates::fmt_day(dates::quarter_start(dates::quarter_of(dates::today()).saturating_sub(4))));
     let (uniqueness, uniq_file) = match o.uniqueness {
         UniquenessMode::Hmac => (None, UniquenessFile::Hmac),
         UniquenessMode::Threshold { operators, threshold } => {
@@ -197,24 +205,33 @@ pub async fn start(o: DevnetOpts) -> anyhow::Result<Devnet> {
         scheme: o.scheme.clone(),
         oidc,
         provider_code: 1,
-        rollout_certified: rollout,
         uniqueness: uniq_file,
         uniqueness_key: None,
+        policy: pop_issuer::Policy {
+            replace_wait_days: o.replace_wait_days.unwrap_or(pop_issuer::Policy::default().replace_wait_days),
+            like_window_secs: o.like_window_secs.unwrap_or(10),
+            ..Default::default()
+        },
     })
     .await?;
-    serve(l_iss, pop_issuer::router(issuer));
+    let pad_sizes = issuer.params().pad_sizes;
+    serve(l_iss, wiring::with_gateway(pop_issuer::router(issuer), &pad_sizes)?);
 
     let platforms = wiring::platforms(&PlatformOpts { mockfeed_url: Some(feed_url.clone()), ..Default::default() });
     let dir = Directory::connect(
         Arc::new(HttpClient::new(&issuer_url)),
         platforms,
         wiring::store(o.data_dir.as_deref(), "directory-db")?,
-        DirectoryConfig::default(),
+        DirectoryConfig { bucket_posts: o.bucket_posts.unwrap_or(DirectoryConfig::default().bucket_posts), ..Default::default() },
     )
     .await?;
-    serve(l_dir, pop_directory::router(dir));
+    // the mailbox for paired computers runs beside the directory, behind the same gateway
+    let mailbox = wiring::mailbox(o.data_dir.as_deref())?;
+    serve(l_dir, wiring::with_gateway(pop_directory::router(dir).merge(mailbox), &pad_sizes)?);
+    // in a real deployment someone other than the operator of the servers runs the relay
+    serve(l_relay, pop_ohttp::relay::router([("issuer".to_string(), issuer_url.clone()), ("directory".to_string(), directory_url.clone())].into())?);
 
-    Ok(Devnet { feed_url, idp_url, issuer_url, directory_url, uniqueness })
+    Ok(Devnet { feed_url, idp_url, issuer_url, directory_url, relay_url, uniqueness })
 }
 
 /// Complete the mock identity check without a browser: the mock IdP logs `subject` in at once when

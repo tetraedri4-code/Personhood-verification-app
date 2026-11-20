@@ -57,6 +57,8 @@ pub struct Gens {
     pub ped_b: G1A,       // Pedersen value base (Bulletproofs B, GK g)
     pub ped_h: G1A,       // Pedersen blinding base (Bulletproofs B_blinding, GK h)
     pub p_acc: G1A,       // accumulator base P
+    pub wp1: G1A,         // witness BBS signature on the handle: P1
+    pub wh: G1A,          // witness BBS signature on the handle: generator of r
 }
 
 /// Design v2 (§4.1, §4.3): m = (s, delta, r, tau, gamma, ell, c, gamma0, e), plus rho from the blind-issuance
@@ -74,6 +76,12 @@ pub const A_GAMMA0: usize = 8;
 pub const A_E: usize = 9;
 
 impl Gens {
+    /// One shared copy (hashing to the curve is not free).
+    pub fn cached() -> &'static Gens {
+        static G: std::sync::OnceLock<Gens> = std::sync::OnceLock::new();
+        G.get_or_init(Gens::new)
+    }
+
     pub fn new() -> Self {
         let dst = b"EUPC-V1-GENERATORS";
         let h = (0..N_ATTR)
@@ -87,6 +95,8 @@ impl Gens {
             ped_b: hash_to_g1(dst, b"PEDERSEN_B"),
             ped_h: hash_to_g1(dst, b"PEDERSEN_H"),
             p_acc: hash_to_g1(dst, b"ACC_P"),
+            wp1: hash_to_g1(dst, b"WITNESS_P1"),
+            wh: hash_to_g1(dst, b"WITNESS_H"),
         }
     }
 }

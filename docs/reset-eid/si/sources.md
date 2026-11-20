@@ -1,0 +1,3 @@
+- e-uprava, loss of an identity card: https://e-uprava.gov.si/en/podrocja/personal-documents-certificates-change-of-residence/personal-documents-digital-certificate/izguba-pogresitev-osebne-izkazice.html
+- SI-TRUST, SI-PASS and smsPASS general terms: https://www.si-trust.gov.si/en/si-pass-smspass-general-terms
+- SI-TRUST, mobile identity smsPASS: https://www.si-trust.gov.si/en/si-pass/mobile-identity-smspass/

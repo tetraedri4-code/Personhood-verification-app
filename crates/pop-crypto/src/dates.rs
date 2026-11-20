@@ -7,10 +7,18 @@ pub type Day = u32;
 /// Unix time of the scheme epoch, 2026-01-01T00:00:00Z.
 pub const EPOCH_UNIX: i64 = 1_767_225_600;
 
-/// Lease length of a badge, nine months (design §4.5), in days.
-pub const LEASE_DAYS: u32 = 274;
-/// Probation: a fresh secret is not counted for nine months (design §4.5).
-pub const PROBATION_DAYS: u32 = 274;
+
+/// The scheme epoch, 1 January 2026, was a Thursday; weeks start on Monday.
+pub fn week_start(day: Day) -> Day {
+    day.saturating_sub((day + 3) % 7)
+}
+
+/// The latest "counts from" date a proof may show today: today itself, or an earlier date while an
+/// alarm about stolen eID logins is on. Secrets counting from after it are in probation.
+pub fn count_cutoff(today: Day, alarm: Option<Day>) -> Day {
+    alarm.map_or(today, |a| a.min(today))
+}
+
 /// Re-check period, 24 months (design §4.6), in days.
 pub const RECHECK_DAYS: u32 = 730;
 /// A credential that expired less than 12 months ago can still renew (design §4.6).

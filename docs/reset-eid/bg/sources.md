@@ -1,0 +1,2 @@
+- Evrotrust, eID scheme: https://discover.evrotrust.com/eid-scheme-en
+- European Commission, eID in Bulgaria: https://ec.europa.eu/digital-building-blocks/sites/display/EIDCOMMUNITY/Bulgaria

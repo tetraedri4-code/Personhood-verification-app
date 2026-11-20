@@ -1,6 +1,7 @@
 //! Builders that turn configuration into running parts.
+use pop_protocol::clock::{Clock, Source as ClockSource};
 use anyhow::Context;
-use pop_crypto::{dates, ProofSystem, Scheme, SchemeConfig};
+use pop_crypto::{ProofSystem, Scheme, SchemeConfig};
 use pop_holder::{Holder, WalletStore};
 use pop_idp::oidc::{OidcConfig, OidcProvider};
 use pop_idp::Loa;
@@ -17,6 +18,7 @@ use std::sync::Arc;
 
 /// Configuration file of `pop issuer` (JSON). See docs/real-identity-provider.md.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IssuerFile {
     /// directory for keys and the JSON store; omit for in-memory
     pub data_dir: Option<PathBuf>,
@@ -26,8 +28,6 @@ pub struct IssuerFile {
     /// code of this provider in the credential (attribute e); publish the list and never reuse a code
     #[serde(default = "one")]
     pub provider_code: u32,
-    /// "YYYY-MM-DD" quarter start: secrets enrolled now count as certified then (rollout window)
-    pub rollout_certified: Option<String>,
     /// Who computes the deduplication key. Omit for the single-operator keyed hash.
     #[serde(default)]
     pub uniqueness: UniquenessFile,
@@ -35,6 +35,10 @@ pub struct IssuerFile {
     /// `data_dir/uniqueness-keys/`. It counts as the oldest key.
     #[serde(default)]
     pub uniqueness_key: Option<String>,
+    /// The rules' numbers: waits, probations, intervals, the alarm. Every field is optional and
+    /// defaults to the agreed value; see `pop_issuer::Policy` and docs/real-servers.md.
+    #[serde(default)]
+    pub policy: pop_issuer::Policy,
 }
 
 /// The `uniqueness` section of the issuer configuration.
@@ -58,12 +62,6 @@ pub fn store(dir: Option<&Path>, name: &str) -> anyhow::Result<SharedStore> {
         Some(d) => Arc::new(JsonFileStore::open(d.join(name))?),
         None => MemoryStore::shared(),
     })
-}
-
-fn parse_day(s: &str) -> anyhow::Result<u32> {
-    let p: Vec<u32> = s.split('-').map(|x| x.parse()).collect::<Result<_, _>>().context("date must be YYYY-MM-DD")?;
-    anyhow::ensure!(p.len() == 3, "date must be YYYY-MM-DD");
-    Ok(dates::from_civil(p[0] as i32, p[1], p[2]))
 }
 
 const KEY_DIR: &str = "uniqueness-keys";
@@ -189,8 +187,8 @@ pub async fn build_issuer(f: &IssuerFile) -> anyhow::Result<Arc<Issuer>> {
         keys_dir: f.data_dir.as_ref().map(|d| d.join("keys")),
         provider_code: f.provider_code,
         min_loa,
-        rollout_certified: f.rollout_certified.as_deref().map(parse_day).transpose()?,
         clock: None,
+        policy: f.policy.clone(),
     };
     Issuer::new(scheme, idp, uniq, db, cfg).await
 }
@@ -226,7 +224,47 @@ pub fn platforms(o: &PlatformOpts) -> PlatformRegistry {
 }
 
 pub fn build_holder(issuer_url: &str, directory_url: &str, platforms: PlatformRegistry, wallet: Arc<dyn WalletStore>) -> Holder {
-    Holder::new(Arc::new(HttpClient::new(issuer_url)), Arc::new(HttpClient::new(directory_url)), platforms, wallet)
+    build_holder_via(issuer_url, directory_url, &Relays::default(), platforms, wallet).expect("direct clients cannot fail")
+}
+
+/// Oblivious HTTP relays the holder sends its requests through (docs/relay.md). With the relay of
+/// `pop relay`, the address for a server is the relay's address followed by the server's name there
+/// (`https://relay.example/directory`). None: straight to the server.
+#[derive(Clone, Debug, Default)]
+pub struct Relays {
+    pub issuer: Option<String>,
+    pub directory: Option<String>,
+}
+
+fn client(url: &str, relay: Option<&str>, clock: &Arc<Clock>, src: ClockSource) -> anyhow::Result<HttpClient> {
+    Ok(match relay {
+        Some(r) => HttpClient::with_transport(url, Arc::new(pop_ohttp::Oblivious::new(r)?)),
+        None => HttpClient::new(url),
+    }
+    .with_clock(clock.clone(), src))
+}
+
+/// A holder whose requests go through the given relays. Its like windows follow the middle of the
+/// issuer's, the directory's and the relay's times (pop_protocol::clock).
+pub fn build_holder_via(issuer_url: &str, directory_url: &str, relays: &Relays, platforms: PlatformRegistry, wallet: Arc<dyn WalletStore>) -> anyhow::Result<Holder> {
+    let clock = Arc::new(Clock::new());
+    let issuer = client(issuer_url, relays.issuer.as_deref(), &clock, ClockSource::Issuer)?;
+    let directory = client(directory_url, relays.directory.as_deref(), &clock, ClockSource::Directory)?;
+    // paired computers leave likes in the mailbox beside the directory, reached the same way
+    Ok(Holder::new(Arc::new(issuer), Arc::new(directory.clone()), platforms, wallet).with_clock(clock).with_mailbox(Arc::new(directory)))
+}
+
+/// The mailbox for paired computers (`pop-mailbox`), stored in `data_dir`/mailbox-db or in memory.
+pub fn mailbox(data_dir: Option<&std::path::Path>) -> anyhow::Result<axum::Router> {
+    let m = pop_mailbox::Mailboxes::new(store(data_dir, "mailbox-db")?, pop_mailbox::MailboxConfig::default());
+    Ok(pop_mailbox::router(Arc::new(m)))
+}
+
+/// A server's routes with an Oblivious HTTP gateway in front (`POST /ohttp`, `GET /ohttp/keys`),
+/// padding answers to the issuer's size classes (`policy.pad_sizes`; empty: the defaults).
+pub fn with_gateway(app: axum::Router, pad_sizes: &[u32]) -> anyhow::Result<axum::Router> {
+    let sizes = if pad_sizes.is_empty() { pop_ohttp::DEFAULT_PAD_SIZES.to_vec() } else { pad_sizes.to_vec() };
+    Ok(pop_ohttp::gateway::wrap(app, pop_ohttp::gateway::Gateway::with_pad_sizes(sizes)?))
 }
 
 pub fn mock_oidc(idp_url: &str, issuer_url: &str) -> OidcConfig {
@@ -250,5 +288,25 @@ pub fn proof_system(s: &str) -> anyhow::Result<ProofSystem> {
         "lego" | "legogroth16" => Ok(ProofSystem::LegoGroth16),
         "bp" | "bulletproofs" => Ok(ProofSystem::Bulletproofs),
         _ => anyhow::bail!("proof system must be legogroth16 or bulletproofs"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The examples must parse: a field the issuer no longer reads is an error, so that nobody runs
+    /// with a setting they believe applies.
+    #[test]
+    fn the_example_configurations_parse() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+        for f in ["issuer.mock.json", "issuer.broker.example.json", "issuer.threshold.example.json"] {
+            let f: IssuerFile = serde_json::from_slice(&std::fs::read(dir.join(f)).unwrap()).unwrap_or_else(|e| panic!("{f}: {e}"));
+            f.policy.validate().unwrap();
+        }
+        let mut old: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("issuer.mock.json")).unwrap()).unwrap();
+        old["replace_wait_days"] = 90.into();
+        let e = serde_json::from_value::<IssuerFile>(old).unwrap_err().to_string();
+        assert!(e.contains("replace_wait_days"), "{e}");
     }
 }

@@ -43,6 +43,32 @@ enum Cmd {
         data_dir: Option<PathBuf>,
         #[command(flatten)]
         platforms: PlatformArgs,
+        /// lease of a badge, in days (default nine months)
+        #[arg(long, default_value_t = 274, value_parser = clap::value_parser!(u32).range(7..=3650))]
+        lease_days: u32,
+        /// posts with likes per count bucket that readers download (more: more private, more data)
+        #[arg(long, default_value_t = 32, value_parser = clap::value_parser!(u32).range(1..=100_000))]
+        bucket_posts: u32,
+        /// like proofs checked together at most (1: each by itself; docs/crypto.md). The size adjusts
+        /// to the recent share of false proofs, down to --like-batch-min
+        #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u64).range(1..=4096))]
+        like_batch_max: u64,
+        /// smallest batch, used while many false proofs arrive
+        #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u64).range(1..=4096))]
+        like_batch_min: u64,
+        /// how long the first like of a batch waits for others, in milliseconds
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u64).range(0..=10_000))]
+        like_batch_wait_ms: u64,
+    },
+    /// Run an Oblivious HTTP relay (RFC 9458) in front of the issuer's and directory's gateways, so
+    /// that they do not see the holder's address (docs/relay.md). Someone other than their operator
+    /// should run it.
+    Relay {
+        #[arg(long, default_value = "127.0.0.1:4004")]
+        listen: SocketAddr,
+        /// a server to relay to, as name=address (repeat): `--gateway directory=https://dir.example`
+        #[arg(long = "gateway", required = true)]
+        gateways: Vec<String>,
     },
     /// Run the mock identity provider alone
     MockIdp {
@@ -76,13 +102,13 @@ enum Cmd {
 enum UniqCmd {
     /// Run one operator of the threshold service
     Operator {
-        /// JSON: index, eval_token, admin_token, peer_token, state_file, max_evals_per_minute, min_threshold
+        /// JSON: index, eval_token, admin_token, state_file, max_evals_per_minute, min_threshold
         #[arg(long)]
         config: PathBuf,
         #[arg(long, default_value = "127.0.0.1:4100")]
         listen: SocketAddr,
     },
-    /// Generate a new shared key among the operators of a cluster file. Prints the group key to pin in the issuer configuration
+    /// Generate a new shared key among operators you administer yourself. Prints the group key to pin in the issuer configuration
     Dkg {
         /// JSON list of {index, url, admin_token}
         #[arg(long)]
@@ -90,14 +116,14 @@ enum UniqCmd {
         #[arg(long)]
         threshold: usize,
     },
-    /// Give every operator a new share of the same key and erase the old shares
+    /// Give every operator you administer a new share of the same key; the old shares are erased
     Refresh {
         #[arg(long)]
         cluster: PathBuf,
         #[arg(long)]
         key: String,
     },
-    /// Hand the key to a changed operator set (add, remove or replace operators, or change the threshold)
+    /// Hand the key to a changed operator set you administer (add, remove or replace operators, or change the threshold)
     Reshare {
         #[arg(long)]
         key: String,
@@ -109,22 +135,11 @@ enum UniqCmd {
         to: PathBuf,
         #[arg(long)]
         threshold: usize,
-        /// do not erase the old shares yet; run `finalize` later
-        #[arg(long)]
-        keep_old: bool,
     },
-    /// Erase every share older than an epoch (the new set, and the operators that left)
-    Finalize {
-        #[arg(long)]
-        key: String,
-        #[arg(long)]
-        epoch: u64,
-        /// cluster file of every operator of the new epoch
-        #[arg(long)]
-        cluster: PathBuf,
-        /// cluster file of operators that left
-        #[arg(long)]
-        leavers: Option<PathBuf>,
+    /// Operators with different administrators: write a round, pass the file around, and each administrator joins it
+    Round {
+        #[command(subcommand)]
+        cmd: RoundCmd,
     },
     /// Show what each operator of a cluster file publishes: keys, epochs, thresholds, evaluation counts
     Status {
@@ -144,12 +159,56 @@ enum UniqCmd {
     },
 }
 
+#[derive(Subcommand)]
+enum RoundCmd {
+    /// Write the spec of a key generation. `members` is a JSON list of {index, url, identity}; leave
+    /// `identity` out only if you accept the key each operator publishes
+    NewDkg {
+        #[arg(long)]
+        members: PathBuf,
+        #[arg(long)]
+        threshold: usize,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Write the spec of a refresh (same members in --from and --to) or a change of operators or threshold
+    NewReshare {
+        #[arg(long)]
+        key: String,
+        /// members file of current holders that deal
+        #[arg(long)]
+        from: PathBuf,
+        /// members file of the new operator set
+        #[arg(long)]
+        to: PathBuf,
+        #[arg(long)]
+        threshold: usize,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Print what a spec says, for the administrator to check before joining
+    Show {
+        #[arg(long)]
+        spec: PathBuf,
+    },
+    /// Approve the round at your own operator and keep it moving until it is done
+    Join {
+        #[arg(long)]
+        spec: PathBuf,
+        /// JSON {index, url, admin_token} of your own operator
+        #[arg(long)]
+        operator: PathBuf,
+        /// give up after this many seconds (the others may not have joined yet)
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
+    },
+}
+
 #[derive(serde::Deserialize)]
 struct OperatorFile {
     index: u32,
     eval_token: String,
     admin_token: String,
-    peer_token: String,
     state_file: PathBuf,
     #[serde(default = "default_rate")]
     max_evals_per_minute: u32,
@@ -180,12 +239,13 @@ async fn uniqueness_cmd(cmd: UniqCmd) -> anyhow::Result<()> {
                 index,
                 eval_token: f.eval_token,
                 admin_token: f.admin_token,
-                peer_token: f.peer_token,
                 state_file: Some(f.state_file),
                 max_evals_per_minute: f.max_evals_per_minute,
                 min_threshold: f.min_threshold,
+                test_fault: None,
             })?;
             println!("Uniqueness operator {index} listening on http://{listen}");
+            println!("Identity key (give it to the other administrators): {}", op.identity());
             serve(listen, pop_uniqueness::router(op)).await?;
         }
         UniqCmd::Dkg { cluster: c, threshold } => {
@@ -199,24 +259,55 @@ async fn uniqueness_cmd(cmd: UniqCmd) -> anyhow::Result<()> {
             let ops = cluster(&c)?;
             let cur = admin::current_epoch(&key, &ops).await?;
             let epoch = admin::reshare(&key, &ops, &ops, cur.threshold).await?;
-            admin::finalize(&key, epoch, &ops, &[]).await?;
             println!("Shares refreshed: epoch {epoch}, old shares erased. The key and every deduplication key are unchanged.");
         }
-        UniqCmd::Reshare { key, from, to, threshold, keep_old } => {
+        UniqCmd::Reshare { key, from, to, threshold } => {
             let (dealers, receivers) = (cluster(&from)?, cluster(&to)?);
             let epoch = admin::reshare(&key, &dealers, &receivers, threshold).await?;
-            println!("New shares dealt: epoch {epoch}, {threshold}-of-{}.", receivers.len());
-            if keep_old {
-                println!("Old shares are still in place. Erase them with `pop uniqueness finalize --epoch {epoch}`, naming EVERY operator that held an older share under --leavers.");
-            } else {
-                admin::finalize(&key, epoch, &receivers, &dealers).await?;
-                println!("Old shares erased at the operators named in --from and --to. If other operators held a share of the old epoch, run `pop uniqueness finalize` with them under --leavers.");
-            }
+            println!("New shares dealt: epoch {epoch}, {threshold}-of-{}. Every operator of the round erased its older shares.", receivers.len());
+            println!("An operator that held a share but took no part still has it: check with `pop uniqueness status`.");
         }
-        UniqCmd::Finalize { key, epoch, cluster: c, leavers } => {
-            let leavers = leavers.as_ref().map(cluster).transpose()?.unwrap_or_default();
-            admin::finalize(&key, epoch, &cluster(&c)?, &leavers).await?;
-            println!("Shares older than epoch {epoch} erased.");
+        UniqCmd::Round { cmd } => {
+            use pop_uniqueness::admin::Member;
+            use pop_uniqueness::wire::RoundSpec;
+            let members = |p: &PathBuf| read_json::<Vec<Member>>(p);
+            let write = |spec: &RoundSpec, out: &PathBuf| -> anyhow::Result<()> {
+                std::fs::write(out, serde_json::to_vec_pretty(spec)?)?;
+                println!("Round {} written to {}. Send the file to every administrator; each checks it (`round show`) and runs `round join`.", spec.id(), out.display());
+                Ok(())
+            };
+            match cmd {
+                RoundCmd::NewDkg { members: m, threshold, out } => write(&admin::spec_dkg(&members(&m)?, threshold).await?, &out)?,
+                RoundCmd::NewReshare { key, from, to, threshold, out } => write(&admin::spec_reshare(&key, &members(&from)?, &members(&to)?, threshold).await?, &out)?,
+                RoundCmd::Show { spec } => {
+                    let s: RoundSpec = read_json(&spec)?;
+                    pop_uniqueness::round::check_spec(&s).map_err(|e| anyhow::anyhow!("this spec is not valid: {e}"))?;
+                    println!("Round {}", s.id());
+                    match &s.key {
+                        None => println!("  generates a NEW key, shared {}-of-{}", s.threshold, s.receivers.len()),
+                        Some(k) => println!("  gives new shares of key {} ({}-of-{}), dealt from epoch {} by operators {:?}, as epoch {}", pop_uniqueness::key_version(k), s.threshold, s.receivers.len(), s.from_epoch.unwrap_or(0), s.dealers, s.new_epoch),
+                    }
+                    println!("  operators that will hold a share afterwards: {:?}", s.receivers);
+                    let leaving: Vec<u32> = s.dealers.iter().copied().filter(|d| !s.receivers.contains(d)).collect();
+                    if !leaving.is_empty() {
+                        println!("  operators that leave and erase their share: {leaving:?}");
+                    }
+                    println!("  identity keys (compare each with what its administrator gave you):");
+                    for p in &s.peers {
+                        println!("    operator {} at {}: {}", p.index, p.url, p.identity);
+                    }
+                }
+                RoundCmd::Join { spec, operator, timeout } => {
+                    let s: RoundSpec = read_json(&spec)?;
+                    let me: AdminEndpoint = read_json(&operator)?;
+                    println!("Joining round {} as operator {} ...", s.id(), me.index);
+                    let st = admin::join(&s, &me, std::time::Duration::from_secs(timeout)).await?;
+                    match st.result {
+                        Some((key, epoch)) => println!("Done. This operator holds epoch {epoch} of key {} and erased its older shares.\nGroup key: {key}", pop_uniqueness::key_version(&key)),
+                        None => println!("Done. This operator left the set and erased its share."),
+                    }
+                }
+            }
         }
         UniqCmd::Status { cluster: c } => {
             for o in cluster(&c)? {
@@ -260,13 +351,18 @@ struct DevnetArgs {
     /// keep keys and data here between runs; omit for in-memory
     #[arg(long)]
     data_dir: Option<PathBuf>,
-    /// enrolments go through nine months of probation instead of counting at once
-    #[arg(long)]
-    no_rollout: bool,
     /// who holds the deduplication key: `threshold` (2-of-3 operators, each its own server, plus a
     /// standby) or `hmac` (one keyed hash inside the issuer)
     #[arg(long, default_value = "threshold")]
     uniqueness: String,
+    /// the directory's posts per count bucket (default 32; the demo's few posts then fit in one, so
+    /// readers sync the whole table; 1 makes them use buckets)
+    #[arg(long)]
+    bucket_posts: Option<u32>,
+    /// the issuer's window for sending likes, in seconds: a like is sent at a random moment of the
+    /// window after the click (default 10 here; 1800 in a real deployment's policy)
+    #[arg(long)]
+    like_window_secs: Option<u32>,
 }
 
 #[derive(Args, Clone, Default)]
@@ -314,6 +410,13 @@ struct HolderArgs {
     issuer_url: String,
     #[arg(long, default_value = "http://127.0.0.1:4003")]
     directory_url: String,
+    /// send requests to the issuer through this Oblivious HTTP relay (with `pop relay`: its address
+    /// followed by `/issuer`), so that the issuer does not see this computer's address
+    #[arg(long, env = "POP_ISSUER_RELAY")]
+    issuer_relay: Option<String>,
+    /// the same for the directory (with `pop relay`: its address followed by `/directory`)
+    #[arg(long, env = "POP_DIRECTORY_RELAY")]
+    directory_relay: Option<String>,
     #[command(flatten)]
     platforms: PlatformArgs,
     #[command(subcommand)]
@@ -346,7 +449,58 @@ enum HolderCmd {
     Renew,
     /// Revoke your own credential with the guardian key
     Revoke,
+    /// The two-year identity re-check: log in again, keep the same secret and badges
+    Recheck {
+        #[arg(long)]
+        mock_login: Option<String>,
+    },
+    /// Make an encrypted backup and print its paper code (again: new code, old backup deleted)
+    Backup,
+    /// Restore a backup onto a device without a credential
+    Restore {
+        /// the paper code; dashes, spaces and case do not matter. Leave it out to be asked for it:
+        /// a code on the command line ends up in the shell history
+        code: Option<String>,
+    },
+    /// Replace a lost or stolen secret after an identity check. At once if this wallet still has the
+    /// old guardian key; otherwise it waits and the old app can refuse it
+    Replace {
+        #[arg(long)]
+        mock_login: Option<String>,
+        /// "It wasn't me": your enrolment was refused because someone else enrolled with your
+        /// identity. Their secret is suspended at once and the report counted. Secure your eID first.
+        #[arg(long)]
+        not_me: bool,
+    },
+    /// Collect the new credential of a replacement whose wait is over
+    Claim,
+    /// Refuse a replacement of this wallet's secret that someone else asked for. This is an identity
+    /// re-check: your eID together with this wallet's secret outranks the eID alone
+    Veto {
+        #[arg(long)]
+        mock_login: Option<String>,
+    },
     Status,
+    /// Pair a computer without the app from the nine words its extension shows (now, or later from
+    /// paper): its likes are collected and wait for your approval (`pop holder pairings`)
+    Pair {
+        /// leave out to be asked for them: words on the command line end up in the shell history
+        words: Vec<String>,
+        /// a name to tell pairings apart (default "computer N")
+        #[arg(long)]
+        name: Option<String>,
+        /// send this computer's likes without asking first
+        #[arg(long)]
+        auto: bool,
+    },
+    /// Collect from paired computers, then list the pairings and the likes waiting for approval
+    Pairings,
+    /// Send waiting likes: their numbers from `pop holder pairings`, or `all`
+    Approve { ids: Vec<String> },
+    /// Drop waiting likes without sending them: their numbers, or `all`
+    Reject { ids: Vec<String> },
+    /// End a pairing now: the computer can leave no more likes
+    Unpair { name: String },
     /// Serve the local API for the browser extension
     Serve {
         #[arg(long, default_value = "127.0.0.1:4010")]
@@ -361,12 +515,13 @@ fn devnet_opts(a: &DevnetArgs) -> anyhow::Result<DevnetOpts> {
     Ok(DevnetOpts {
         scheme: SchemeConfig { proof_system: wiring::proof_system(&a.proof_system)?, tree_depth: a.tree_depth, ..Default::default() },
         data_dir: a.data_dir.clone(),
-        rollout: !a.no_rollout,
         uniqueness: match a.uniqueness.as_str() {
             "threshold" => devnet::UniquenessMode::Threshold { operators: 3, threshold: 2 },
             "hmac" => devnet::UniquenessMode::Hmac,
             _ => anyhow::bail!("--uniqueness must be threshold or hmac"),
         },
+        bucket_posts: a.bucket_posts,
+        like_window_secs: a.like_window_secs,
         ..Default::default()
     })
 }
@@ -382,6 +537,7 @@ fn print_devnet(d: &devnet::Devnet) {
     println!("Mock ID provider   {}", d.idp_url);
     println!("Issuer             {}", d.issuer_url);
     println!("Directory          {}", d.directory_url);
+    println!("Relay (OHTTP)      {}/issuer, {}/directory", d.relay_url, d.relay_url);
     if let Some(c) = &d.uniqueness {
         for m in &c.members {
             println!("Uniqueness op {}    {}  (holds a share, {}-of-{})", m.index, m.url, c.threshold, c.members.len());
@@ -392,7 +548,8 @@ fn print_devnet(d: &devnet::Devnet) {
 
 fn holder_for(wallet: PathBuf, d: &devnet::Devnet, as_handle: &str) -> anyhow::Result<Holder> {
     let p = wiring::platforms(&PlatformOpts { mockfeed_url: Some(d.feed_url.clone()), mockfeed_as: Some(as_handle.into()), ..Default::default() });
-    Ok(wiring::build_holder(&d.issuer_url, &d.directory_url, p, Arc::new(FileWallet::open(wallet)?)))
+    // the demo's holders go through the devnet's relay
+    wiring::build_holder_via(&d.issuer_url, &d.directory_url, &d.relays(), p, Arc::new(FileWallet::open(wallet)?))
 }
 
 async fn demo(a: DevnetArgs) -> anyhow::Result<()> {
@@ -482,6 +639,55 @@ async fn demo(a: DevnetArgs) -> anyhow::Result<()> {
         println!("    Alice's identity code is still recognised: a second enrolment is refused as before");
     }
 
+    step(9, "Bob does the two-year identity re-check: he logs in again, his secret and badge stay.");
+    let url = bob.recheck_start().await?;
+    let code = devnet::mock_login(&url, "020285-901B").await?;
+    let next = bob.recheck_finish(&code).await?;
+    println!("    re-checked; the next one is due by {}", dates::fmt_day(next));
+
+    step(10, "Bob makes an encrypted backup, loses his phone, and restores on a new one with the paper code.");
+    let paper = bob.backup_create().await?;
+    println!("    paper code: {paper}  (the server stores ciphertext it cannot read)");
+    let bob2 = Arc::new(holder_for(tmp.join("wallet-bob-new"), &d, "bob")?);
+    let _ = std::fs::remove_file(tmp.join("wallet-bob-new/wallet.json"));
+    bob2.restore(&paper).await?;
+    let again = bob2.bind("mockfeed", "bob", 1, CodePlacement::Bio).await?;
+    println!("    restored: same secret, same code on @bob ({})", again.entry.code);
+
+    step(11, "Carol lost her phone and has no backup. With only her eID the replacement waits; a re-check with the old app would cancel it.");
+    let carol2 = Arc::new(holder_for(tmp.join("wallet-carol-new"), &d, "carol")?);
+    let _ = std::fs::remove_file(tmp.join("wallet-carol-new/wallet.json"));
+    let url = carol2.replace_start().await?;
+    let code = devnet::mock_login(&url, "030375-902C").await?;
+    if let pop_holder::ReplaceOutcome::Waiting { claim_after, .. } = carol2.replace_finish(&code, false).await? {
+        println!("    request recorded; the new secret can be collected from {claim_after}");
+    }
+    if let Some(p) = carol.pending_replacement().await? {
+        println!("    Carol's old app sees the request (made on {}); whoever has it AND her eID could refuse", dates::fmt_day(p.requested_on));
+    }
+    println!("    had she kept her guardian key (it is in the backup), the new secret would come at once, with nine months of probation");
+
+    step(12, "Someone enrols with Dave's eID before he does. Dave's enrolment is refused; he secures his eID and reports \"it wasn't me\".");
+    let thief = Arc::new(holder_for(tmp.join("wallet-thief"), &d, "dave")?);
+    let url = thief.enrol_start().await?;
+    thief.enrol_finish(&devnet::mock_login(&url, "040490-903D").await?).await?;
+    let dave = Arc::new(holder_for(tmp.join("wallet-dave"), &d, "dave")?);
+    let url = dave.enrol_start().await?;
+    let code = devnet::mock_login(&url, "040490-903D").await?;
+    anyhow::ensure!(code.is_empty() && dave.enrol_finish(&code).await.is_err(), "Dave's second enrolment was not refused");
+    println!("    Dave's enrolment is refused: his identity is already enrolled. The app points him to the instructions: {}", reset_eid_help());
+    let url = dave.replace_start().await?;
+    let code = devnet::mock_login(&url, "040490-903D").await?;
+    match dave.replace_finish(&code, true).await? {
+        pop_holder::ReplaceOutcome::Issued { counted_from } => println!("    reported; Dave has a new secret at once, which counts from {counted_from} (a week's probation)"),
+        pop_holder::ReplaceOutcome::Waiting { claim_after, .. } => println!("    reported; Dave's new secret can be collected from {claim_after}"),
+    }
+    println!("    the thief's wallet now sees itself suspended: {}", thief.suspended().await?);
+    let r = pop_protocol::api::IssuerApi::reports(&HttpClient::new(&d.issuer_url)).await?;
+    println!("    public weekly count of such reports this week: {} (alarm cutoff: {:?})", r.weeks.last().map(|w| w.1).unwrap_or(0), r.alarm_cutoff.map(dates::fmt_day));
+    println!("    for 90 days, the thief's app AND Dave's eID together could block Dave's new secret; Dave secured his eID, so they cannot");
+    println!("    (a quick replacement like this one is possible once in two years; later reports wait 90 days and then nine months)");
+
     let token = std::env::var("POP_PAIRING_TOKEN").ok().filter(|t| t.len() >= 16).unwrap_or_else(local_api::new_token);
     let l = tokio::net::TcpListener::bind("127.0.0.1:4010").await?;
     println!("\nServices keep running. To see badges and counts in a browser:");
@@ -493,22 +699,82 @@ async fn demo(a: DevnetArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The identity check: with the mock provider it can run without a browser; otherwise the person
+/// opens the address and types the code the issuer's page shows.
+/// Where to read how to secure an eID: the copy built into the app, or the repository's.
+fn reset_eid_help() -> String {
+    format!("{} (or http://127.0.0.1:4010{} while `pop holder serve` runs)", pop_holder::holder::RESET_EID_HELP, pop_holder::holder::RESET_EID_PATH)
+}
+
+async fn login(url: &str, mock_login: Option<String>) -> anyhow::Result<String> {
+    Ok(match mock_login {
+        Some(id) => devnet::mock_login(url, &id).await?,
+        None => {
+            println!("Open this address in your own browser and log in:\n\n  {url}\n\nThen type the 6-digit code from that page here and press Enter.");
+            let mut s = String::new();
+            std::io::stdin().read_line(&mut s)?;
+            s
+        }
+    })
+}
+
+fn fmt_ms(ms: u64) -> String {
+    time::OffsetDateTime::from_unix_timestamp((ms / 1000) as i64)
+        .ok()
+        .and_then(|t| t.format(time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]")).ok())
+        .unwrap_or_else(|| ms.to_string())
+}
+
+fn print_inbox(h: &Holder) -> anyhow::Result<()> {
+    let inbox = h.inbox()?;
+    if inbox.is_empty() {
+        println!("No likes wait for approval.");
+        return Ok(());
+    }
+    println!("Waiting for approval (`pop holder approve <numbers|all>`, or `pop holder reject ...`):");
+    for i in inbox {
+        println!("  {:>4}  {} {}  clicked {} UTC on {}{}", i.id, i.platform, i.post, fmt_ms(i.clicked_ms), i.from, i.note.map(|n| format!("  ({n})")).unwrap_or_default());
+    }
+    Ok(())
+}
+
+fn inbox_ids(h: &Holder, args: &[String]) -> anyhow::Result<Vec<u64>> {
+    if args.iter().any(|a| a == "all") {
+        return Ok(h.inbox()?.iter().map(|i| i.id).collect());
+    }
+    args.iter().map(|a| a.parse::<u64>().map_err(|_| anyhow::anyhow!("\"{a}\" is not a number or `all`"))).collect()
+}
+
+/// Queued likes go out at a random moment of the next window: stay until they have.
+async fn wait_for_queue(h: &Holder) {
+    if h.queued_likes() == 0 {
+        return;
+    }
+    println!("Sending at random moments of the next like window; keep this running (or use `pop holder serve`)...");
+    while h.queued_likes() > 0 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    println!("Sent.");
+}
+
 async fn holder_cmd(a: HolderArgs) -> anyhow::Result<()> {
     let wallet_dir = a.wallet.clone();
-    let h = Arc::new(wiring::build_holder(&a.issuer_url, &a.directory_url, wiring::platforms(&a.platforms.into()), Arc::new(FileWallet::open(&a.wallet)?)));
+    let relays = wiring::Relays { issuer: a.issuer_relay.clone(), directory: a.directory_relay.clone() };
+    let h = Arc::new(wiring::build_holder_via(&a.issuer_url, &a.directory_url, &relays, wiring::platforms(&a.platforms.into()), Arc::new(FileWallet::open(&a.wallet)?))?);
     match a.cmd {
         HolderCmd::Enrol { mock_login } => {
-            let url = h.enrol_start().await?;
-            let code = match mock_login {
-                Some(id) => devnet::mock_login(&url, &id).await?,
-                None => {
-                    println!("Open this address in your own browser and log in:\n\n  {url}\n\nThen type the 6-digit code from that page here and press Enter.");
-                    let mut s = String::new();
-                    std::io::stdin().read_line(&mut s)?;
-                    s
+            let code = login(&h.enrol_start().await?, mock_login).await?;
+            if let Err(e) = h.enrol_finish(&code).await {
+                if matches!(e, pop_holder::HolderError::EnrolNotReady(pop_protocol::api::EnrolStatus::AlreadyEnrolled)) {
+                    println!("This identity is already enrolled, so a second enrolment is refused.\n");
+                    println!("If you enrolled it yourself on a phone you no longer have, run `pop holder restore` (with your backup code)");
+                    println!("or `pop holder replace`. The new secret counts after about nine months.\n");
+                    println!("If you did NOT enrol it, someone has used your eID. First secure your eID: close it with its provider,");
+                    println!("report the crime to the police and get new eID means. How, with phone numbers: {}", reset_eid_help());
+                    println!("Then run `pop holder replace --not-me` with the new eID means. The other secret is suspended at once.");
                 }
-            };
-            h.enrol_finish(&code).await?;
+                return Err(e.into());
+            }
             println!("Enrolled. {}", serde_json::to_string_pretty(&h.status()?)?);
         }
         HolderCmd::Bind { platform, handle, slot, post } => {
@@ -524,6 +790,9 @@ async fn holder_cmd(a: HolderArgs) -> anyhow::Result<()> {
             println!("Badge withdrawn.");
         }
         HolderCmd::Like { platform, post } => {
+            let (wait, _) = h.like_delay().await?;
+            println!("Waiting {} s before sending (likes go out at a random moment of the next window, so the count does not go up the moment you liked)...", wait.as_secs());
+            tokio::time::sleep(wait).await;
             let r = h.like(&platform, &post).await?;
             println!("Reported. New person: {}. Verified likes on this post: {}.", r.new, r.count);
         }
@@ -532,7 +801,143 @@ async fn holder_cmd(a: HolderArgs) -> anyhow::Result<()> {
             h.revoke().await?;
             println!("Credential revoked.");
         }
-        HolderCmd::Status => println!("{}", serde_json::to_string_pretty(&h.status()?)?),
+        HolderCmd::Recheck { mock_login } => {
+            let code = login(&h.recheck_start().await?, mock_login).await?;
+            let next = h.recheck_finish(&code).await?;
+            println!("Identity re-checked. Same secret, same badges. Next re-check by {}.", dates::fmt_day(next));
+        }
+        HolderCmd::Backup => {
+            let code = h.backup_create().await?;
+            println!("Backup stored, encrypted. Write this code on paper and keep it away from this device:\n\n  {code}\n");
+            println!("It is shown this once and is not kept here. Whoever has it can restore your secret; without it nobody can read the backup.");
+        }
+        HolderCmd::Restore { code } => {
+            let code = match code {
+                Some(c) => c,
+                None => {
+                    println!("Type the backup code from your paper and press Enter.");
+                    let mut s = String::new();
+                    std::io::stdin().read_line(&mut s)?;
+                    s
+                }
+            };
+            h.restore(&code).await?;
+            println!("Restored. {}", serde_json::to_string_pretty(&h.status()?)?);
+            println!("If the credential has expired, run `pop holder renew`.");
+        }
+        HolderCmd::Replace { mock_login, not_me } => {
+            if not_me {
+                println!("Before you go on: if you have not secured your eID yet, do it first, or whoever used it can undo this.");
+                println!("How: {}\n", reset_eid_help());
+            }
+            let code = login(&h.replace_start().await?, mock_login).await?;
+            match h.replace_finish(&code, not_me).await? {
+                pop_holder::ReplaceOutcome::Issued { counted_from } if not_me => {
+                    println!("Reported. The secret enrolled with your identity is revoked from now on, and you have a new one.");
+                    println!("Bind your accounts again now; they and your likes count from {counted_from}.");
+                    println!("For 90 days, someone who has the old app AND can log in with your eID can still block this and take the");
+                    println!("identity back. If that happens, your eID is still not safe: tell the police and your eID provider. {}", reset_eid_help());
+                }
+                pop_holder::ReplaceOutcome::Issued { counted_from } => {
+                    println!("Secret replaced. The old secret is revoked; its badges run out with their leases.");
+                    println!("The new secret is in probation: bind your accounts again now, they and your likes count from {counted_from}.");
+                }
+                pop_holder::ReplaceOutcome::Waiting { claim_after, claim_before, suspended } => {
+                    if suspended {
+                        println!("Reported. The secret enrolled with your identity is suspended from now on: it can no longer bind accounts or like.");
+                        println!("It can be lifted only by someone who has that app AND can log in with your eID. If that happens, your eID is");
+                        println!("still not safe: tell the police and your eID provider. {}", reset_eid_help());
+                    }
+                    println!("Request recorded. This wallet does not have the old guardian key, so the replacement waits.");
+                    println!("Until then it can be refused from the app with the old secret, which takes your eID as well. Run `pop holder claim` between {claim_after} and {claim_before}.");
+                }
+            }
+        }
+        HolderCmd::Claim => println!("Secret replaced. Bind your accounts again; they and your likes count from {}.", h.replace_claim().await?),
+        HolderCmd::Veto { mock_login } => {
+            let pending = h.pending_replacement().await?.is_some();
+            let suspended = h.suspended().await?;
+            anyhow::ensure!(pending || suspended, "nobody is waiting to replace this wallet's secret, and it is not suspended");
+            let code = login(&h.recheck_start().await?, mock_login).await?;
+            h.recheck_finish(&code).await?;
+            if suspended {
+                println!("Suspension lifted: same secret, same badges. If someone had replaced it with a theft report, their new secret is revoked.");
+            }
+            if pending {
+                println!("Replacement refused.");
+            }
+            println!("If you did not ask for this, someone else can log in with your eID. Secure it now: {}", reset_eid_help());
+        }
+        HolderCmd::Status => {
+            let suspended = h.suspended().await.unwrap_or(false);
+            println!("{}", serde_json::to_string_pretty(&h.status()?)?);
+            if suspended {
+                println!(
+                    "\nWARNING: someone logged in with your eID and reported that they did not enrol this secret, so it is suspended.\n\
+                     If that was not you, run `pop holder veto` (it asks you to log in), then secure your eID: {}",
+                    reset_eid_help()
+                );
+            }
+            if let Ok(Some(p)) = h.pending_replacement().await {
+                println!(
+                    "\nWARNING: on {} someone logged in with your eID and asked to REPLACE this wallet's secret. It takes effect from {}.\nIf that was not you, run `pop holder veto` now (it asks you to log in), then secure your eID: {}",
+                    dates::fmt_day(p.requested_on),
+                    dates::fmt_day(p.claim_after),
+                    reset_eid_help()
+                );
+            }
+        }
+        HolderCmd::Pair { words, name, auto } => {
+            let words = if words.is_empty() {
+                println!("Type the nine words the other computer shows and press Enter.");
+                let mut s = String::new();
+                std::io::stdin().read_line(&mut s)?;
+                s
+            } else {
+                words.join(" ")
+            };
+            let p = h.pair(&words, name.as_deref(), auto).await?;
+            let end = pop_crypto::dates::fmt_day((p.end_ms / 86_400_000) as u32);
+            if p.ended {
+                println!("Paired as \"{}\". Its period is over (ended {end}): the likes it left were collected once.", p.name);
+            } else {
+                println!("Paired as \"{}\" until {} UTC ({end}). Likes from it are collected every few minutes while `pop holder serve` runs.", p.name, fmt_ms(p.end_ms));
+            }
+            if auto {
+                wait_for_queue(&h).await;
+            } else {
+                print_inbox(&h)?;
+            }
+        }
+        HolderCmd::Pairings => {
+            let n = h.collect_pairings().await?;
+            for p in h.pairings()? {
+                println!("{}: until {} UTC{}{}", p.name, fmt_ms(p.end_ms), if p.ended { " (ended)" } else { "" }, if p.auto { ", sends without asking" } else { "" });
+            }
+            if n > 0 {
+                println!("{n} new like(s) collected.");
+            }
+            print_inbox(&h)?;
+            wait_for_queue(&h).await;
+        }
+        HolderCmd::Approve { ids } => {
+            let ids = inbox_ids(&h, &ids)?;
+            for r in h.approve(&ids).await? {
+                match r.error {
+                    None => println!("{}: queued", r.id),
+                    Some(e) => println!("{}: not queued: {e}", r.id),
+                }
+            }
+            wait_for_queue(&h).await;
+        }
+        HolderCmd::Reject { ids } => {
+            let ids = inbox_ids(&h, &ids)?;
+            println!("{} like(s) dropped.", h.reject(&ids).await?);
+        }
+        HolderCmd::Unpair { name } => {
+            h.unpair(&name).await?;
+            println!("\"{name}\" unpaired: it can leave no more likes.");
+        }
         HolderCmd::Serve { listen, token } => {
             anyhow::ensure!(listen.ip().is_loopback(), "the local API must listen on a loopback address");
             let tf = wallet_dir.join("pairing-token");
@@ -547,6 +952,20 @@ async fn holder_cmd(a: HolderArgs) -> anyhow::Result<()> {
                     }
                 },
             };
+            if let Ok(Some(p)) = h.pending_replacement().await {
+                println!(
+                    "WARNING: on {} someone logged in with your eID and asked to REPLACE this wallet's secret (from {}). If that was not you, run `pop holder veto`, then secure your eID: http://{listen}{}",
+                    dates::fmt_day(p.requested_on),
+                    dates::fmt_day(p.claim_after),
+                    pop_holder::holder::RESET_EID_PATH
+                );
+            }
+            if h.suspended().await.unwrap_or(false) {
+                println!(
+                    "WARNING: this wallet's secret is suspended by a theft report made with your eID. If that was not you, run `pop holder veto`, then secure your eID: http://{listen}{}",
+                    pop_holder::holder::RESET_EID_PATH
+                );
+            }
             println!("Holder app listening on http://{listen}\nPairing token for the extension: {token}");
             serve(listen, local_api::router(h, token)).await?;
         }
@@ -576,18 +995,31 @@ async fn main() -> anyhow::Result<()> {
             let f: IssuerFile = serde_json::from_slice(&std::fs::read(&config).with_context(|| format!("cannot read {}", config.display()))?)?;
             let issuer = wiring::build_issuer(&f).await?;
             println!("Issuer listening on http://{listen}");
-            serve(listen, pop_issuer::router(issuer)).await?;
+            let pad_sizes = issuer.params().pad_sizes;
+            serve(listen, wiring::with_gateway(pop_issuer::router(issuer), &pad_sizes)?).await?;
         }
-        Cmd::Directory { listen, issuer_url, data_dir, platforms } => {
+        Cmd::Directory { listen, issuer_url, data_dir, platforms, lease_days, bucket_posts, like_batch_max, like_batch_min, like_batch_wait_ms } => {
             let d = Directory::connect(
                 Arc::new(HttpClient::new(&issuer_url)),
                 wiring::platforms(&platforms.into()),
                 wiring::store(data_dir.as_deref(), "directory-db")?,
-                DirectoryConfig::default(),
+                DirectoryConfig { lease_days, bucket_posts, like_batch_max: like_batch_max as usize, like_batch_min: (like_batch_min as usize).min(like_batch_max as usize), like_batch_wait_ms, ..Default::default() },
             )
             .await?;
             println!("Directory listening on http://{listen}");
-            serve(listen, pop_directory::router(d)).await?;
+            // the directory's gateway pads to the issuer's size classes
+            let pad_sizes = pop_protocol::api::IssuerApi::params(&HttpClient::new(&issuer_url)).await?.pad_sizes;
+            let mailbox = wiring::mailbox(data_dir.as_deref())?;
+            serve(listen, wiring::with_gateway(pop_directory::router(d).merge(mailbox), &pad_sizes)?).await?;
+        }
+        Cmd::Relay { listen, gateways } => {
+            let mut m = std::collections::BTreeMap::new();
+            for g in gateways {
+                let (name, url) = g.split_once('=').context("--gateway takes name=address")?;
+                m.insert(name.to_string(), url.to_string());
+            }
+            println!("Relay listening on http://{listen} for {}", m.keys().cloned().collect::<Vec<_>>().join(", "));
+            serve(listen, pop_ohttp::relay::router(m)?).await?;
         }
         Cmd::MockIdp { listen, public_url, client_id, client_secret, redirect_uri } => {
             println!("Mock identity provider listening on http://{listen}");

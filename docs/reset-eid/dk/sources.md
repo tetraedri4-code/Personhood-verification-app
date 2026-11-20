@@ -1,0 +1,5 @@
+- borger.dk, help with MitID: https://www.borger.dk/hjaelp-og-vejledning/hvad-har-du-brug-for-hjaelp-til/mitid
+- MitID, block the MitID app: https://www.mitid.dk/hjaelp/hjaelpeunivers/mitid-app/spaer-mitid-app/
+- MitID, suspected misuse: https://www.mitid.dk/hjaelp/hjaelpeunivers/mistanke-om-misbrug/
+- MitID, blocking: https://www.mitid.dk/hjaelp/hjaelpeunivers/spaerring/
+- Danish Police: https://politi.dk/

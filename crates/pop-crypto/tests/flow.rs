@@ -26,7 +26,7 @@ fn attrs(today: Day, handle: u64) -> IssuedAttrs {
     IssuedAttrs {
         handle,
         expiry: dates::quarter_end(q),
-        certified: dates::quarter_start(q.saturating_sub(4)),
+        certified: dates::week_start(today.saturating_sub(300)),
         last_check: dates::month_start(today),
         country: 246,
         first_quarter: q.saturating_sub(4),
@@ -57,33 +57,33 @@ fn run(ps: ProofSystem) {
     let bind = b"mockfeed|user:alice|nonce1";
 
     // binding
-    let bp = w.scheme.prove_binding(&mut rng, &alice, &tree, &w.ik.public, &w.wk.public, ctx, 1, today, true, bind).unwrap();
-    w.scheme.verify_binding(&vc, ctx, bind, &bp).unwrap();
+    let bp = w.scheme.prove_binding(&mut rng, &alice, &tree, &w.ik.public, &w.wk.public, ctx, 1, today, today, true, bind).unwrap();
+    w.scheme.verify_binding(&vc, today, ctx, bind, &bp).unwrap();
     // the same proof cannot be claimed for another account
-    assert!(w.scheme.verify_binding(&vc, ctx, b"mockfeed|user:mallory|nonce1", &bp).is_err());
+    assert!(w.scheme.verify_binding(&vc, today, ctx, b"mockfeed|user:mallory|nonce1", &bp).is_err());
     // nor in another context
-    assert!(w.scheme.verify_binding(&vc, "pop:ctx:other", bind, &bp).is_err());
+    assert!(w.scheme.verify_binding(&vc, today, "pop:ctx:other", bind, &bp).is_err());
     // the pseudonym is stable per (context, slot) and differs across slots
-    let bp2 = w.scheme.prove_binding(&mut rng, &alice, &tree, &w.ik.public, &w.wk.public, ctx, 1, today, false, b"x").unwrap();
+    let bp2 = w.scheme.prove_binding(&mut rng, &alice, &tree, &w.ik.public, &w.wk.public, ctx, 1, today, today, false, b"x").unwrap();
     assert_eq!(bp.nym, bp2.nym);
     assert_eq!(bp.tags, bp2.tags);
-    let bp3 = w.scheme.prove_binding(&mut rng, &alice, &tree, &w.ik.public, &w.wk.public, ctx, 2, today, false, b"x").unwrap();
+    let bp3 = w.scheme.prove_binding(&mut rng, &alice, &tree, &w.ik.public, &w.wk.public, ctx, 2, today, today, false, b"x").unwrap();
     assert_ne!(bp.nym, bp3.nym);
-    assert!(w.scheme.prove_binding(&mut rng, &alice, &tree, &w.ik.public, &w.wk.public, ctx, 4, today, false, b"x").is_err());
+    assert!(w.scheme.prove_binding(&mut rng, &alice, &tree, &w.ik.public, &w.wk.public, ctx, 4, today, today, false, b"x").is_err());
     // tampered: swapped nym
     let mut bad = bp.clone();
     bad.nym = bp3.nym.clone();
-    assert!(w.scheme.verify_binding(&vc, ctx, bind, &bad).is_err());
+    assert!(w.scheme.verify_binding(&vc, today, ctx, bind, &bad).is_err());
 
     // likes: one tag per person per post
-    let l1 = w.scheme.prove_like(&mut rng, &alice, &tree, &w.ik.public, &w.wk.public, ctx, "post-1", today).unwrap();
-    let l2 = w.scheme.prove_like(&mut rng, &alice, &tree, &w.ik.public, &w.wk.public, ctx, "post-1", today).unwrap();
-    let l3 = w.scheme.prove_like(&mut rng, &bob, &tree, &w.ik.public, &w.wk.public, ctx, "post-1", today).unwrap();
-    let l4 = w.scheme.prove_like(&mut rng, &alice, &tree, &w.ik.public, &w.wk.public, ctx, "post-2", today).unwrap();
+    let l1 = w.scheme.prove_like(&mut rng, &alice, &tree, &w.ik.public, &w.wk.public, ctx, "post-1", today, today).unwrap();
+    let l2 = w.scheme.prove_like(&mut rng, &alice, &tree, &w.ik.public, &w.wk.public, ctx, "post-1", today, today).unwrap();
+    let l3 = w.scheme.prove_like(&mut rng, &bob, &tree, &w.ik.public, &w.wk.public, ctx, "post-1", today, today).unwrap();
+    let l4 = w.scheme.prove_like(&mut rng, &alice, &tree, &w.ik.public, &w.wk.public, ctx, "post-2", today, today).unwrap();
     for (l, p) in [(&l1, "post-1"), (&l2, "post-1"), (&l3, "post-1"), (&l4, "post-2")] {
-        w.scheme.verify_like(&vc, ctx, p, l).unwrap();
+        w.scheme.verify_like(&vc, today, ctx, p, l).unwrap();
     }
-    assert!(w.scheme.verify_like(&vc, ctx, "post-2", &l1).is_err());
+    assert!(w.scheme.verify_like(&vc, today, ctx, "post-2", &l1).is_err());
     assert_eq!(l1.tag, l2.tag);
     assert_ne!(l1.tag, l3.tag);
     assert_ne!(l1.tag, l4.tag);
@@ -97,21 +97,96 @@ fn run(ps: ProofSystem) {
     let sig = w.scheme.reissue(&mut rng, &w.ik, &vc, session, &rp, new_exp).unwrap();
     let alice2 = w.scheme.finish_renewal(&w.ik.public, &alice, rho, &sig, new_exp).unwrap();
     assert_eq!(alice2.expiry(), new_exp);
-    let bp4 = w.scheme.prove_binding(&mut rng, &alice2, &tree, &w.ik.public, &w.wk.public, ctx, 1, today, false, b"y").unwrap();
+    let bp4 = w.scheme.prove_binding(&mut rng, &alice2, &tree, &w.ik.public, &w.wk.public, ctx, 1, today, today, false, b"y").unwrap();
     assert_eq!(bp4.nym, bp.nym, "renewal keeps pseudonyms");
 
-    // revocation: once alice's handle is in the tree she can no longer prove
+    // re-check: the issuer learns the handle and the old month, and moves the month forward
+    {
+        let later = today + 600; // 20 months on, inside the 24-month window
+        let mut old = alice2.clone();
+        // keep the credential alive up to `later` by blind renewals, as a real holder would
+        let exp = dates::quarter_end(dates::quarter_of(later));
+        let (rp, rho) = w.scheme.prove_renewal(&mut rng, &old, &tree, &w.ik.public, &w.wk.public, today, b"r2").unwrap();
+        let sig = w.scheme.reissue(&mut rng, &w.ik, &vc, b"r2", &rp, exp).unwrap();
+        old = w.scheme.finish_renewal(&w.ik.public, &old, rho, &sig, exp).unwrap();
+        let vcl = VerifyCtx { today: later, ..vc.clone() };
+        let (rp, rho) = w.scheme.prove_recheck(&mut rng, &old, &tree, &w.ik.public, &w.wk.public, later, b"rc").unwrap();
+        let (h, oc) = (old.attrs.handle, old.attrs.last_check);
+        let (ne, nc) = (dates::quarter_end(dates::quarter_of(later) + 1), dates::month_start(later));
+        // wrong handle (another person's login), wrong month, wrong session, or a plain renewal proof: refused
+        assert!(w.scheme.reissue_recheck(&mut rng, &w.ik, &vcl, b"rc", &rp, 1 << 41, oc, ne, nc, None).is_err());
+        assert!(w.scheme.reissue_recheck(&mut rng, &w.ik, &vcl, b"rc", &rp, h, oc + 31, ne, nc, None).is_err());
+        assert!(w.scheme.reissue_recheck(&mut rng, &w.ik, &vcl, b"other", &rp, h, oc, ne, nc, None).is_err());
+        assert!(w.scheme.reissue(&mut rng, &w.ik, &vcl, b"rc", &rp, ne).is_err(), "a re-check proof is not a renewal proof");
+        let (plain, _) = w.scheme.prove_renewal(&mut rng, &old, &tree, &w.ik.public, &w.wk.public, later, b"rc").unwrap();
+        assert!(w.scheme.reissue_recheck(&mut rng, &w.ik, &vcl, b"rc", &plain, h, oc, ne, nc, None).is_err());
+        let sig = w.scheme.reissue_recheck(&mut rng, &w.ik, &vcl, b"rc", &rp, h, oc, ne, nc, None).unwrap();
+        let fresh = w.scheme.finish_recheck(&w.ik.public, &w.wk.public, &old, rho, &sig, ne, nc, None).unwrap();
+        assert_eq!(fresh.attrs.last_check, nc);
+        // same secret, same pseudonym; and it now renews at a date where the old one could not
+        let far = later + 400;
+        let vcf = VerifyCtx { today: far, ..vc.clone() };
+        let _ = vcf;
+        assert!(w.scheme.prove_renewal(&mut rng, &old, &tree, &w.ik.public, &w.wk.public, far, b"x").is_err(), "re-check overdue");
+        assert!(w.scheme.prove_renewal(&mut rng, &fresh, &tree, &w.ik.public, &w.wk.public, later + 300, b"x").is_ok());
+        let bp5 = w.scheme.prove_binding(&mut rng, &fresh, &tree, &w.ik.public, &w.wk.public, ctx, 1, later, later, false, b"y").unwrap();
+        assert_eq!(bp5.nym, bp.nym, "a re-check keeps pseudonyms");
+
+        // lifting a suspension: the old handle is revoked; the re-check proves against the list as it
+        // was before the handle went on it, and the issuer swaps in a new handle
+        let before = w.scheme.revocation_tree(&[5]).unwrap();
+        let after = w.scheme.revocation_tree(&[5, h]).unwrap();
+        assert!(matches!(w.scheme.prove_recheck(&mut rng, &fresh, &after, &w.ik.public, &w.wk.public, later, b"lift"), Err(CryptoError::Revoked)));
+        let (rp, rho) = w.scheme.prove_recheck(&mut rng, &fresh, &before, &w.ik.public, &w.wk.public, later, b"lift").unwrap();
+        let vcb = VerifyCtx { today: later, revocation_root: before.root(), ..vc.clone() };
+        let nh = (1u64 << 42) + 9;
+        assert!(w.scheme.reissue_recheck(&mut rng, &w.ik, &vcb, b"lift", &rp, h, nc, ne, nc, Some(h)).is_err(), "same handle");
+        let sig = w.scheme.reissue_recheck(&mut rng, &w.ik, &vcb, b"lift", &rp, h, nc, ne, nc, Some(nh)).unwrap();
+        let hs = w.wk.sign_handle(&mut rng, nh);
+        let wrong = w.wk.sign_handle(&mut rng, nh + 1);
+        assert!(w.scheme.finish_recheck(&w.ik.public, &w.wk.public, &fresh, rho, &sig, ne, nc, Some((nh, &wrong))).is_err());
+        assert!(w.scheme.finish_recheck(&w.ik.public, &w.wk.public, &fresh, rho, &sig, ne, nc, None).is_err(), "signature is over the new handle");
+        let lifted = w.scheme.finish_recheck(&w.ik.public, &w.wk.public, &fresh, rho, &sig, ne, nc, Some((nh, &hs))).unwrap();
+        assert_eq!(lifted.attrs.handle, nh);
+        let bp6 = w.scheme.prove_binding(&mut rng, &lifted, &after, &w.ik.public, &w.wk.public, ctx, 1, later, later, false, b"y").unwrap();
+        assert_eq!(bp6.nym, bp.nym, "lifting keeps the secret and the pseudonyms");
+        let vca = VerifyCtx { today: later, revocation_root: after.root(), ..vc.clone() };
+        w.scheme.verify_binding(&vca, later, ctx, b"y", &bp6).unwrap();
+    }
+
+    // the public cutoff: a secret counting from after it can neither like nor claim a counted badge
+    {
+        let fresh_attrs = IssuedAttrs { certified: dates::week_start(today), ..attrs(today, 1 << 43) };
+        let session = b"session-2";
+        let (secrets, req) = BlindRequest::new(&mut rng, &w.scheme, session);
+        let sig = w.scheme.issue_blind(&mut rng, &w.ik, &req, &fresh_attrs, session).unwrap();
+        let hs = w.wk.sign_handle(&mut rng, 1 << 43);
+        let carol = w.scheme.finish_issuance(&w.ik.public, &w.wk.public, &secrets, &sig, &fresh_attrs, &hs).unwrap();
+        // no alarm: counts at once
+        let l = w.scheme.prove_like(&mut rng, &carol, &tree, &w.ik.public, &w.wk.public, ctx, "fresh", today, today).unwrap();
+        w.scheme.verify_like(&vc, today, ctx, "fresh", &l).unwrap();
+        // alarm reaching back before her enrolment week
+        let cut = dates::count_cutoff(today, Some(dates::week_start(today) - 7));
+        assert!(w.scheme.prove_like(&mut rng, &carol, &tree, &w.ik.public, &w.wk.public, ctx, "fresh", today, cut).is_err());
+        assert!(w.scheme.prove_binding(&mut rng, &carol, &tree, &w.ik.public, &w.wk.public, ctx, 1, today, cut, true, b"c").is_err());
+        assert!(w.scheme.prove_binding(&mut rng, &carol, &tree, &w.ik.public, &w.wk.public, ctx, 1, today, cut, false, b"c").is_ok());
+        // a proof made without the alarm does not verify under it, and the other way round
+        assert!(w.scheme.verify_like(&vc, cut, ctx, "fresh", &l).is_err());
+        let old_like = w.scheme.prove_like(&mut rng, &alice, &tree, &w.ik.public, &w.wk.public, ctx, "fresh", today, cut).unwrap();
+        w.scheme.verify_like(&vc, cut, ctx, "fresh", &old_like).unwrap();
+    }
+
     let tree2 = w.scheme.revocation_tree(&[5, 1 << 40]).unwrap();
     assert!(matches!(
-        w.scheme.prove_like(&mut rng, &alice, &tree2, &w.ik.public, &w.wk.public, ctx, "p", today),
+        w.scheme.prove_like(&mut rng, &alice, &tree2, &w.ik.public, &w.wk.public, ctx, "p", today, today),
         Err(CryptoError::Revoked)
     ));
     // a proof against an old root is rejected by a verifier that uses the new root
     let vc2 = VerifyCtx { revocation_root: tree2.root(), ..vc.clone() };
-    assert!(w.scheme.verify_like(&vc2, ctx, "post-1", &l1).is_err());
+    assert!(w.scheme.verify_like(&vc2, today, ctx, "post-1", &l1).is_err());
     // expired credential cannot bind
     let late = dates::quarter_end(dates::quarter_of(today)) + 1;
-    assert!(w.scheme.prove_binding(&mut rng, &bob, &tree, &w.ik.public, &w.wk.public, ctx, 1, late, false, b"z").is_err());
+    assert!(w.scheme.prove_binding(&mut rng, &bob, &tree, &w.ik.public, &w.wk.public, ctx, 1, late, late, false, b"z").is_err());
     eprintln!("{ps:?}: binding proof {} bytes, like proof {} bytes", bp.proof.len() / 2, l1.proof.len() / 2);
 }
 

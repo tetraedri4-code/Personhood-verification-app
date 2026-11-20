@@ -2,7 +2,6 @@
   "data_dir": "/var/lib/pop/issuer",
   "scheme": { "proof_system": "LegoGroth16", "tree_depth": 12, "slots": 3, "bp_gens_log2": 14 },
   "provider_code": 2,
-  "rollout_certified": null,
   "oidc": {
     "name": "ftn-broker",
     "issuer": "https://REPLACE-with-the-brokers-issuer-url",

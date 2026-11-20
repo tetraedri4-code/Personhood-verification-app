@@ -2,8 +2,10 @@
 // (src/adapters/*.js) find accounts and posts in the page and this file decides what to draw.
 //
 // Privacy rules this file keeps:
-//  * It never asks a server about an account or a post. It downloads the whole public list of verified
-//    accounts and the whole table of counts through the background worker, and looks things up locally.
+//  * It never asks a server about an account or a post. The background worker keeps the whole public
+//    list of verified accounts (syncing only changes), and this file looks accounts up locally. For
+//    counts it asks for the buckets of the posts on screen, each bucket holding many posts, in one
+//    request per screen (or keeps the whole table while it is small).
 //  * A like is reported only if the person switched reporting on in the options.
 //  * Everything from the directory and from the page is treated as untrusted text: it reaches the DOM
 //    only through textContent and title, never as HTML.
@@ -34,8 +36,8 @@
       if (!r || r.error) return;
       state.settings = r.settings;
       state.today = r.today;
+      state.alarm = Number.isInteger(r.alarm) ? r.alarm : null;
       state.seen = r.seen || {};
-      state.counts = r.counts || {};
       // an account can have several claims (anyone enrolled can name any account); keep them all
       state.list = new Map();
       state.byHandle = new Map();
@@ -62,6 +64,14 @@
     }
     const entryFor = (acct) => claimsFor(acct).find(confirmed);
 
+    // Same rule as BindingEntry::counts in the protocol: while an alarm is on, a claim counts if it
+    // was made before the cutoff or proved again under this alarm.
+    function countsNow(entry) {
+      if (!entry.counted) return false;
+      const a = state.alarm;
+      return a == null || entry.bound_on < a || entry.proved_alarm === a;
+    }
+
     function drawBadge(el, entry) {
       const next = el.nextElementSibling;
       const has = next && next.classList && next.classList.contains("pop-badge");
@@ -70,11 +80,14 @@
         return;
       }
       const b = has ? next : document.createElement("span");
-      b.className = "pop-badge" + (entry.counted ? "" : " pop-probation");
+      const counts = countsNow(entry);
+      b.className = "pop-badge" + (counts ? "" : " pop-probation");
       b.textContent = "1";
-      b.title = entry.counted
+      b.title = counts
         ? "One enrolled person runs this account (personhood prototype). This says nothing about who they are or whether they are trustworthy."
-        : "One enrolled person runs this account, enrolled less than nine months ago (probation).";
+        : state.alarm != null && entry.counted
+          ? "One enrolled person runs this account. Not counted while the alarm about stolen eID logins is on (recent enrolments are paused)."
+          : "One enrolled person runs this account, with a secret still in probation (replaced less than nine months ago).";
       b.setAttribute("role", "img");
       b.setAttribute("aria-label", "one enrolled person");
       if (!has) el.insertAdjacentElement("afterend", b);
@@ -104,14 +117,16 @@
       const btn = post.likeButton;
       if (!btn || hooked.has(btn)) return;
       hooked.add(btn);
-      btn.addEventListener("click", () => {
-        if (!state.settings.reportLikes) return;
+      btn.addEventListener("click", (ev) => {
+        // only the person's own click: a script of the page can call click() too
+        if (!ev.isTrusted || !state.settings.reportLikes) return;
         // let the site handle the click first, then see whether the post is now liked
         setTimeout(async () => {
           if (!adapter.isLiked(btn)) return;
-          const r = await send({ type: "like", platform: adapter.id, post: id });
+          const r = await send({ type: "like", platform: adapter.id, post: id, shown: state.mine.has(id) ? null : Number(state.counts[id] || 0) });
           if (r && !r.error) {
-            state.counts[id] = r.count;
+            // the holder app sends the like in the next window of the schedule; show it now
+            if (!state.mine.has(id)) state.counts[id] = Number(state.counts[id] || 0) + 1;
             state.mine.add(id);
             scan();
           }
@@ -137,9 +152,17 @@
       try {
         await noteProfile();
         for (const a of adapter.findAccounts(document)) drawBadge(a.el, entryFor(a));
+        const found = [];
         for (const post of adapter.findPosts(document)) {
           const id = await adapter.canonicalPostId(post.raw, { byHandle: state.byHandle, send });
-          if (!id) continue;
+          if (id) found.push([post, id]);
+        }
+        // one request for the whole screen
+        const r = found.length ? await send({ type: "counts", platform: adapter.id, posts: found.map(([, id]) => id) }) : null;
+        if (r && r.counts) {
+          for (const [id, n] of Object.entries(r.counts)) state.counts[id] = n;
+        }
+        for (const [post, id] of found) {
           hookLike(post, id);
           drawCount(post, id);
         }

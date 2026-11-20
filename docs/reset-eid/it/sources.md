@@ -1,0 +1,3 @@
+- AgID, SPID user guide (InfoCamere example): https://www.agid.gov.it/sites/default/files/repository_files/guida-utente_spid_v4.pdf
+- LepidaID, revocation and suspension form: https://id.lepida.it/docs/modulo_revoca_sospensione.pdf
+- Ministry of the Interior, electronic identity card: https://www.cartaidentita.interno.gov.it/

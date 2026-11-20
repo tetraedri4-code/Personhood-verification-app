@@ -72,15 +72,19 @@ Tables in use:
 | issuer | `enrolments` | deduplication key d | handle, guardian public key, status, day, uniqueness key version |
 | issuer | `enrol_sessions`, `enrol_states` | random ids | sessions in progress, deleted at the end or after 15 minutes |
 | issuer | `revoked` | handle | day of revocation |
+| issuer | `enrol_by_handle`, `enrol_by_claim`, `enrol_pending` | handle, claim-token hash, d | the record key d (lookup tables, rebuilt at start) |
 | directory | `bindings` | platform, account, pseudonym | the claim and its proof |
 | directory | `nyms` | platform, pseudonym | account the pseudonym is bound to |
 | directory | `likes` | platform, post, tag | day |
 | directory | `like_counts` | platform, post | count |
 | directory | `nonces` | kind, platform, nonce | day, pruned after three days |
 
-Two places scan a whole table and need an index or a query once there are many rows: the issuer's
-`revoke` (find the enrolment by handle) and the directory's `list` and `table`. With a database, add
-methods for those instead of calling `list`.
+The issuer finds enrolment records by handle and by claim token through three lookup tables it keeps
+in the same store (`enrol_by_handle`, `enrol_by_claim`, `enrol_pending`), so any store works without
+secondary indexes. They are rebuilt from `enrolments` at every start, which reads every record once
+(the start already does so to check key versions); they need no backup. With a database you can replace them
+by indexes on the record's handle and claim hash. The directory's `list` and `table` still read a whole
+table; with a database, add methods for those instead of calling `list`.
 
 The directory runs as one process: it serialises writes with an in-process lock. To run several, move
 the "one account per pseudonym" and "count once" logic into database transactions.
@@ -95,7 +99,7 @@ With `data_dir` set, the issuer writes to `data_dir/keys/` (and the uniqueness k
 | `issuer.key` | BBS signing key | credentials can be forged |
 | `witness.key` | signs revocation handles | with the issuer key: forged credentials pass |
 | `uniqueness-keys/NNNN.key` | keys the deduplication hash (single-operator mode) | enrolment records can be tested against known identity codes |
-| `lego-*.bin` | proving keys | public; but see below |
+| `lego2-*.bin` | proving keys | public; but see below |
 
 For anything beyond a demo:
 
@@ -113,10 +117,63 @@ For anything beyond a demo:
 - Back up `enrolments` and the uniqueness keys together. Without the key of its records nobody can be
   recognised as already enrolled, so the issuer refuses to start ([uniqueness.md](uniqueness.md) §1).
 
+### Policy settings
+
+Every number the rules chose is a setting in the `policy` section of the issuer configuration. Leave
+out any you do not change; a misspelt name is an error, and settings that would break a rule (a
+probation that is not whole weeks, a block window shorter than the probation it guards) stop the issuer
+at start. The settings in force are public at `GET /v1/policy`.
+
+```json
+"policy": {
+  "replace_wait_days": 90,                 // replacement without the old guardian key waits this long
+  "claim_window_days": 90,                 // ... and must then be collected within this many days
+  "replace_min_interval_days": 30,         // at most one replacement per person in this many days
+  "probation_days": 280,                   // probation of a replaced secret (whole weeks)
+  "report_probation_days": 7,              // probation after the first theft report in the period below
+  "contest_days": 90,                      // the replaced secret can block that replacement this long
+  "fresh_replacement_interval_days": 730,  // one quick replacement after a report per person in this time
+  "report_count_interval_days": 30,        // one report per person counts in the public totals
+  "alarm": {
+    "min_reports": 20, "factor": 3,        // a week is high with this many reports and this many times
+    "baseline_weeks": 12,                  //   the median of the weeks before
+    "alarm_weeks": 4,                      // the alarm stays on while one of the latest weeks is high
+    "reach_days": 28                       // enrolments from this long before stop counting
+  },
+  "previous_root_grace_secs": 120,         // proofs against the previous revocation root are taken this long
+  "max_backup_chars": 44000,               // largest encrypted backup
+  "pad_sizes": [1024, 4096, 16384, 65536, 262144, 1048576],  // relay messages are padded to these sizes
+  "like_window_secs": 1800                // a like clicked in one half-hour is sent at a random moment of the next
+}
+```
+
+(JSON has no comments: they only explain the fields here.) See [recovery.md](recovery.md) for what each
+rule does. Set the alarm from the counts of real weeks; the counts are public at `GET /v1/reports`. The
+badge lease is a setting of the directory (`pop directory --lease-days`, default 274), and so is the
+size of count buckets (`--bucket-posts`, default 32). The relay settings are explained in
+[relay.md](relay.md); the directory's gateway takes the size classes from the issuer's parameters. The two-year
+re-check and the twelve months an expired credential can still renew are part of the proof statement
+and not settings: changing them means new proving keys for every holder and verifier.
+
+The two backup routes can be served from another host than the issuer; they share only the
+`backup_tickets` table with it ([recovery.md](recovery.md) §2). Changes to an enrolment record (revoke,
+re-check, replace, claim) are serialised by a lock inside the issuer process: run one issuer process, or
+move that into your database as a compare-and-swap on the record. The theft-report counts are in the
+`theft_reports` table; back it up with `enrolments`.
+
+The issuer configuration no longer takes `replace_wait_days`, `alarm_min_reports` and `alarm_factor` at
+the top level (they are in `policy`), nor `rollout_certified`.
+
+The proving-key files are named `lego2-*.bin` since the like statement changed; older `lego-*.bin`
+files are unused and can be deleted.
+
 ## 4. Revocation list
 
-`GET /v1/revocations` returns every revoked handle, and each holder rebuilds the tree to find its own
-path without telling anyone its handle. That stops scaling in the tens of thousands. The design's answer
+`GET /v1/revocations?since=N` returns the revoked handles from position N on, in the order they were
+revoked. The holder keeps the list (in its wallet cache), asks only for the rest, and rebuilds the tree
+to find its own path without telling anyone its handle. A new device still downloads the whole list
+once (about 20 bytes per revoked credential, less with gzip), and every holder keeps it, which stops
+scaling somewhere in the millions. The design's answer
 (§4.6) is a bucketed lookup: the holder asks for the bucket of leaves around its handle plus the path
 above. `IssuerApi::revocations` is the one method to change, with `Holder::tree`.
 
@@ -125,17 +182,25 @@ The tree depth is in the scheme configuration: capacity is 4^depth − 1 revoked
 
 ## 5. Like counts
 
-The extension downloads the whole counts table (`GET /v1/likes/table`) so the directory does not learn
-which posts a person looks at. At scale, serve it in buckets by a prefix of the hashed post id, so a
-request reveals only a bucket. An enrolled person can report likes for post ids that do not exist; the
+While a platform has few posts with likes, the extension keeps its whole counts table and syncs it
+(`GET /v1/likes/table?since=N`), so the directory does not learn which posts a person looks at; the
+same holds for the list of bound accounts (`GET /v1/bindings?since=N`). Beyond that it asks for count
+buckets (`GET`/`POST /v1/likes/buckets`), each holding about `pop directory --bucket-posts` posts
+(default 32); a request reveals only buckets, about 1 in 32 posts ([data-usage.md](data-usage.md)).
+The directory keeps the counts ordered by bucket in memory, rebuilt from `like_counts` at start; with
+a database, an index on (platform, bucket hash) replaces it. Removed claims are remembered for 30 days; a reader away longer
+gets the whole list again. A store that keeps change numbers needs them to be atomic with the write,
+which the prototype gets from the directory's write lock. An enrolled person can report likes for post ids that do not exist; the
 directory only checks the id's form. Tags are unlinkable by design, so this cannot be limited per
 person. Cap it at the proxy and prune posts with a single tag from the table if it becomes a problem.
 
 ## 6. Network privacy
 
-The design routes every proof through delaying relays (§4.7). The prototype sends them directly, so the
-directory sees the sender's address and the time. Both clients take a `reqwest::Client`
-(`HttpClient::with_client`), which is where an Oblivious HTTP relay or a proxy goes.
+`pop issuer` and `pop directory` serve an Oblivious HTTP gateway (`POST /ohttp`, `GET /ohttp/keys`).
+Have someone else run a relay (`pop relay`, or a hosted RFC 9458 relay) and give holders and the
+extension its address: the servers then do not see their addresses. See [relay.md](relay.md). Keep
+`/ohttp` out of any per-address rate limit at your proxy (every request comes from the relay); limit at
+the relay instead. The design's relays also delay and mix reports (§4.7); this one does not.
 
 ## 7. Before real people use it
 

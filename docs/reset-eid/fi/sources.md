@@ -1,0 +1,11 @@
+- Laki vahvasta sähköisestä tunnistamisesta ja sähköisistä luottamuspalveluista 617/2009, § 25, as amended by Act 533/2016 (later amendments not checked): https://finlex.fi/api/media/statute/69585/mainPdf/main.pdf
+- Nordea, "Toimi näin, jos epäilet tulleesi huijatuksi": https://www.nordea.fi/henkiloasiakkaat/sinun-elamasi/turvallisuus/jouduitko-huijatuksi.html
+- Nordea, "Pankkitunnukset": https://www.nordea.fi/henkiloasiakkaat/palvelumme/verkko-mobiilipalvelut/pankkitunnukset/
+- OP, "Turvallinen asiointi": https://www.op.fi/henkiloasiakkaat/asiakkuus/turvallisuus
+- Elisa, Mobiilivarmenne, usein kysyttyä: https://elisa.fi/asiakaspalvelu/aihe/mobiilivarmenne/ohje/usein-kysyttya/
+- Elisa, SIM tai laite kadonnut: https://elisa.fi/asiakaspalvelu/puheliittymat/sim-tai-laite-kadonnut/
+- Telia, Mobile certificate: https://www.telia.fi/asiakastuki/palvelut/mobile-certificate
+- DVV, Citizen certificate: https://dvv.fi/en/citizen-certificate
+- Asiakastieto, "Identiteettivarkaus – mitä tehdä aivan ensimmäisenä?": https://www.asiakastieto.fi/omatieto/fi/ukk/jos-havaitsen-identiteettivarkauden-mita-minun-tulee-tehda-aivan-ensimmaisena
+- Asiakastieto, where to file the police report: https://www.asiakastieto.fi/omatieto/fi/ukk/jos-ep%E4ilen-identiteettivarkautta%2C-niin-miss%E4-kohtaa-minun-kannattaa-tehd%E4-rikosilmoitus
+- Commission Implementing Regulation (EU) 2015/1502, Annex, 2.2.3: https://nccert.pl/files/CELEX_32015R1502_EN.pdf

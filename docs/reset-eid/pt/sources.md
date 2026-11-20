@@ -1,0 +1,3 @@
+- gov.pt, cancel the Digital Mobile Key: https://www.gov.pt/servicos/cancelar-a-chave-movel-digital
+- gov.pt, cancel the citizen card: https://www.gov.pt/servicos/cancelar-o-cartao-de-cidadao
+- gov.pt, report and cancel lost or stolen cards: https://www.gov.pt/guias/comunicar-e-cancelar-os-cartoes-perdidos-ou-roubados

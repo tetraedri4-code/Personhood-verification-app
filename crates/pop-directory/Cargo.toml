@@ -6,6 +6,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+hex.workspace = true
+rand.workspace = true
 pop-crypto.workspace = true
 pop-protocol.workspace = true
 pop-storage.workspace = true
@@ -16,3 +18,4 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+sha2.workspace = true

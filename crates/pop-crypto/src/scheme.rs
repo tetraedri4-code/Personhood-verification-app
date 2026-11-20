@@ -120,50 +120,62 @@ impl IssuerKey {
     }
 }
 
-/// Key of the log witnesses, who sign every issued handle r once (Pointcheval–Sanders).
+/// Key of the log witnesses, who sign every issued handle r once. A BBS signature on the one message r
+/// (A = (P1_w + H_w r)^{1/(x+e)}), so that showing it takes only G1 relations and one pairing
+/// equation, which combine across a batch of proofs. (Design §4.2 has Pointcheval–Sanders, whose
+/// showing needs a commitment in GT; see docs/crypto.md.)
 pub struct WitnessKey {
     x: Fr,
-    y: Fr,
     pub public: WitnessPublicKey,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct WitnessPublicKey {
-    pub xt: G2A,
-    pub yt: G2A,
+    pub w: G2A,
 }
 
+/// (A, e)
 #[derive(Clone, Debug, PartialEq)]
-pub struct HandleSignature(pub G1A, pub G1A);
+pub struct HandleSignature(pub G1A, pub Fr);
+
+fn witness_b(r: u64) -> G1 {
+    let g = Gens::cached();
+    g.wp1 + g.wh * Fr::from(r)
+}
 
 impl WitnessKey {
     pub fn generate<R: RngCore>(rng: &mut R) -> Self {
-        Self::from_scalars(Fr::rand(rng), Fr::rand(rng))
+        Self::from_scalar(Fr::rand(rng))
     }
-    fn from_scalars(x: Fr, y: Fr) -> Self {
-        let g2 = G2::generator();
-        WitnessKey { x, y, public: WitnessPublicKey { xt: (g2 * x).into_affine(), yt: (g2 * y).into_affine() } }
+    fn from_scalar(x: Fr) -> Self {
+        WitnessKey { x, public: WitnessPublicKey { w: (G2::generator() * x).into_affine() } }
     }
     pub fn to_bytes(&self) -> Vec<u8> {
-        codec::ser(&(self.x, self.y))
+        codec::ser(&self.x)
     }
     pub fn from_bytes(b: &[u8]) -> Result<Self> {
-        let (x, y): (Fr, Fr) = codec::de(b)?;
-        Ok(Self::from_scalars(x, y))
+        let x: Fr = codec::de(b).map_err(|_| CryptoError::Encoding("witness key: not a BBS key (keys from before 20 November 2026 were Pointcheval–Sanders; generate a new one)".into()))?;
+        Ok(Self::from_scalar(x))
     }
     pub fn sign_handle<R: RngCore>(&self, rng: &mut R, r: u64) -> HandleSignature {
-        let h = (G1::generator() * Fr::rand(rng)).into_affine();
-        HandleSignature(h, (h * (self.x + self.y * Fr::from(r))).into_affine())
+        loop {
+            let e = Fr::rand(rng);
+            if let Some(inv) = (self.x + e).inverse() {
+                return HandleSignature((witness_b(r) * inv).into_affine(), e);
+            }
+        }
     }
 }
 
 impl WitnessPublicKey {
+    /// e(A, W g2^e) = e(P1_w + H_w r, g2)
     pub fn verify_handle(&self, r: u64, sig: &HandleSignature) -> bool {
         if sig.0.is_zero() {
             return false;
         }
-        let rhs = (self.xt.into_group() + self.yt * Fr::from(r)).into_affine();
-        E::multi_pairing([sig.1, (-sig.0.into_group()).into_affine()], [G2::generator().into_affine(), rhs]).is_zero()
+        let g2 = G2::generator();
+        let lhs = (self.w.into_group() + g2 * sig.1).into_affine();
+        E::multi_pairing([sig.0, (-witness_b(r)).into_affine()], [lhs, g2.into_affine()]).is_zero()
     }
 }
 
@@ -178,7 +190,9 @@ pub struct IssuedAttrs {
     pub handle: u64,
     /// tau: expiry, the last day of a calendar quarter
     pub expiry: Day,
-    /// gamma: first day of the quarter in which s was certified (probation)
+    /// gamma: the Monday from which s counts (likes accepted, badges counted). The week of enrolment
+    /// for a first enrolment, 40 weeks later for a replaced secret. Proofs show only that it is not
+    /// after the public cutoff (`dates::count_cutoff`).
     pub certified: Day,
     /// ell: first day of the month of the last eID check
     pub last_check: Day,
@@ -198,8 +212,8 @@ impl IssuedAttrs {
         if self.expiry != dates::quarter_end(q) {
             return Err(CryptoError::OffGrid("expiry is not the last day of a quarter".into()));
         }
-        if self.certified != dates::quarter_start(dates::quarter_of(self.certified)) {
-            return Err(CryptoError::OffGrid("certification date is not a quarter start".into()));
+        if self.certified != dates::week_start(self.certified) {
+            return Err(CryptoError::OffGrid("the counts-from date is not a Monday".into()));
         }
         if self.last_check != dates::month_start(self.last_check) {
             return Err(CryptoError::OffGrid("re-check date is not a month start".into()));
@@ -455,18 +469,19 @@ impl Scheme {
                 quarters: dates::lease_quarters(today),
                 today,
                 probation: kind == StatementKind::BindingProbation,
+                cutoff: today,
                 root: Fr::zero(),
                 bind: vec![],
             },
-            StatementKind::Like => Stmt::Like { ctx: "setup".into(), post: "setup".into(), today, root: Fr::zero(), bind: vec![] },
-            StatementKind::Renewal => Stmt::Renewal { today, root: Fr::zero(), bind: vec![] },
+            StatementKind::Like => Stmt::Like { ctx: "setup".into(), post: "setup".into(), today, cutoff: today, root: Fr::zero(), bind: vec![] },
+            StatementKind::Renewal => Stmt::Renewal { today, root: Fr::zero(), bind: vec![], shown: None },
         }
     }
 
     fn cfg_for(&self, st: &Stmt) -> Cfg {
         let kind = st.kind();
         let (hashes, ranges, today, root, bind) = match st {
-            Stmt::Binding { ctx, slot, quarters, today, probation, root, bind } => {
+            Stmt::Binding { ctx, slot, quarters, today, probation, cutoff, root, bind } => {
                 let p = context_scalar(ctx);
                 let mut h = vec![HashUse {
                     label: "nym",
@@ -490,15 +505,11 @@ impl Scheme {
                 }
                 let mut r = vec![Range { label: "tau >= today", terms: vec![(A_TAU, 1)], constant: -(*today as i64) }];
                 if *probation {
-                    r.push(Range {
-                        label: "gamma <= today - 9 months",
-                        terms: vec![(A_GAMMA, -1)],
-                        constant: *today as i64 - dates::PROBATION_DAYS as i64,
-                    });
+                    r.push(Range { label: "gamma <= cutoff", terms: vec![(A_GAMMA, -1)], constant: *cutoff as i64 });
                 }
                 (h, r, *today, *root, bind.clone())
             }
-            Stmt::Like { ctx, post, today, root, bind } => {
+            Stmt::Like { ctx, post, today, cutoff, root, bind } => {
                 let h = vec![HashUse {
                     label: "like",
                     tag: dom("like"),
@@ -508,10 +519,15 @@ impl Scheme {
                     bases: vec![output_base("like", ctx, 0, post)],
                     hidden: vec![false],
                 }];
-                let r = vec![Range { label: "tau >= today", terms: vec![(A_TAU, 1)], constant: -(*today as i64) }];
+                // A like counts only from a secret that is past its probation. Without this, replacing
+                // the secret (recovery) would hand out a fresh set of like tags each time.
+                let r = vec![
+                    Range { label: "tau >= today", terms: vec![(A_TAU, 1)], constant: -(*today as i64) },
+                    Range { label: "gamma <= cutoff", terms: vec![(A_GAMMA, -1)], constant: *cutoff as i64 },
+                ];
                 (h, r, *today, *root, bind.clone())
             }
-            Stmt::Renewal { today, root, bind } => {
+            Stmt::Renewal { today, root, bind, .. } => {
                 let t = *today as i64;
                 let r = vec![
                     Range { label: "tau >= today - 12 months", terms: vec![(A_TAU, 1)], constant: dates::RENEW_GRACE_DAYS as i64 - t },
@@ -536,6 +552,13 @@ impl Scheme {
         }
         context.extend_from_slice(&(bind.len() as u64).to_be_bytes());
         context.extend_from_slice(&bind);
+        let mut reveal = vec![];
+        if let Stmt::Renewal { shown: Some((handle, last_check)), .. } = st {
+            context.extend_from_slice(b"|RECHECK");
+            context.extend_from_slice(&handle.to_be_bytes());
+            context.extend_from_slice(&last_check.to_be_bytes());
+            reveal = vec![(A_R, Fr::from(*handle)), (A_ELL, Fr::from(*last_check as u64))];
+        }
         Cfg {
             name: kind.name().into(),
             context,
@@ -546,6 +569,7 @@ impl Scheme {
             ranges,
             d_entries: vec![],
             reissue: kind == StatementKind::Renewal,
+            reveal,
             backend: self.config.proof_system,
             width: 5,
             compact: false,
@@ -557,8 +581,7 @@ impl Scheme {
         Public {
             g: &self.g,
             w_iss: issuer.w,
-            ps_xt: witness.xt,
-            ps_yt: witness.yt,
+            wit_w: witness.w,
             acc_q: G2::generator().into_affine(),
             gens: &[],
             pc: PedersenGens { B: self.g.ped_b, B_blinding: self.g.ped_h },
@@ -611,7 +634,7 @@ impl Scheme {
         let holder = Holder {
             cred: cred.inner.clone(),
             r_u64: cred.handle(),
-            ps: (cred.handle_sig.0, cred.handle_sig.1),
+            wsig: (cred.handle_sig.0, cred.handle_sig.1),
             wits: vec![],
             paths: vec![path],
             rho_new,
@@ -658,6 +681,7 @@ impl Scheme {
         ctx: &str,
         slot: u32,
         today: Day,
+        cutoff: Day,
         probation: bool,
         bind: &[u8],
     ) -> Result<BindingProof> {
@@ -665,7 +689,7 @@ impl Scheme {
             return Err(CryptoError::Unprovable(format!("slot must be 1..={}", self.config.slots)));
         }
         let quarters = dates::lease_quarters(today);
-        let st = Stmt::Binding { ctx: ctx.into(), slot, quarters, today, probation, root: tree.root(), bind: bind.to_vec() };
+        let st = Stmt::Binding { ctx: ctx.into(), slot, quarters, today, probation, cutoff, root: tree.root(), bind: bind.to_vec() };
         let pr = self.prove_stmt(rng, &st, cred, tree, issuer, witness)?;
         Ok(BindingProof {
             slot,
@@ -677,7 +701,9 @@ impl Scheme {
         })
     }
 
-    pub fn verify_binding(&self, vc: &VerifyCtx, ctx: &str, bind: &[u8], bp: &BindingProof) -> Result<()> {
+    /// `cutoff`: the verifier's own `dates::count_cutoff` for the proof's day (it matters only when the
+    /// proof claims `probation_cleared`).
+    pub fn verify_binding(&self, vc: &VerifyCtx, cutoff: Day, ctx: &str, bind: &[u8], bp: &BindingProof) -> Result<()> {
         if bp.slot == 0 || bp.slot > self.config.slots {
             return Err(CryptoError::InvalidProof);
         }
@@ -691,6 +717,7 @@ impl Scheme {
             quarters,
             today: vc.today,
             probation: bp.probation_cleared,
+            cutoff,
             root: vc.revocation_root,
             bind: bind.to_vec(),
         };
@@ -715,19 +742,69 @@ impl Scheme {
         ctx: &str,
         post: &str,
         today: Day,
+        cutoff: Day,
     ) -> Result<LikeProof> {
-        let st = Stmt::Like { ctx: ctx.into(), post: post.into(), today, root: tree.root(), bind: vec![] };
+        let st = Stmt::Like { ctx: ctx.into(), post: post.into(), today, cutoff, root: tree.root(), bind: vec![] };
         let pr = self.prove_stmt(rng, &st, cred, tree, issuer, witness)?;
         Ok(LikeProof { tag: to_hex(&pr.outputs[0]), proof: hex::encode(codec::encode_proof(&pr)) })
     }
 
-    pub fn verify_like(&self, vc: &VerifyCtx, ctx: &str, post: &str, lp: &LikeProof) -> Result<()> {
-        let st = Stmt::Like { ctx: ctx.into(), post: post.into(), today: vc.today, root: vc.revocation_root, bind: vec![] };
+    pub fn verify_like(&self, vc: &VerifyCtx, cutoff: Day, ctx: &str, post: &str, lp: &LikeProof) -> Result<()> {
+        let st = Stmt::Like { ctx: ctx.into(), post: post.into(), today: vc.today, cutoff, root: vc.revocation_root, bind: vec![] };
         let pr = self.verify_stmt(&st, vc, &lp.proof)?;
         if to_hex(&pr.outputs[0]) != lp.tag {
             return Err(CryptoError::InvalidProof);
         }
         Ok(())
+    }
+
+    /// Check many like proofs at once ([`statement::verify_batch`]): accepts only if every one would pass
+    /// [`Scheme::verify_like`]. On failure it does not say which ([`Scheme::sieve_likes`] does).
+    /// Items: (context, post, proof).
+    pub fn verify_likes<R: RngCore + CryptoRng>(&self, rng: &mut R, vc: &VerifyCtx, cutoff: Day, items: &[(&str, &str, &LikeProof)]) -> Result<()> {
+        let mut decoded = Vec::with_capacity(items.len());
+        for it in items {
+            decoded.push(self.decode_like(vc, cutoff, it)?.ok_or(CryptoError::InvalidProof)?);
+        }
+        let p = self.public(vc.issuer, vc.witness);
+        let pairs: Vec<(&Cfg, &statement::Proof)> = decoded.iter().map(|(c, pr)| (c, pr)).collect();
+        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| statement::verify_batch(&p, &pairs, rng))).unwrap_or(false);
+        if ok { Ok(()) } else { Err(CryptoError::InvalidProof) }
+    }
+
+    /// Which like proofs are valid, each as [`Scheme::verify_like`] would say, checked in batches and,
+    /// where a batch fails, in halves ([`statement::sieve_batch`]): false proofs cannot sink true ones.
+    pub fn sieve_likes<R: RngCore + CryptoRng>(&self, rng: &mut R, vc: &VerifyCtx, cutoff: Day, items: &[(&str, &str, &LikeProof)]) -> Result<Vec<bool>> {
+        let mut decoded = Vec::with_capacity(items.len());
+        for it in items {
+            decoded.push(self.decode_like(vc, cutoff, it)?);
+        }
+        let idx: Vec<usize> = (0..items.len()).filter(|i| decoded[*i].is_some()).collect();
+        let pairs: Vec<(&Cfg, &statement::Proof)> = idx.iter().map(|i| decoded[*i].as_ref().map(|(c, pr)| (c, pr)).unwrap()).collect();
+        let p = self.public(vc.issuer, vc.witness);
+        let flags = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| statement::sieve_batch(&p, &pairs, rng))).unwrap_or_else(|_| vec![false; pairs.len()]);
+        let mut out = vec![false; items.len()];
+        for (k, i) in idx.iter().enumerate() {
+            out[*i] = flags[k];
+        }
+        Ok(out)
+    }
+
+    /// The statement and decoded proof of a like, after the checks that need no cryptography. Ok(None): the
+    /// proof is false; Err: the keys are missing.
+    fn decode_like(&self, vc: &VerifyCtx, cutoff: Day, (ctx, post, lp): &(&str, &str, &LikeProof)) -> Result<Option<(Cfg, statement::Proof)>> {
+        let st = Stmt::Like { ctx: (*ctx).into(), post: (*post).into(), today: vc.today, cutoff, root: vc.revocation_root, bind: vec![] };
+        let cfg = self.cfg_for(&st);
+        if self.config.proof_system == ProofSystem::LegoGroth16 && cfg.lego.is_none() {
+            return Err(CryptoError::MissingKeys(st.kind().name().into()));
+        }
+        let Ok(bytes) = hex::decode(&lp.proof) else { return Ok(None) };
+        let Ok(pr) = codec::decode_proof(&bytes) else { return Ok(None) };
+        let expect_outputs = cfg.hashes.iter().map(|h| h.bases.len()).sum::<usize>();
+        if pr.outputs.len() != expect_outputs || pr.cnew.is_some() != cfg.reissue || !pr.gens.is_empty() || to_hex(&pr.outputs[0]) != lp.tag {
+            return Ok(None);
+        }
+        Ok(Some((cfg, pr)))
     }
 
     /// The like tag a holder would produce for a post, without a proof (used to undo a like locally).
@@ -758,7 +835,7 @@ impl Scheme {
         today: Day,
         session: &[u8],
     ) -> Result<(RenewalProof, Fr)> {
-        let st = Stmt::Renewal { today, root: tree.root(), bind: session.to_vec() };
+        let st = Stmt::Renewal { today, root: tree.root(), bind: session.to_vec(), shown: None };
         let rho_new = Fr::rand(rng);
         let pr = self.prove_stmt_with(rng, &st, cred, tree, issuer, witness, Some(rho_new))?;
         Ok((RenewalProof { proof: hex::encode(codec::encode_proof(&pr)) }, rho_new))
@@ -777,7 +854,7 @@ impl Scheme {
         if new_expiry != dates::quarter_end(dates::quarter_of(new_expiry)) {
             return Err(CryptoError::OffGrid("new expiry".into()));
         }
-        let st = Stmt::Renewal { today: vc.today, root: vc.revocation_root, bind: session.to_vec() };
+        let st = Stmt::Renewal { today: vc.today, root: vc.revocation_root, bind: session.to_vec(), shown: None };
         let pr = self.verify_stmt(&st, vc, &rp.proof)?;
         let cnew = pr.cnew.ok_or(CryptoError::InvalidProof)?;
         let b = self.g.p1 + self.g.q1 * statement::domain() + cnew + self.g.h[A_TAU] * Fr::from(new_expiry as u64);
@@ -812,6 +889,115 @@ impl Scheme {
     }
 }
 
+// ------------------------------- re-check -------------------------------
+//
+// The two-year identity re-check (design §4.6). The holder logs in with the eID and shows a renewal
+// proof that also reveals the credential's handle and the month of its last check. The issuer, who
+// knows from the login which enrolment record this is, checks that the handle is that record's, and
+// signs the same hidden attributes with a new expiry and a new last-check month. The secret, and with
+// it every pseudonym, stays; the issuer learns nothing it did not know from the login.
+impl Scheme {
+    /// Holder: like [`Scheme::prove_renewal`], with the handle and last-check month shown.
+    pub fn prove_recheck<R: RngCore + CryptoRng>(
+        &self,
+        rng: &mut R,
+        cred: &Credential,
+        tree: &RevocationTree,
+        issuer: &IssuerPublicKey,
+        witness: &WitnessPublicKey,
+        today: Day,
+        session: &[u8],
+    ) -> Result<(RenewalProof, Fr)> {
+        let st = Stmt::Renewal { today, root: tree.root(), bind: session.to_vec(), shown: Some((cred.attrs.handle, cred.attrs.last_check)) };
+        let rho_new = Fr::rand(rng);
+        let pr = self.prove_stmt_with(rng, &st, cred, tree, issuer, witness, Some(rho_new))?;
+        Ok((RenewalProof { proof: hex::encode(codec::encode_proof(&pr)) }, rho_new))
+    }
+
+    /// Issuer: verify a re-check proof for the credential with `handle` whose last check was in the
+    /// month starting `old_check`, and sign with `new_expiry` and `new_check`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reissue_recheck<R: RngCore>(
+        &self,
+        rng: &mut R,
+        key: &IssuerKey,
+        vc: &VerifyCtx,
+        session: &[u8],
+        rp: &RenewalProof,
+        handle: u64,
+        old_check: Day,
+        new_expiry: Day,
+        new_check: Day,
+        new_handle: Option<u64>,
+    ) -> Result<BlindSignature> {
+        if new_handle.is_some_and(|h| h == 0 || h >= 1 << 63 || h == handle) {
+            return Err(CryptoError::OffGrid("new handle".into()));
+        }
+        if new_expiry != dates::quarter_end(dates::quarter_of(new_expiry)) || new_check != dates::month_start(new_check) || new_check < old_check {
+            return Err(CryptoError::OffGrid("new expiry or re-check month".into()));
+        }
+        let st = Stmt::Renewal { today: vc.today, root: vc.revocation_root, bind: session.to_vec(), shown: Some((handle, old_check)) };
+        let pr = self.verify_stmt(&st, vc, &rp.proof)?;
+        let cnew = pr.cnew.ok_or(CryptoError::InvalidProof)?;
+        // cnew commits to every attribute but the expiry, the old month and handle included; swap the
+        // month, and the handle when a suspension is lifted (the old handle stays revoked)
+        let mut b = self.g.p1 + self.g.q1 * statement::domain() + cnew + self.g.h[A_TAU] * Fr::from(new_expiry as u64)
+            + self.g.h[A_ELL] * (Fr::from(new_check as u64) - Fr::from(old_check as u64));
+        if let Some(nh) = new_handle {
+            b += self.g.h[A_R] * (Fr::from(nh) - Fr::from(handle));
+        }
+        let e = Fr::rand(rng);
+        let a = (b * (key.x + e).inverse().unwrap()).into_affine();
+        Ok(BlindSignature { a: to_hex(&a), e: to_hex(&e) })
+    }
+
+    /// Holder: install the re-checked signature.
+    /// `new_handle`: when a suspension was lifted, the new handle and the witness's signature on it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_recheck(
+        &self,
+        issuer: &IssuerPublicKey,
+        witness: &WitnessPublicKey,
+        old: &Credential,
+        rho_new: Fr,
+        sig: &BlindSignature,
+        new_expiry: Day,
+        new_check: Day,
+        new_handle: Option<(u64, &HandleSignature)>,
+    ) -> Result<Credential> {
+        let mut attrs = old.attrs.clone();
+        attrs.expiry = new_expiry;
+        attrs.last_check = new_check;
+        let mut handle_sig = old.handle_sig.clone();
+        if let Some((h, hs)) = new_handle {
+            if !witness.verify_handle(h, hs) {
+                return Err(CryptoError::BadSignature);
+            }
+            attrs.handle = h;
+            handle_sig = hs.clone();
+        }
+        attrs.check_grid()?;
+        if new_check < old.attrs.last_check {
+            return Err(CryptoError::OffGrid("re-check month went backwards".into()));
+        }
+        let mut m = old.inner.m;
+        m[A_RHO] = rho_new;
+        m[A_TAU] = Fr::from(new_expiry as u64);
+        m[A_ELL] = Fr::from(new_check as u64);
+        m[A_R] = Fr::from(attrs.handle);
+        let a: G1A = from_hex(&sig.a)?;
+        let e: Fr = from_hex(&sig.e)?;
+        if !statement::bbs_verify(&self.g, &issuer.w, &a, e, &statement::bbs_b(&self.g, &m)) {
+            return Err(CryptoError::BadSignature);
+        }
+        let mut mv = old.inner.mv;
+        mv[A_TAU] = new_expiry as u64;
+        mv[A_ELL] = new_check as u64;
+        mv[A_R] = attrs.handle;
+        Ok(Credential { inner: statement::Credential { a, e, m, mv }, attrs, handle_sig })
+    }
+}
+
 fn cfg_pos<'a>(s: &'a Scheme, cfg: &Cfg) -> &'a Poseidon {
     if cfg.width == 3 {
         &s.pos3
@@ -821,9 +1007,10 @@ fn cfg_pos<'a>(s: &'a Scheme, cfg: &Cfg) -> &'a Poseidon {
 }
 
 enum Stmt {
-    Binding { ctx: String, slot: u32, quarters: [u32; 4], today: Day, probation: bool, root: Fr, bind: Vec<u8> },
-    Like { ctx: String, post: String, today: Day, root: Fr, bind: Vec<u8> },
-    Renewal { today: Day, root: Fr, bind: Vec<u8> },
+    Binding { ctx: String, slot: u32, quarters: [u32; 4], today: Day, probation: bool, cutoff: Day, root: Fr, bind: Vec<u8> },
+    Like { ctx: String, post: String, today: Day, cutoff: Day, root: Fr, bind: Vec<u8> },
+    /// `shown`: a re-check shows the handle and the month of the last identity check to the issuer
+    Renewal { today: Day, root: Fr, bind: Vec<u8>, shown: Option<(u64, Day)> },
 }
 
 impl Stmt {
@@ -919,11 +1106,10 @@ impl IssuerPublicKey {
 
 impl WitnessPublicKey {
     pub fn to_hex(&self) -> String {
-        to_hex(&(self.xt, self.yt))
+        to_hex(&self.w)
     }
     pub fn from_hex(s: &str) -> Result<Self> {
-        let (xt, yt) = from_hex(s)?;
-        Ok(WitnessPublicKey { xt, yt })
+        Ok(WitnessPublicKey { w: from_hex(s)? })
     }
 }
 

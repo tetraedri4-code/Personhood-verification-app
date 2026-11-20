@@ -1,8 +1,16 @@
 // Background worker: the only part of the extension that talks to the network.
-//  * directory (public, no credentials): the list of verified accounts and the table of counts
+//  * directory (public, no credentials): the list of verified accounts, kept in chrome.storage.local and
+//    brought up to date with only the changes since the last download; and the like counts: while the
+//    directory has few posts with likes, the whole table (synced the same way), else the buckets of the
+//    posts on screen (one request per screen, each bucket about 32 posts, kept a minute)
 //  * holder app on 127.0.0.1 (pairing token): report a like, read which posts this person liked
+//  * paired for a while instead of having the holder app (pairing.js, docs/pairing.md): likes go, encrypted,
+//    to the mailbox beside the directory, for the person's app to collect
+//  * with a relay set, every directory request goes through it, encrypted to the directory (ohttp.js):
+//    the directory does not see this computer's address, the relay does not see the request
 // Settings live in chrome.storage.local.
-const DEFAULTS = { directoryUrl: "http://127.0.0.1:4003", holderUrl: "http://127.0.0.1:4010", token: "", reportLikes: false };
+importScripts("ohttp.js", "words.js", "pairing.js");
+const DEFAULTS = { directoryUrl: "http://127.0.0.1:4003", relayUrl: "", holderUrl: "http://127.0.0.1:4010", token: "", reportLikes: false };
 const TTL_MS = 60_000;
 const cache = new Map();
 
@@ -26,6 +34,33 @@ async function cached(key, load) {
   return value;
 }
 
+// A relay address keeps its path (one relay can serve several servers under different paths).
+function relayAddr(url) {
+  if (!url) return null;
+  const u = new URL(url);
+  const loopback = u.hostname === "127.0.0.1" || u.hostname === "localhost";
+  if (u.protocol !== "https:" && !(u.protocol === "http:" && loopback)) throw new Error("relay address must be https, or http on this computer");
+  if (u.search || u.hash) throw new Error("relay address must not have a query");
+  return u.origin + u.pathname.replace(/\/+$/, "");
+}
+
+// A GET to the directory: through the relay when one is set, else straight.
+async function dirJson(s, url) {
+  const relay = relayAddr(s.relayUrl);
+  if (!relay) return getJson(url);
+  const r = await PopOhttp.request(relay, "GET", url);
+  if (r.status < 200 || r.status >= 300) throw new Error(`${r.status}`);
+  return JSON.parse(new TextDecoder().decode(r.body));
+}
+
+async function dirPost(s, url, body) {
+  const relay = relayAddr(s.relayUrl);
+  if (!relay) return getJson(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  const r = await PopOhttp.request(relay, "POST", url, JSON.stringify(body));
+  if (r.status < 200 || r.status >= 300) throw new Error(`${r.status}`);
+  return JSON.parse(new TextDecoder().decode(r.body));
+}
+
 async function getJson(url, init) {
   const r = await fetch(url, { credentials: "omit", cache: "no-store", ...init });
   if (!r.ok) throw new Error(`${r.status}`);
@@ -46,15 +81,195 @@ async function holder(s, path, body) {
 
 const PLATFORM_RE = /^[a-z0-9-]{1,32}$/;
 
-async function handle(msg) {
+// The worker is stopped when idle, so the synced copy lives in storage, not in memory.
+// Per directory and platform: { at, today, listSeq, entries: {account|nym: entry}, countSeq, counts }.
+const SYNC_VERSION = 1;
+const syncing = new Map();
+
+async function synced(s, dir, platform) {
+  const key = `sync|${dir}|${platform}`;
+  let st = (await chrome.storage.local.get(key))[key];
+  if (!st || st.v !== SYNC_VERSION) st = { v: SYNC_VERSION, at: 0, today: 0, instance: "", listSeq: 0, entries: {}, countSeq: 0, counts: {} };
+  if (Date.now() - st.at < TTL_MS) return st;
+  // one sync at a time per platform, however many tabs ask
+  if (!syncing.has(key)) {
+    syncing.set(key, (async () => {
+      try {
+        const inst = encodeURIComponent(st.instance || "");
+        const list = await dirJson(s, `${dir}/v1/bindings?platform=${platform}&since=${st.listSeq}&instance=${inst}`);
+        if (list.full) st.entries = {};
+        for (const g of list.gone || []) delete st.entries[`${g.account_id}|${g.nym}`];
+        for (const e of list.entries || []) st.entries[`${e.account_id}|${e.nym}`] = e;
+        st.listSeq = list.seq;
+        st.today = list.today;
+        st.alarm = Number.isInteger(list.alarm_cutoff) ? list.alarm_cutoff : null;
+        // claims whose lease ran out are not announced as gone: drop them here
+        for (const [k, e] of Object.entries(st.entries)) if (e.lease_until < list.today) delete st.entries[k];
+        // the whole table only while the directory says one bucket holds everything
+        if ((await bucketBits(s, dir, platform)) === 0) {
+          const table = await dirJson(s, `${dir}/v1/likes/table?platform=${platform}&since=${st.countSeq}&instance=${inst}`);
+          if (table.full) st.counts = {};
+          for (const [k, n] of Object.entries(table.counts || {})) if (k !== "__proto__" && Number.isSafeInteger(n)) st.counts[k] = n;
+          st.countSeq = table.seq;
+        } else {
+          st.counts = {};
+          st.countSeq = 0;
+        }
+        st.instance = list.instance;
+        st.at = Date.now();
+        await chrome.storage.local.set({ [key]: st });
+        return st;
+      } finally {
+        syncing.delete(key);
+      }
+    })());
+  }
+  return syncing.get(key);
+}
+
+// ---- count buckets: a post's bucket is the top `bits` bits of SHA-256("platform|post"), as the
+// directory computes it. The directory learns which buckets were asked for, not which posts.
+const buckets = new Map(); // `${dir}|${platform}|${bits}|${bucket}` -> { at, counts }
+const MAX_BUCKETS = 64;
+
+async function bucketBits(s, dir, platform) {
+  return cached(`bits|${dir}|${platform}`, async () => {
+    const r = await dirJson(s, `${dir}/v1/likes/buckets?platform=${platform}`);
+    return Number.isInteger(r.bits) && r.bits >= 0 && r.bits <= 20 ? r.bits : 0;
+  });
+}
+
+async function bucketOf(platform, post, bits) {
+  if (bits === 0) return 0;
+  const h = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${platform}|${post}`)));
+  return (((h[0] << 24) | (h[1] << 16) | (h[2] << 8) | h[3]) >>> 0) >>> (32 - bits);
+}
+
+async function countsFor(s, dir, platform, posts) {
+  const out = {};
+  const bits = await bucketBits(s, dir, platform);
+  if (bits === 0) {
+    const st = await synced(s, dir, platform);
+    for (const p of posts) out[p] = Number(st.counts[p] || 0);
+    return out;
+  }
+  const want = new Map();
+  for (const p of posts) {
+    const b = await bucketOf(platform, p, bits);
+    if (!want.has(b)) want.set(b, []);
+    want.get(b).push(p);
+  }
+  const k = (b) => `${dir}|${platform}|${bits}|${b}`;
+  const missing = [...want.keys()].filter((b) => !(buckets.get(k(b)) && Date.now() - buckets.get(k(b)).at < TTL_MS));
+  for (let i = 0; i < missing.length; i += MAX_BUCKETS) {
+    const r = await dirPost(s, `${dir}/v1/likes/buckets`, { platform, bits, buckets: missing.slice(i, i + MAX_BUCKETS) });
+    for (const b of missing.slice(i, i + MAX_BUCKETS)) {
+      const counts = new Map();
+      for (const [post, n] of Object.entries((r.buckets || {})[b] || {})) if (Number.isSafeInteger(n)) counts.set(post, n);
+      buckets.set(k(b), { at: Date.now(), counts });
+    }
+  }
+  if (buckets.size > 20_000) for (const [key, v] of buckets) if (Date.now() - v.at >= TTL_MS) buckets.delete(key);
+  for (const [b, ps] of want) for (const p of ps) out[p] = buckets.get(k(b))?.counts.get(p) || 0;
+  return out;
+}
+
+// Own likes still on their way (see the "like" message): at least the count at the click plus one.
+async function withPending(dir, platform, out) {
+  const pending = (await chrome.storage.local.get("pendingLikes")).pendingLikes || {};
+  let changed = false;
+  for (const [key, v] of Object.entries(pending)) {
+    if (Date.now() > v.until) (delete pending[key], (changed = true));
+  }
+  for (const p of Object.keys(out)) {
+    const v = pending[`${dir}|${platform}|${p}`];
+    if (v) out[p] = Math.max(out[p], v.min);
+  }
+  if (changed) await chrome.storage.local.set({ pendingLikes: pending });
+  return out;
+}
+
+async function forgetCounts(dir, platform) {
+  // after a like, look again at once instead of waiting for the next minute
+  for (const key of buckets.keys()) if (key.startsWith(`${dir}|${platform}|`)) buckets.delete(key);
+  const key = `sync|${dir}|${platform}`;
+  const st = (await chrome.storage.local.get(key))[key];
+  if (st) {
+    st.at = 0;
+    await chrome.storage.local.set({ [key]: st });
+  }
+}
+
+// ---- pairing (pairing.js). Kept in chrome.storage.session: gone when the browser closes, and not
+// readable by content scripts. Only this computer's words and keys are here, never a secret of the person.
+const MIN_PAIR_MINUTES = 15;
+const MAX_PAIR_MINUTES = 30 * 1440;
+
+async function pairing() {
+  const p = (await chrome.storage.session.get("pairing")).pairing;
+  if (!p) return null;
+  if (Date.now() > p.end_ms) {
+    await forgetPairing();
+    return null;
+  }
+  return p;
+}
+
+async function forgetPairing() {
+  await chrome.storage.session.remove(["pairing", "pairedLiked"]);
+}
+
+async function pairStart(s, minutes) {
+  if (!Number.isInteger(minutes) || minutes < MIN_PAIR_MINUTES || minutes > MAX_PAIR_MINUTES) throw new Error("a pairing lasts from 15 minutes to 30 days");
+  if (await pairing()) throw new Error("this computer is already paired; unpair it first");
+  const dir = base(s.directoryUrl);
+  const words = PopPairing.generate();
+  const keys = await PopPairing.derive(words);
+  const end_ms = Date.now() + minutes * 60_000;
+  await dirPost(s, `${dir}/v1/mailbox/open`, { mailbox: keys.mailbox, end_ms, tag: await PopPairing.endTag(keys, end_ms) });
+  await chrome.storage.session.set({ pairing: { words, keys, end_ms, dir } });
+  return { words, end_ms };
+}
+
+async function pairEnd(s) {
+  const p = (await chrome.storage.session.get("pairing")).pairing;
+  await forgetPairing();
+  if (!p) return { closed: false };
+  // the words are gone from here either way; closing tells the mailbox to take no more
+  try {
+    await dirPost(s, `${p.dir}/v1/mailbox/close`, { mailbox: p.keys.mailbox });
+    return { closed: true };
+  } catch (e) {
+    return { closed: false, error: `the mailbox was not told (${e.message}); it closes by itself at the end time` };
+  }
+}
+
+async function pairedLike(s, p, platform, post) {
+  const { item, dh } = await PopPairing.seal(p.keys, platform, post, Date.now());
+  await dirPost(s, `${p.dir}/v1/mailbox/deposit`, { mailbox: p.keys.mailbox, item, dh });
+  const liked = (await chrome.storage.session.get("pairedLiked")).pairedLiked || {};
+  const arr = (liked[platform] ||= []);
+  if (!arr.includes(post)) arr.push(post);
+  await chrome.storage.session.set({ pairedLiked: liked });
+  return { queued: true, paired: true };
+}
+
+async function handle(msg, fromOwnPage) {
   const s = await settings();
   if (msg.type === "data") {
     if (!PLATFORM_RE.test(msg.platform)) throw new Error("bad platform");
     const dir = base(s.directoryUrl);
-    const list = await cached(`list|${dir}|${msg.platform}`, () => getJson(`${dir}/v1/bindings?platform=${msg.platform}`));
-    const table = await cached(`counts|${dir}|${msg.platform}`, () => getJson(`${dir}/v1/likes/table?platform=${msg.platform}`));
+    const st = await synced(s, dir, msg.platform);
     const seen = (await chrome.storage.local.get("seen")).seen || {};
-    return { settings: { reportLikes: !!s.reportLikes }, today: list.today, entries: list.entries, counts: table.counts, seen: seen[msg.platform] || {} };
+    const entries = Object.values(st.entries).sort((a, b) => (a.account_id < b.account_id ? -1 : a.account_id > b.account_id ? 1 : 0));
+    // a paired computer reports likes: that is what it was paired for
+    return { settings: { reportLikes: !!s.reportLikes || !!(await pairing()) }, today: st.today, alarm: st.alarm ?? null, entries, seen: seen[msg.platform] || {} };
+  }
+  if (msg.type === "counts") {
+    if (!PLATFORM_RE.test(msg.platform)) throw new Error("bad platform");
+    const posts = Array.isArray(msg.posts) ? [...new Set(msg.posts.filter((p) => typeof p === "string" && p.length <= 256))].slice(0, 500) : [];
+    const dir = base(s.directoryUrl);
+    return { counts: await withPending(dir, msg.platform, await countsFor(s, dir, msg.platform, posts)) };
   }
   if (msg.type === "seen") {
     const all = (await chrome.storage.local.get("seen")).seen || {};
@@ -63,9 +278,24 @@ async function handle(msg) {
     return {};
   }
   if (msg.type === "like") {
+    const p = await pairing();
+    if (p) {
+      if (!PLATFORM_RE.test(msg.platform) || typeof msg.post !== "string" || msg.post.length > 256) throw new Error("bad like");
+      return pairedLike(s, p, msg.platform, msg.post);
+    }
     if (!s.reportLikes) throw new Error("like reporting is off");
     const r = await holder(s, "/v1/like", { platform: msg.platform, post: msg.post });
-    cache.delete(`counts|${base(s.directoryUrl)}|${msg.platform}`);
+    const dir = base(s.directoryUrl);
+    await forgetCounts(dir, msg.platform);
+    // The holder app sends the like at a random moment of the next window. Until it has surely arrived and the copies
+    // here have expired, show at least the count seen at the click plus this like.
+    if (r && r.queued && Number.isSafeInteger(msg.shown) && msg.shown >= 0) {
+      const within = Number.isSafeInteger(r.within_secs) ? Math.min(r.within_secs, 86_400) : 3600;
+      const pending = (await chrome.storage.local.get("pendingLikes")).pendingLikes || {};
+      const pk = `${dir}|${msg.platform}|${msg.post}`;
+      if (!pending[pk]) pending[pk] = { until: Date.now() + (within + 30) * 1000 + TTL_MS, min: msg.shown + 1 };
+      await chrome.storage.local.set({ pendingLikes: pending });
+    }
     const mine = (await chrome.storage.local.get("liked")).liked || {};
     const arr = (mine[msg.platform] ||= []);
     if (!arr.includes(msg.post)) arr.push(msg.post);
@@ -73,7 +303,18 @@ async function handle(msg) {
     return r;
   }
   if (msg.type === "status") {
-    return { liked: (await chrome.storage.local.get("liked")).liked || {} };
+    const liked = structuredClone((await chrome.storage.local.get("liked")).liked || {});
+    if (await pairing()) for (const [k, v] of Object.entries((await chrome.storage.session.get("pairedLiked")).pairedLiked || {})) liked[k] = [...new Set([...(liked[k] || []), ...v])];
+    return { liked };
+  }
+  // pairing is for the options page only: a content script runs inside web pages, and the words must
+  // not reach one
+  if (msg.type.startsWith("pair-") && !fromOwnPage) throw new Error("not allowed here");
+  if (msg.type === "pair-start") return pairStart(s, msg.minutes);
+  if (msg.type === "pair-end") return pairEnd(s);
+  if (msg.type === "pair-status") {
+    const p = await pairing();
+    return p ? { paired: true, words: p.words, end_ms: p.end_ms } : { paired: false };
   }
   if (msg.type === "holder-status") {
     return holder(s, "/v1/status");
@@ -88,7 +329,9 @@ async function handle(msg) {
 
 chrome.runtime.onMessage.addListener((msg, sender, reply) => {
   // messages are accepted only from this extension's own scripts
-  if (sender.id !== chrome.runtime.id) return false;
-  handle(msg).then(reply, (e) => reply({ error: String(e && e.message ? e.message : e) }));
+  if (sender.id !== chrome.runtime.id || !msg || typeof msg.type !== "string") return false;
+  // the extension's own pages (options), as opposed to content scripts, whose sender URL is the web page's
+  const fromOwnPage = typeof sender.url === "string" && sender.url.startsWith(chrome.runtime.getURL(""));
+  handle(msg, fromOwnPage).then(reply, (e) => reply({ error: String(e && e.message ? e.message : e) }));
   return true;
 });

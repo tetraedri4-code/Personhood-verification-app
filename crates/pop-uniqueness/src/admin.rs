@@ -1,9 +1,12 @@
-//! The coordinator's side of key generation, refresh and resharing: it tells every operator's admin
-//! endpoint what to do and compares what they report. It never sees a share.
+//! The administrators' side of key generation, refresh and resharing.
 //!
-//! In this prototype one coordinator holds every operator's admin token. Operators that do not trust
-//! each other run the same steps each against their own operator and compare transcripts out of band;
-//! the operator API is built for that (every step is one authenticated call per operator).
+//! A round needs no coordinator. Somebody writes the round spec ([`spec_dkg`], [`spec_reshare`]) and
+//! passes it around; each operator's administrator checks it, approves it at their own operator and
+//! keeps it moving ([`join`]). Nobody needs anybody else's admin token, and no administrator ever
+//! sees a share.
+//!
+//! [`dkg`] and [`reshare`] do the same for a whole cluster at once, for the demo, tests and
+//! deployments where one party really does run every operator.
 use crate::shamir::lagrange_at_zero;
 use crate::wire::*;
 use anyhow::{bail, ensure, Context};
@@ -13,7 +16,9 @@ use pop_crypto::codec::from_hex;
 use pop_crypto::params::{G2, G2A};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::time::Duration;
 
+/// An operator as its own administrator addresses it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AdminEndpoint {
     pub index: u32,
@@ -21,14 +26,24 @@ pub struct AdminEndpoint {
     pub admin_token: String,
 }
 
-impl AdminEndpoint {
-    fn peer(&self) -> Peer {
-        Peer { index: self.index, url: self.url.clone() }
+/// An operator as others know it. `identity` should be pinned out of band; if it is left out, the
+/// key the operator publishes is taken on trust.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Member {
+    pub index: u32,
+    pub url: String,
+    #[serde(default)]
+    pub identity: Option<String>,
+}
+
+impl From<&AdminEndpoint> for Member {
+    fn from(a: &AdminEndpoint) -> Self {
+        Member { index: a.index, url: a.url.clone(), identity: None }
     }
 }
 
 fn http() -> reqwest::Client {
-    reqwest::Client::builder().timeout(std::time::Duration::from_secs(60)).redirect(reqwest::redirect::Policy::none()).build().expect("http client")
+    reqwest::Client::builder().timeout(Duration::from_secs(60)).redirect(reqwest::redirect::Policy::none()).build().expect("http client")
 }
 
 async fn call<T: DeserializeOwned>(c: &reqwest::Client, o: &AdminEndpoint, path: &str, body: &impl Serialize) -> anyhow::Result<T> {
@@ -45,109 +60,164 @@ pub async fn public(url: &str) -> anyhow::Result<PublicInfo> {
     Ok(http().get(format!("{}/v1/public", url.trim_end_matches('/'))).send().await?.error_for_status()?.json().await?)
 }
 
-fn round_id() -> String {
+fn nonce() -> String {
     hex::encode(rand::random::<[u8; 16]>())
 }
 
-fn union<'a>(a: &'a [AdminEndpoint], b: &'a [AdminEndpoint]) -> Vec<&'a AdminEndpoint> {
-    let mut v: Vec<&AdminEndpoint> = a.iter().collect();
-    for o in b {
-        if !v.iter().any(|x| x.index == o.index) {
-            v.push(o);
+/// Fill in address and identity key of each member, checking a pinned key against the published one.
+async fn peers(members: &[Member]) -> anyhow::Result<(Vec<Peer>, Vec<PublicInfo>)> {
+    let mut out = vec![];
+    let mut infos = vec![];
+    for m in members {
+        let info = public(&m.url).await.with_context(|| format!("operator {}", m.index))?;
+        ensure!(info.index == m.index, "the server at {} is operator {}, not {}", m.url, info.index, m.index);
+        if let Some(pinned) = &m.identity {
+            ensure!(*pinned == info.identity, "operator {} publishes another identity key than the pinned one", m.index);
         }
+        out.push(Peer { index: m.index, url: m.url.clone(), identity: info.identity.clone() });
+        infos.push(info);
     }
-    v
+    Ok((out, infos))
 }
 
-/// Run one round to the commit. On any failure the round is aborted everywhere and nothing changed.
-async fn run_round(spec: RoundSpec, dealers: &[AdminEndpoint], receivers: &[AdminEndpoint]) -> anyhow::Result<(String, u64)> {
-    let c = http();
-    let all = union(dealers, receivers);
-    let id = RoundId { round_id: spec.round_id.clone() };
-    let attempt = async {
-        for o in &all {
-            let _: serde_json::Value = call(&c, o, "/v1/admin/round/start", &spec).await?;
-        }
-        for o in dealers {
-            let _: serde_json::Value = call(&c, o, "/v1/admin/round/deal", &id).await?;
-        }
-        let mut transcript: Option<BTreeMap<u32, String>> = None;
-        for o in receivers {
-            let st: RoundStatus = call(&c, o, "/v1/admin/round/status", &id).await?;
-            ensure!(st.missing.is_empty(), "operator {} has no deal from {:?}", o.index, st.missing);
-            match &transcript {
-                None => transcript = Some(st.transcript),
-                Some(t) => ensure!(*t == st.transcript, "operator {} saw other commitments than the others: a dealer cheated or was impersonated", o.index),
-            }
-        }
-        transcript.context("no receivers")
-    };
-    let transcript = match attempt.await {
-        Ok(t) => t,
-        Err(e) => {
-            for o in &all {
-                let _ = call::<serde_json::Value>(&c, o, "/v1/admin/round/abort", &id).await;
-            }
-            return Err(e.context("round aborted, nothing changed"));
-        }
-    };
-    // From here on a failure leaves some operators with the new epoch and some without. The old epoch
-    // stays valid everywhere until `finalize`, so evaluations keep working meanwhile.
-    let req = CommitRequest { round_id: spec.round_id.clone(), transcript };
-    let mut committed: Vec<(&AdminEndpoint, (String, u64))> = vec![];
-    let mut failure: Option<anyhow::Error> = None;
-    for o in receivers {
-        match call::<CommitResponse>(&c, o, "/v1/admin/round/commit", &req).await {
-            Ok(CommitResponse { key: Some(key), epoch: Some(epoch) }) => {
-                if committed.first().is_some_and(|(_, x)| *x != (key.clone(), epoch)) {
-                    failure = Some(anyhow::anyhow!("operators disagree on the key or epoch they committed"));
-                }
-                committed.push((o, (key, epoch)));
-            }
-            Ok(_) => failure = Some(anyhow::anyhow!("operator {} committed nothing", o.index)),
-            Err(e) => failure = Some(e),
-        }
-        if failure.is_some() {
-            break;
+/// The spec of a key generation among `members`.
+pub async fn spec_dkg(members: &[Member], threshold: usize) -> anyhow::Result<RoundSpec> {
+    let (peers, _) = peers(members).await?;
+    let idx: Vec<u32> = members.iter().map(|m| m.index).collect();
+    Ok(RoundSpec { nonce: nonce(), kind: RoundKind::Dkg, key: None, from_epoch: None, old_threshold: None, old_vks: BTreeMap::new(), new_epoch: 1, dealers: idx.clone(), receivers: idx, peers, threshold })
+}
+
+fn epochs_of(info: &PublicInfo, key: &str) -> Vec<PublicEpoch> {
+    info.keys.iter().find(|k| k.key == key).map(|k| k.epochs.clone()).unwrap_or_default()
+}
+
+/// The spec of a reshare of `key` from `dealers` (current holders, at least the threshold of them) to
+/// `receivers` with `threshold`. The same set is a refresh.
+pub async fn spec_reshare(key: &str, dealers: &[Member], receivers: &[Member], threshold: usize) -> anyhow::Result<RoundSpec> {
+    let key = key.to_lowercase();
+    let mut all: Vec<Member> = dealers.to_vec();
+    for r in receivers {
+        match all.iter().find(|m| m.index == r.index) {
+            Some(m) => ensure!(m.url.trim_end_matches('/') == r.url.trim_end_matches('/'), "operator {} is listed with two addresses", r.index),
+            None => all.push(r.clone()),
         }
     }
-    if let Some(e) = failure {
-        // Undo: the receivers that committed drop the new epoch. Nothing was erased yet (that is
-        // `finalize`, which only runs after a complete round), so every old share is still there.
-        let mut undone = true;
-        for (o, (key, epoch)) in &committed {
-            undone &= call::<serde_json::Value>(&c, o, "/v1/admin/discard", &DiscardRequest { key: key.clone(), epoch: *epoch }).await.is_ok();
-        }
-        for o in &all {
+    let (peers, infos) = peers(&all).await?;
+    // the newest epoch that every dealer holds
+    let mut candidates: Vec<PublicEpoch> = epochs_of(&infos[0], &key);
+    candidates.retain(|e| (0..dealers.len()).all(|i| epochs_of(&infos[i], &key).contains(e)));
+    let cur = candidates.into_iter().max_by_key(|e| e.epoch).context("the dealers share no epoch of this key; name operators that hold the same epoch")?;
+    ensure!(dealers.len() >= cur.threshold, "{} dealers given, the key needs {}", dealers.len(), cur.threshold);
+    for d in dealers {
+        ensure!(cur.vks.contains_key(&d.index), "operator {} holds no share of epoch {}", d.index, cur.epoch);
+    }
+    let left_out = holders_left_out(&cur, dealers, receivers);
+    if !left_out.is_empty() {
+        tracing::warn!(
+            "operators {left_out:?} hold a share of epoch {} and take no part in this round: they will KEEP that share. \
+             Name every reachable holder under the dealers (a dealer that is not a receiver erases its share at the end); \
+             destroy the state file of a holder that is gone for good",
+            cur.epoch
+        );
+    }
+    // later than anything any participant holds, so a leftover of a stalled round is superseded
+    let newest = infos.iter().flat_map(|i| epochs_of(i, &key)).map(|e| e.epoch).max().unwrap_or(cur.epoch);
+    Ok(RoundSpec {
+        nonce: nonce(),
+        kind: RoundKind::Reshare,
+        key: Some(key),
+        from_epoch: Some(cur.epoch),
+        old_threshold: Some(cur.threshold),
+        old_vks: dealers.iter().map(|d| (d.index, cur.vks[&d.index].clone())).collect(),
+        new_epoch: newest + 1,
+        dealers: dealers.iter().map(|d| d.index).collect(),
+        receivers: receivers.iter().map(|r| r.index).collect(),
+        peers,
+        threshold,
+    })
+}
+
+/// Holders of `epoch` that a round among `dealers` and `receivers` leaves out. An operator erases its
+/// old share only at the end of a round it takes part in, so these would keep theirs; if `threshold`
+/// of them remain, the old sharing stays usable.
+pub fn holders_left_out(epoch: &PublicEpoch, dealers: &[Member], receivers: &[Member]) -> Vec<u32> {
+    epoch.vks.keys().copied().filter(|i| !dealers.iter().chain(receivers).any(|m| m.index == *i)).collect()
+}
+
+/// Approve `spec` at one's own operator. Read the spec first: this is the administrator's consent.
+pub async fn approve(spec: &RoundSpec, me: &AdminEndpoint) -> anyhow::Result<String> {
+    let id: RoundId = call(&http(), me, "/v1/admin/round/start", spec).await?;
+    ensure!(id.round_id == spec.id(), "the operator computed another round id");
+    Ok(id.round_id)
+}
+
+fn failure(index: u32, f: &Failure) -> anyhow::Error {
+    match f.blamed {
+        Some(b) => anyhow::anyhow!("round failed at operator {index}: {} [operator {b} is at fault; run the round again without it]", f.reason),
+        None => anyhow::anyhow!("round failed at operator {index}: {}", f.reason),
+    }
+}
+
+/// Approve the round at one's own operator and keep it moving until it is done, fails or times out.
+/// Every administrator runs this for their own operator; the operators talk to each other.
+pub async fn join(spec: &RoundSpec, me: &AdminEndpoint, timeout: Duration) -> anyhow::Result<RoundStatus> {
+    drive(spec, std::slice::from_ref(me), timeout).await.map(|mut v| v.remove(0))
+}
+
+/// [`join`] for several operators at once.
+pub async fn drive(spec: &RoundSpec, admins: &[AdminEndpoint], timeout: Duration) -> anyhow::Result<Vec<RoundStatus>> {
+    let c = http();
+    let id = RoundId { round_id: spec.id() };
+    let abort = |why: anyhow::Error| async {
+        for o in admins {
             let _ = call::<serde_json::Value>(&c, o, "/v1/admin/round/abort", &id).await;
         }
-        return Err(e.context(if undone {
-            "commit failed part-way; the new shares were discarded and nothing changed"
-        } else {
-            "commit failed part-way and could not be undone everywhere; the old shares still work. Check `pop uniqueness status` and discard the newest epoch at the operators that have it"
-        }));
+        Err(why)
+    };
+    for o in admins {
+        if let Err(e) = approve(spec, o).await {
+            return abort(e).await;
+        }
     }
-    for o in dealers.iter().filter(|d| !receivers.iter().any(|r| r.index == d.index)) {
-        let _: CommitResponse = call(&c, o, "/v1/admin/round/commit", &req).await?;
+    let started = std::time::Instant::now();
+    let mut pause = Duration::from_millis(20);
+    loop {
+        let mut all = vec![];
+        for o in admins {
+            match call::<RoundStatus>(&c, o, "/v1/admin/round/advance", &id).await {
+                Ok(st) => all.push(st),
+                Err(e) => return abort(e).await,
+            }
+        }
+        // a failure with a named culprit is the better report: look at every operator before choosing
+        let failed: Vec<(u32, Failure)> = admins.iter().zip(&all).filter_map(|(o, st)| st.failed.clone().map(|f| (o.index, f))).collect();
+        if let Some((i, f)) = failed.iter().find(|(_, f)| f.blamed.is_some()).or(failed.first()) {
+            // every operator has now seen the failure or will refuse to go on; stop the round here
+            return abort(failure(*i, f)).await;
+        }
+        if all.iter().all(|st| st.done) {
+            return Ok(all);
+        }
+        if started.elapsed() > timeout {
+            let waits: Vec<String> = admins.iter().zip(&all).filter(|(_, st)| !st.done).map(|(o, st)| format!("operator {} ({}) waits for {}", o.index, st.phase, st.waiting_for.join(", "))).collect();
+            // Not aborted: operators that have stored their new share keep it, and nothing was erased.
+            bail!("the round did not finish in {} s: {}. Nothing was erased; run `status`, then start a new round", timeout.as_secs(), waits.join("; "));
+        }
+        tokio::time::sleep(pause).await;
+        pause = (pause * 2).min(Duration::from_millis(500));
     }
-    committed.into_iter().next().map(|(_, x)| x).context("no receivers")
 }
 
-/// Distributed key generation among `operators`. Returns the group key (hex), to be pinned in the
-/// issuer configuration.
+const CLUSTER_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Key generation among operators one party administers. Returns the group key (hex), to be pinned
+/// in the issuer configuration.
 pub async fn dkg(operators: &[AdminEndpoint], threshold: usize) -> anyhow::Result<String> {
-    let spec = RoundSpec {
-        round_id: round_id(),
-        kind: RoundKind::Dkg,
-        key: None,
-        from_epoch: None,
-        old_threshold: None,
-        old_vks: BTreeMap::new(),
-        dealers: operators.iter().map(|o| o.index).collect(),
-        receivers: operators.iter().map(|o| o.peer()).collect(),
-        threshold,
-    };
-    let (key, _) = run_round(spec, operators, operators).await?;
+    let members: Vec<Member> = operators.iter().map(Member::from).collect();
+    let spec = spec_dkg(&members, threshold).await?;
+    let st = drive(&spec, operators, CLUSTER_TIMEOUT).await?;
+    let (key, _) = st.iter().find_map(|s| s.result.clone()).context("no operator stored a share")?;
+    ensure!(st.iter().all(|s| s.result.as_ref().map(|r| &r.0) == Some(&key)), "operators disagree on the key");
     verify_epoch(&key, 1, operators).await?;
     Ok(key)
 }
@@ -155,18 +225,18 @@ pub async fn dkg(operators: &[AdminEndpoint], threshold: usize) -> anyhow::Resul
 /// The newest epoch of `key` that every one of `holders` has, with its threshold and verification keys.
 pub async fn current_epoch(key: &str, holders: &[AdminEndpoint]) -> anyhow::Result<PublicEpoch> {
     let key = key.to_lowercase();
-    let mut common: Option<PublicEpoch> = None;
+    let mut common: Option<Vec<PublicEpoch>> = None;
     for o in holders {
         let info = public(&o.url).await.with_context(|| format!("operator {}", o.index))?;
         ensure!(info.index == o.index, "the server at {} is operator {}, not {}", o.url, info.index, o.index);
-        let k = info.keys.into_iter().find(|k| k.key == key).with_context(|| format!("operator {} holds no share of this key", o.index))?;
-        let newest = k.epochs.into_iter().max_by_key(|e| e.epoch).context("no epoch")?;
-        match &common {
-            None => common = Some(newest),
-            Some(c) => ensure!(*c == newest, "operators {} and others are at different epochs; finish or re-run the last round first", o.index),
-        }
+        let eps = epochs_of(&info, &key);
+        ensure!(!eps.is_empty(), "operator {} holds no share of this key", o.index);
+        common = Some(match common {
+            None => eps,
+            Some(c) => c.into_iter().filter(|e| eps.contains(e)).collect(),
+        });
     }
-    common.context("no holders given")
+    common.unwrap_or_default().into_iter().max_by_key(|e| e.epoch).context("the operators share no epoch of this key")
 }
 
 /// Check, from public data only, that `holders` all publish `epoch` of `key` with the same
@@ -176,7 +246,7 @@ pub async fn verify_epoch(key: &str, epoch: u64, holders: &[AdminEndpoint]) -> a
     ensure!(e.epoch == epoch, "operators are at epoch {}, expected {epoch}", e.epoch);
     let idx: Vec<u32> = e.vks.keys().copied().collect();
     ensure!(holders.iter().all(|h| idx.contains(&h.index)), "an operator is not in the epoch it reports");
-    ensure!(idx.len() >= e.threshold && holders.len() >= e.threshold, "fewer holders than the threshold");
+    ensure!(idx.len() >= e.threshold && e.threshold >= 1, "fewer holders than the threshold");
     let y: G2A = from_hex(key).map_err(|e| anyhow::anyhow!("bad group key: {e}"))?;
     // every t-subset must give Y; checking the first t and the last t indices catches a bad key cheaply
     for subset in [&idx[..e.threshold], &idx[idx.len() - e.threshold..]] {
@@ -189,45 +259,16 @@ pub async fn verify_epoch(key: &str, epoch: u64, holders: &[AdminEndpoint]) -> a
     Ok(e)
 }
 
-/// Give new shares of `key` to `receivers` with threshold `threshold`, dealt by `dealers` (at least the
-/// current threshold of current holders). `receivers` may be the same set (a refresh), a superset, a
-/// subset or other operators altogether. Old shares stay until [`finalize`]. Returns the new epoch.
+/// Reshare among operators one party administers: new shares of `key` for `receivers` with
+/// `threshold`, dealt by `dealers`. The older shares are erased by the operators themselves once
+/// every receiver has stored its new one. Returns the new epoch.
 pub async fn reshare(key: &str, dealers: &[AdminEndpoint], receivers: &[AdminEndpoint], threshold: usize) -> anyhow::Result<u64> {
     let key = key.to_lowercase();
-    let cur = current_epoch(&key, dealers).await?;
-    ensure!(dealers.len() >= cur.threshold, "{} dealers given, the key needs {}", dealers.len(), cur.threshold);
-    for d in dealers {
-        ensure!(cur.vks.contains_key(&d.index), "operator {} holds no share of the current epoch", d.index);
-    }
-    let spec = RoundSpec {
-        round_id: round_id(),
-        kind: RoundKind::Reshare,
-        key: Some(key.clone()),
-        from_epoch: Some(cur.epoch),
-        old_threshold: Some(cur.threshold),
-        old_vks: dealers.iter().map(|d| (d.index, cur.vks[&d.index].clone())).collect(),
-        dealers: dealers.iter().map(|o| o.index).collect(),
-        receivers: receivers.iter().map(|o| o.peer()).collect(),
-        threshold,
-    };
-    let (got_key, epoch) = run_round(spec, dealers, receivers).await?;
-    if got_key != key {
-        bail!("the round returned another key");
-    }
-    verify_epoch(&key, epoch, receivers).await?;
-    Ok(epoch)
-}
-
-/// Erase every share older than `epoch`, at the operators that hold `epoch` (`holders`) and at those
-/// that left (`leavers`). Checks first, from public data, that the holders really have `epoch`:
-/// erasing is the one step that cannot be undone.
-pub async fn finalize(key: &str, epoch: u64, holders: &[AdminEndpoint], leavers: &[AdminEndpoint]) -> anyhow::Result<()> {
-    let key = key.to_lowercase();
-    let e = verify_epoch(&key, epoch, holders).await?;
-    ensure!(holders.len() == e.vks.len(), "finalize needs every operator of the new epoch ({} of {} given), so that no share is lost", holders.len(), e.vks.len());
-    let c = http();
-    for (o, leaving) in holders.iter().map(|o| (o, false)).chain(leavers.iter().filter(|l| !holders.iter().any(|h| h.index == l.index)).map(|o| (o, true))) {
-        let _: serde_json::Value = call(&c, o, "/v1/admin/finalize", &FinalizeRequest { key: key.clone(), epoch, leaving }).await?;
-    }
-    Ok(())
+    let (d, r): (Vec<Member>, Vec<Member>) = (dealers.iter().map(Member::from).collect(), receivers.iter().map(Member::from).collect());
+    let spec = spec_reshare(&key, &d, &r, threshold).await?;
+    let mut all: Vec<AdminEndpoint> = dealers.to_vec();
+    all.extend(receivers.iter().filter(|r| !dealers.iter().any(|d| d.index == r.index)).cloned());
+    drive(&spec, &all, CLUSTER_TIMEOUT).await?;
+    verify_epoch(&key, spec.new_epoch, receivers).await?;
+    Ok(spec.new_epoch)
 }

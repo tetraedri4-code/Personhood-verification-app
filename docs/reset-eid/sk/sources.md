@@ -1,0 +1,1 @@
+- slovensko.sk, my documents were stolen or lost: https://www.slovensko.sk/sk/zivotne-situacie/zivotna-situacia/_ukradli-mi-doklady-stratili

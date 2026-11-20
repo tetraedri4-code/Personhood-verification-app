@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/pop-crypto", "crates/pop-protocol", "crates/pop-storage", "crates/pop-idp", "crates/pop-mock-idp", "crates/pop-issuer", "crates/pop-uniqueness", "crates/pop-directory", "crates/pop-mockfeed", "crates/pop-platform-mockfeed", "crates/pop-platform-bluesky", "crates/pop-holder", "crates/pop-cli"]
+members = ["crates/pop-crypto", "crates/pop-protocol", "crates/pop-storage", "crates/pop-idp", "crates/pop-mock-idp", "crates/pop-issuer", "crates/pop-uniqueness", "crates/pop-directory", "crates/pop-mockfeed", "crates/pop-platform-mockfeed", "crates/pop-platform-bluesky", "crates/pop-holder", "crates/pop-cli", "crates/pop-ohttp", "crates/pop-mailbox"]
 
 [workspace.package]
 version = "0.1.0"
@@ -8,6 +8,7 @@ edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
+httpdate = "1"
 ark-bls12-381 = "0.4"
 ark-ec = "0.4"
 ark-ff = { version = "0.4", features = ["asm"] }
@@ -32,8 +33,8 @@ base64 = "0.22"
 async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
 axum = "0.7"
-tower-http = { version = "0.5", features = ["cors"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tower-http = { version = "0.5", features = ["cors", "compression-gzip"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
 jsonwebtoken = "9"
 ring = "0.17"
 url = "2"
@@ -54,6 +55,8 @@ pop-mockfeed = { path = "crates/pop-mockfeed" }
 pop-platform-mockfeed = { path = "crates/pop-platform-mockfeed" }
 pop-platform-bluesky = { path = "crates/pop-platform-bluesky" }
 pop-holder = { path = "crates/pop-holder" }
+pop-ohttp = { path = "crates/pop-ohttp" }
+pop-mailbox = { path = "crates/pop-mailbox" }
 
 [profile.release]
 opt-level = 3

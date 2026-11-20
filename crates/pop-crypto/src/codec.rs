@@ -32,12 +32,13 @@ pub fn from_hex<T: CanonicalDeserialize>(s: &str) -> Result<T> {
 /// Upper bound on any vector length in a proof, so a hostile length prefix cannot allocate much.
 const MAX_ITEMS: u64 = 4096;
 
-const VERSION: u8 = 1;
+/// 2: commitment form (Schnorr commitments sent, challenge computed) and a BBS witness signature.
+const VERSION: u8 = 2;
 
 pub fn encode_proof(p: &Proof) -> Vec<u8> {
     assert!(p.gens.is_empty(), "accumulator generations are not part of this prototype's wire format");
     let mut b = vec![VERSION];
-    for pt in [p.abar, p.bbar, p.d, p.s1, p.s2] {
+    for pt in [p.abar, p.bbar, p.d, p.wabar, p.wbbar, p.wd] {
         pt.serialize_compressed(&mut b).unwrap();
     }
     p.vcoms.serialize_compressed(&mut b).unwrap();
@@ -47,7 +48,7 @@ pub fn encode_proof(p: &Proof) -> Vec<u8> {
     p.dcoms.serialize_compressed(&mut b).unwrap();
     p.cnew.serialize_compressed(&mut b).unwrap();
     p.outputs.serialize_compressed(&mut b).unwrap();
-    p.c.serialize_compressed(&mut b).unwrap();
+    p.ts.serialize_compressed(&mut b).unwrap();
     p.z.serialize_compressed(&mut b).unwrap();
     b
 }
@@ -72,8 +73,9 @@ pub fn decode_proof(b: &[u8]) -> Result<Proof> {
     let abar: G1A = read(&mut rd)?;
     let bbar: G1A = read(&mut rd)?;
     let d: G1A = read(&mut rd)?;
-    let s1: G1A = read(&mut rd)?;
-    let s2: G1A = read(&mut rd)?;
+    let wabar: G1A = read(&mut rd)?;
+    let wbbar: G1A = read(&mut rd)?;
+    let wd: G1A = read(&mut rd)?;
     let vcoms = read_vec::<G1A>(&mut rd)?;
     let r1cs: Option<R1CSProof<G1A>> = read(&mut rd)?;
     let lego: Option<legogroth16::Proof<E>> = read(&mut rd)?;
@@ -81,10 +83,10 @@ pub fn decode_proof(b: &[u8]) -> Result<Proof> {
     let dcoms = read_vec::<G1A>(&mut rd)?;
     let cnew: Option<G1A> = read(&mut rd)?;
     let outputs = read_vec::<G1A>(&mut rd)?;
-    let c: Fr = read(&mut rd)?;
+    let ts = read_vec::<G1A>(&mut rd)?;
     let z = read_vec::<Fr>(&mut rd)?;
     if !rd.is_empty() {
         return Err(CryptoError::Encoding("trailing bytes".into()));
     }
-    Ok(Proof { abar, bbar, d, s1, s2, vcoms, r1cs, lego, clcoms, gens: vec![], dcoms, cnew, outputs, c, z })
+    Ok(Proof { abar, bbar, d, wabar, wbbar, wd, ts, vcoms, r1cs, lego, clcoms, gens: vec![], dcoms, cnew, outputs, c: Fr::from(0u64), z })
 }

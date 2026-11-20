@@ -1,0 +1,4 @@
+- gov.gr, loss of ID card (summary only): https://www.gov.gr/org/astynomia/ellenes-tou-exoterikou/loss-id
+- iefimerida, change your TAXISnet codes (2020): https://www.iefimerida.gr/ellada/psifiakis-diakybernisis-allaxete-kodikoys-taxisnet
+- Greek City Times, gov.gr Wallet upgrade (news, January 2026): https://greekcitytimes.com/2026/01/16/gov-gr-wallet-upgrade-real-time-alerts-for-revoked-ids-new-features/
+- GSIS: https://www.gsis.gr/
