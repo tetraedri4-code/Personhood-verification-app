@@ -5,7 +5,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use pop_crypto::{dates, fingerprint, root_from_hex, Day, IssuerPublicKey, Scheme, VerifyCtx, WitnessPublicKey};
+use pop_crypto::{dates, fingerprint, root_from_hex, CryptoError, Day, IssuerPublicKey, Scheme, VerifyCtx, WitnessPublicKey};
 use pop_protocol::api::*;
 use pop_protocol::platform::{PlatformError, PlatformRegistry};
 use pop_protocol::{binding_code, binding_context, context_id, withdraw_context, AccountRef};
@@ -27,11 +27,15 @@ pub struct DirectoryConfig {
     /// Larger is more private and costs more data. While all posts of a platform fit in one bucket,
     /// readers download the whole table and sync only its changes instead.
     pub bucket_posts: u32,
+    /// like proofs checked together at most (docs/crypto.md); 1: each by itself
+    pub like_batch_max: usize,
+    /// how long the first like of a batch waits for others, in milliseconds
+    pub like_batch_wait_ms: u64,
 }
 
 impl Default for DirectoryConfig {
     fn default() -> Self {
-        DirectoryConfig { clock: None, lease_days: 274, bucket_posts: 32 }
+        DirectoryConfig { clock: None, lease_days: 274, bucket_posts: 32, like_batch_max: 64, like_batch_wait_ms: 50 }
     }
 }
 
@@ -66,6 +70,8 @@ pub struct Directory {
     cfg: DirectoryConfig,
     write: tokio::sync::Mutex<()>,
     buckets: RwLock<BucketIndex>,
+    /// like proofs are checked in batches (started on the first like); None when like_batch_max is 1
+    batcher: Option<crate::batch::Batcher>,
 }
 
 const T_BIND: &str = "bindings";
@@ -89,6 +95,8 @@ impl Directory {
     pub async fn connect(issuer_api: Arc<dyn IssuerApi>, platforms: PlatformRegistry, store: SharedStore, cfg: DirectoryConfig) -> anyhow::Result<Arc<Self>> {
         anyhow::ensure!((7..=3650).contains(&cfg.lease_days), "lease_days must be between 7 and 3650");
         anyhow::ensure!((1..=100_000).contains(&cfg.bucket_posts), "bucket_posts must be between 1 and 100000");
+        anyhow::ensure!((1..=4096).contains(&cfg.like_batch_max), "like_batch_max must be between 1 and 4096");
+        anyhow::ensure!(cfg.like_batch_wait_ms <= 10_000, "like_batch_wait_ms must be at most 10000");
         let mut buckets = BucketIndex::new();
         for (k, v) in store.list(T_COUNTS).await? {
             if let Some((platform, post)) = k.split_once('|') {
@@ -104,10 +112,16 @@ impl Directory {
             scheme.install_lego_keys(*k, &issuer_api.lego_keys(*k).await?)?;
         }
         let rv = issuer_api.revocations().await?;
+        let issuer_pk = IssuerPublicKey::from_hex(&p.issuer_public_key)?;
+        let witness_pk = WitnessPublicKey::from_hex(&p.witness_public_key)?;
+        let batcher = (cfg.like_batch_max > 1).then(|| {
+            crate::batch::Batcher::start(scheme.clone(), issuer_pk.clone(), witness_pk.clone(), cfg.like_batch_max, std::time::Duration::from_millis(cfg.like_batch_wait_ms))
+        });
         Ok(Arc::new(Directory {
             scheme,
-            issuer_pk: IssuerPublicKey::from_hex(&p.issuer_public_key)?,
-            witness_pk: WitnessPublicKey::from_hex(&p.witness_public_key)?,
+            issuer_pk,
+            witness_pk,
+            batcher,
             issuer_api,
             roots: RwLock::new((rv.root, rv.previous_root, std::time::Instant::now())),
             alarm: RwLock::new((p.alarm_cutoff, std::time::Instant::now())),
@@ -409,9 +423,19 @@ impl Directory {
             return Err(err(StatusCode::BAD_REQUEST, "post id is not in the platform's canonical form"));
         }
         let alarm = self.check_alarm(req.alarm_cutoff).await?;
-        self.scheme
-            .verify_like(&self.vc(req.today, &req.revocation_root)?, dates::count_cutoff(req.today, alarm), &context_id(&req.platform), &req.post_id, &req.proof)
-            .map_err(|e| err(StatusCode::UNAUTHORIZED, e.to_string()))?;
+        let cutoff = dates::count_cutoff(req.today, alarm);
+        let ctx = context_id(&req.platform);
+        match &self.batcher {
+            Some(b) => match b.check(req.today, &req.revocation_root, cutoff, &ctx, &req.post_id, &req.proof).await {
+                Ok(true) => {}
+                Ok(false) => return Err(err(StatusCode::UNAUTHORIZED, CryptoError::InvalidProof.to_string())),
+                Err(e) => return Err(err(StatusCode::UNAUTHORIZED, e)),
+            },
+            None => self
+                .scheme
+                .verify_like(&self.vc(req.today, &req.revocation_root)?, cutoff, &ctx, &req.post_id, &req.proof)
+                .map_err(|e| err(StatusCode::UNAUTHORIZED, e.to_string()))?,
+        }
         let _g = self.write.lock().await;
         let pk = key(&req.platform, &req.post_id);
         let new = self.store.insert_new(T_LIKES, &key(&pk, &req.proof.tag), json!({"on": req.today})).await?;

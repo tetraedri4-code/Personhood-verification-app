@@ -49,6 +49,12 @@ enum Cmd {
         /// posts with likes per count bucket that readers download (more: more private, more data)
         #[arg(long, default_value_t = 32, value_parser = clap::value_parser!(u32).range(1..=100_000))]
         bucket_posts: u32,
+        /// like proofs checked together at most (1: each by itself; docs/crypto.md)
+        #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u64).range(1..=4096))]
+        like_batch_max: u64,
+        /// how long the first like of a batch waits for others, in milliseconds
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u64).range(0..=10_000))]
+        like_batch_wait_ms: u64,
     },
     /// Run an Oblivious HTTP relay (RFC 9458) in front of the issuer's and directory's gateways, so
     /// that they do not see the holder's address (docs/relay.md). Someone other than their operator
@@ -878,12 +884,12 @@ async fn main() -> anyhow::Result<()> {
             let pad_sizes = issuer.params().pad_sizes;
             serve(listen, wiring::with_gateway(pop_issuer::router(issuer), &pad_sizes)?).await?;
         }
-        Cmd::Directory { listen, issuer_url, data_dir, platforms, lease_days, bucket_posts } => {
+        Cmd::Directory { listen, issuer_url, data_dir, platforms, lease_days, bucket_posts, like_batch_max, like_batch_wait_ms } => {
             let d = Directory::connect(
                 Arc::new(HttpClient::new(&issuer_url)),
                 wiring::platforms(&platforms.into()),
                 wiring::store(data_dir.as_deref(), "directory-db")?,
-                DirectoryConfig { lease_days, bucket_posts, ..Default::default() },
+                DirectoryConfig { lease_days, bucket_posts, like_batch_max: like_batch_max as usize, like_batch_wait_ms, ..Default::default() },
             )
             .await?;
             println!("Directory listening on http://{listen}");

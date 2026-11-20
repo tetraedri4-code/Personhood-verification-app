@@ -311,6 +311,26 @@ a proof claimed for another post, or one from another issuer's credential are al
 server times come from the gateways inside the encryption, so the relay can neither read nor change
 them, and the relay's own time from its answer; an unreadable date is ignored.
 
+### Review of the batchable proof format and batch checking in the directory, 20 November 2026
+
+Proofs now carry the Schnorr commitments instead of the challenge, the witness signature on the handle
+is BBS instead of Pointcheval–Sanders, and the directory checks likes in batches ([crypto.md](crypto.md)).
+Two passes; the second found nothing new.
+
+| # | Problem | Effect | Fix | Test |
+|---|---|---|---|---|
+| 47 | **Before this change, a proof without its SNARK part was accepted.** The verifier checked the Bulletproofs or LegoGroth16 proof only if one was present (`if let Some(..)`), and the challenge simply hashed an empty SNARK. Found by reading the code; not demonstrated with a forged proof | A person with a modified app could leave out the circuit, and with it the proof that the like tag and the pseudonym come from their secret: any number of likes on one post, any number of pseudonyms. Present since the first version | A proof must carry the SNARK of the configured proof system, or it is false | `batch_check_accepts_good_likes_and_refuses_any_bad_one_*` (all proofs go through the new check) |
+| 48 | In the commitment form nothing is checked before the combined check, so any well-formed false proof reaches it | Anyone can send false proofs that cost the directory combined checks and halving | The halving budget (#46) bounds it: with many false proofs the cost is about that of checking each alone | `likes_checked_in_one_batch_get_each_their_own_answer`, measured in crypto.md |
+
+Checked and found sound: the challenge hashes the commitments with everything else, as before (standard
+Fiat–Shamir with commitments); the two BBS equations, the Schnorr relations and the LegoGroth16 equation
+each get their own random scalars; a proof must have as many commitments as relations and as many
+responses as witnesses; the witness signature uses its own generators (`WITNESS_P1`, `WITNESS_H`), and
+its relation shares the response for r with the credential's, so both sign the same handle; the directory's
+batches never mix days, revocation roots or cutoffs; a like waits at most 50 ms for its batch; the queue
+to the checker is bounded (4,096), so a flood makes senders wait instead of filling memory; witness keys
+from before this change are refused with a message (they were PS keys).
+
 ### Checked and found sound
 
 - **Proof verification.** Points are subgroup-checked on decoding; identity elements are rejected where

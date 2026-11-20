@@ -497,3 +497,31 @@ async fn count_buckets_partition_the_table() {
         assert_eq!(status(&c.post::<_, serde_json::Value>("/v1/likes/buckets", &bad).await.unwrap_err()), 400, "{bad}");
     }
 }
+
+#[tokio::test]
+async fn likes_checked_in_one_batch_get_each_their_own_answer() {
+    let d = net().await;
+    let alice = enrolled(d, "alice", "T-BATCH-ALICE").await;
+    let bob = enrolled(d, "bob", "T-BATCH-BOB").await;
+    alice.bind("mockfeed", "alice", 1, CodePlacement::Bio).await.unwrap();
+    // a false like: a binding proof (public in the directory's records) sent as a like proof. It is
+    // well formed, so only the combined check can refuse it, and it must not sink the true likes.
+    let recs: Vec<BindingRecord> = dir(d).get("/v1/bindings/mockfeed/u1").await.unwrap();
+    let rec = recs.into_iter().next().unwrap().request;
+    let fake = |post: &str| LikeRequest {
+        platform: "mockfeed".into(),
+        post_id: post.into(),
+        today: rec.today,
+        alarm_cutoff: rec.alarm_cutoff,
+        revocation_root: rec.revocation_root.clone(),
+        proof: pop_crypto::LikeProof { tag: rec.proof.nym.clone(), proof: rec.proof.proof.clone() },
+    };
+    let c = dir(d);
+    let (x5, x6) = (fake("p5"), fake("p6"));
+    let (a, b, f1, f2) = tokio::join!(alice.like("mockfeed", "p5"), bob.like("mockfeed", "p5"), c.like(&x5), c.like(&x6));
+    assert!(a.is_ok() && b.is_ok(), "{a:?} {b:?}");
+    assert_eq!(status(&f1.unwrap_err()), 401);
+    assert_eq!(status(&f2.unwrap_err()), 401);
+    let t: CountTable = dir(d).get("/v1/likes/table?platform=mockfeed").await.unwrap();
+    assert!(t.counts["p5"] >= 2 && !t.counts.contains_key("p6"));
+}

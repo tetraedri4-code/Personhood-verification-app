@@ -1,6 +1,7 @@
 # Data usage of the app
 
-Measured on 19 November 2026 (first on 16 November, before the change to syncing) with
+Measured on 20 November 2026 (first on 16 November, before the change to syncing; on 19 November before
+the change of proof format) with
 `cargo test --release -p pop-cli --test data_usage -- --ignored --nocapture`, which runs one person through every operation and counts the JSON bodies the holder app
 sends and receives. Default settings: LegoGroth16, revocation tree of depth 8.
 
@@ -13,17 +14,22 @@ and about 5 kB once per connection for the TLS handshake.
 |---|---|---|---|
 | Proving keys | once per device, cached | 0 | **4.7 MB** |
 | Enrol | once | 0.6 kB | 1.7 kB |
-| Bind an account | per account; again every nine months | 4.2 kB | 0.3 kB |
-| Report a like | per like | 2.8 kB | 0.2 kB |
-| Renew | every quarter | 2.7 kB | 0.3 kB |
+| Bind an account | per account; again every nine months | 5.4 kB | 0.3 kB |
+| Report a like | per like | 3.6 kB | 0.2 kB |
+| Renew | every quarter | 3.4 kB | 0.3 kB |
 | Update the backup | with each renewal | 5.7 kB | 0 |
-| Identity re-check (with backup update) | every two years | 8.4 kB | 0.7 kB |
+| Identity re-check (with backup update) | every two years | 9.4 kB | 0.7 kB |
 | Look for a waiting replacement | at app start | 0 | 14 B + 120 B per waiting request in the system |
 | Replace the secret (with backup update) | rarely | 6.4 kB | 0.9 kB |
 | Restore a backup | rarely | 0 | 5.6 kB |
 
 With Bulletproofs instead of LegoGroth16 there are no proving keys to download, and each proof is about
-3.6 kB larger: bind 8.5 kB, like 6.5 kB, renew 6.2 kB, re-check 6.3 kB sent.
+4 to 5 kB larger: bind 10.4 kB, like 7.6 kB, renew 7.2 kB, re-check 7.5 kB sent.
+
+What changed on 20 November 2026: proofs carry their Schnorr commitments (one point per relation)
+instead of the challenge, and the witness signature on the handle is BBS instead of Pointcheval–Sanders,
+so that the directory can check likes in batches ([crypto.md](crypto.md)). That added about 0.7 to 1.2 kB
+per proof in these JSON bodies (hex doubles every byte): a like was 2.8 kB.
 
 What changed on 19 November 2026 (before, a like received 1.0 kB):
 
@@ -45,11 +51,11 @@ A person with two bound accounts who reports ten likes a day:
 | First day: keys, enrolment, two bindings, backup | 4.8 MB | 4.8 MB |
 | Renewals and backup updates (4) | 35 kB | 70 kB |
 | Bindings renewed (2 to 3) | 12 kB | 25 kB |
-| Likes (3,650) | 11 MB | 15 to 20 MB |
+| Likes (3,650) | 13 MB | 16 to 20 MB |
 | Re-check (half of one) | 5 kB | 10 kB |
-| **A year after the first day** | **about 11 MB** | **about 15 to 20 MB** |
+| **A year after the first day** | **about 13 MB** | **about 16 to 20 MB** |
 
-Almost all of it is the uploaded like proofs: about 3 kB each in bodies, 4 to 5 kB on the wire. A person
+Almost all of it is the uploaded like proofs: about 3.6 kB each in bodies, 4 to 5 kB on the wire. A person
 who reports no likes uses under 150 kB a year after the first day. The rough column is an estimate of
 HTTP and TLS overhead, not a measurement.
 
@@ -62,7 +68,7 @@ These include likes by bots and fake accounts, so they overstate a real person's
 logs of 269 consenting users in 2010 showed 14 likes a month on average, and nearly 5% over 100 a
 month ([Pew](https://www.pewresearch.org/internet/2012/02/03/part-2-facebook-activity/)): heavy users
 like several times the average. Applying that ratio to Instagram gives roughly 100 likes a day for a
-heavy user (an extrapolation): about 110 MB a year in bodies, and about 70 s of proving a day on a desktop.
+heavy user (an extrapolation): about 130 MB a year in bodies, and about 70 s of proving a day on a desktop.
 
 ## The browser extension
 

@@ -120,50 +120,62 @@ impl IssuerKey {
     }
 }
 
-/// Key of the log witnesses, who sign every issued handle r once (Pointcheval–Sanders).
+/// Key of the log witnesses, who sign every issued handle r once. A BBS signature on the one message r
+/// (A = (P1_w + H_w r)^{1/(x+e)}), so that showing it takes only G1 relations and one pairing
+/// equation, which combine across a batch of proofs. (Design §4.2 has Pointcheval–Sanders, whose
+/// showing needs a commitment in GT; see docs/crypto.md.)
 pub struct WitnessKey {
     x: Fr,
-    y: Fr,
     pub public: WitnessPublicKey,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct WitnessPublicKey {
-    pub xt: G2A,
-    pub yt: G2A,
+    pub w: G2A,
 }
 
+/// (A, e)
 #[derive(Clone, Debug, PartialEq)]
-pub struct HandleSignature(pub G1A, pub G1A);
+pub struct HandleSignature(pub G1A, pub Fr);
+
+fn witness_b(r: u64) -> G1 {
+    let g = Gens::cached();
+    g.wp1 + g.wh * Fr::from(r)
+}
 
 impl WitnessKey {
     pub fn generate<R: RngCore>(rng: &mut R) -> Self {
-        Self::from_scalars(Fr::rand(rng), Fr::rand(rng))
+        Self::from_scalar(Fr::rand(rng))
     }
-    fn from_scalars(x: Fr, y: Fr) -> Self {
-        let g2 = G2::generator();
-        WitnessKey { x, y, public: WitnessPublicKey { xt: (g2 * x).into_affine(), yt: (g2 * y).into_affine() } }
+    fn from_scalar(x: Fr) -> Self {
+        WitnessKey { x, public: WitnessPublicKey { w: (G2::generator() * x).into_affine() } }
     }
     pub fn to_bytes(&self) -> Vec<u8> {
-        codec::ser(&(self.x, self.y))
+        codec::ser(&self.x)
     }
     pub fn from_bytes(b: &[u8]) -> Result<Self> {
-        let (x, y): (Fr, Fr) = codec::de(b)?;
-        Ok(Self::from_scalars(x, y))
+        let x: Fr = codec::de(b).map_err(|_| CryptoError::Encoding("witness key: not a BBS key (keys from before 20 November 2026 were Pointcheval–Sanders; generate a new one)".into()))?;
+        Ok(Self::from_scalar(x))
     }
     pub fn sign_handle<R: RngCore>(&self, rng: &mut R, r: u64) -> HandleSignature {
-        let h = (G1::generator() * Fr::rand(rng)).into_affine();
-        HandleSignature(h, (h * (self.x + self.y * Fr::from(r))).into_affine())
+        loop {
+            let e = Fr::rand(rng);
+            if let Some(inv) = (self.x + e).inverse() {
+                return HandleSignature((witness_b(r) * inv).into_affine(), e);
+            }
+        }
     }
 }
 
 impl WitnessPublicKey {
+    /// e(A, W g2^e) = e(P1_w + H_w r, g2)
     pub fn verify_handle(&self, r: u64, sig: &HandleSignature) -> bool {
         if sig.0.is_zero() {
             return false;
         }
-        let rhs = (self.xt.into_group() + self.yt * Fr::from(r)).into_affine();
-        E::multi_pairing([sig.1, (-sig.0.into_group()).into_affine()], [G2::generator().into_affine(), rhs]).is_zero()
+        let g2 = G2::generator();
+        let lhs = (self.w.into_group() + g2 * sig.1).into_affine();
+        E::multi_pairing([sig.0, (-witness_b(r)).into_affine()], [lhs, g2.into_affine()]).is_zero()
     }
 }
 
@@ -569,8 +581,7 @@ impl Scheme {
         Public {
             g: &self.g,
             w_iss: issuer.w,
-            ps_xt: witness.xt,
-            ps_yt: witness.yt,
+            wit_w: witness.w,
             acc_q: G2::generator().into_affine(),
             gens: &[],
             pc: PedersenGens { B: self.g.ped_b, B_blinding: self.g.ped_h },
@@ -623,7 +634,7 @@ impl Scheme {
         let holder = Holder {
             cred: cred.inner.clone(),
             r_u64: cred.handle(),
-            ps: (cred.handle_sig.0, cred.handle_sig.1),
+            wsig: (cred.handle_sig.0, cred.handle_sig.1),
             wits: vec![],
             paths: vec![path],
             rho_new,
@@ -1095,11 +1106,10 @@ impl IssuerPublicKey {
 
 impl WitnessPublicKey {
     pub fn to_hex(&self) -> String {
-        to_hex(&(self.xt, self.yt))
+        to_hex(&self.w)
     }
     pub fn from_hex(s: &str) -> Result<Self> {
-        let (xt, yt) = from_hex(s)?;
-        Ok(WitnessPublicKey { xt, yt })
+        Ok(WitnessPublicKey { w: from_hex(s)? })
     }
 }
 

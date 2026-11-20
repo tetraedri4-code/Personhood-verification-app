@@ -22,7 +22,7 @@ use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisE
 use ark_serialize::CanonicalDeserialize;
 use std::sync::Arc;
 use ark_bulletproofs::{BulletproofGens, PedersenGens};
-use ark_ec::{pairing::Pairing, pairing::PairingOutput, AffineRepr, CurveGroup, VariableBaseMSM};
+use ark_ec::{pairing::Pairing, AffineRepr, CurveGroup, VariableBaseMSM};
 use ark_ff::{Field, One, UniformRand, Zero};
 use ark_serialize::CanonicalSerialize;
 use ark_std::rand::RngCore;
@@ -42,10 +42,6 @@ pub const RANGE_BITS: usize = 16;
 pub struct Keys {
     pub x_iss: Fr,
     pub w_iss: G2A,
-    pub ps_x: Fr,
-    pub ps_y: Fr,
-    pub ps_xt: G2A,
-    pub ps_yt: G2A,
     pub acc_alpha: Fr,
     pub acc_q: G2A,
 }
@@ -53,16 +49,10 @@ pub struct Keys {
 impl Keys {
     pub fn gen<R: RngCore>(rng: &mut R, g: &Gens) -> Self {
         let x_iss = Fr::rand(rng);
-        let ps_x = Fr::rand(rng);
-        let ps_y = Fr::rand(rng);
         let acc_alpha = Fr::rand(rng);
         Keys {
             x_iss,
             w_iss: (g.g2 * x_iss).into_affine(),
-            ps_x,
-            ps_y,
-            ps_xt: (g.g2 * ps_x).into_affine(),
-            ps_yt: (g.g2 * ps_y).into_affine(),
             acc_alpha,
             acc_q: (g.g2 * acc_alpha).into_affine(),
         }
@@ -98,11 +88,6 @@ pub fn bbs_verify(g: &Gens, w: &G2A, a: &G1A, e: Fr, b: &G1) -> bool {
     E::multi_pairing([*a, (-*b).into_affine()], [(*w + g.g2 * e).into_affine(), g.g2]).is_zero()
 }
 
-/// Witnesses' PS signature on r.
-pub fn ps_sign<R: RngCore>(rng: &mut R, g: &Gens, k: &Keys, r: Fr) -> (G1A, G1A) {
-    let h = (g.p1 * Fr::rand(rng)).into_affine();
-    (h, (h * (k.ps_x + k.ps_y * r)).into_affine())
-}
 
 #[derive(Clone)]
 pub struct HashUse {
@@ -172,8 +157,13 @@ pub struct Proof {
     pub abar: G1A,
     pub bbar: G1A,
     pub d: G1A,
-    pub s1: G1A,
-    pub s2: G1A,
+    /// the witness signature on r, randomised as for the credential: Abar', Bbar', D'
+    pub wabar: G1A,
+    pub wbbar: G1A,
+    pub wd: G1A,
+    /// the Schnorr commitments, one per linear relation (commitment form: the challenge is computed
+    /// from them, so that the relations of many proofs can be checked as one sum)
+    pub ts: Vec<G1A>,
     pub vcoms: Vec<G1A>,
     pub r1cs: Option<R1CSProof<G1A>>,
     pub lego: Option<legogroth16::Proof<E>>,
@@ -182,6 +172,7 @@ pub struct Proof {
     pub dcoms: Vec<G1A>,
     pub cnew: Option<G1A>,
     pub outputs: Vec<G1A>, // nyms / tags (public outputs of the presentation)
+    /// the challenge; not sent, the verifier computes it from everything else
     pub c: Fr,
     pub z: Vec<Fr>,
 }
@@ -208,7 +199,9 @@ struct Layout {
     e_neg: usize,
     r1: usize,
     r3: usize,
-    ps_k: usize,
+    w_e_neg: usize, // witness signature: -e', r1', r3'
+    w_r1: usize,
+    w_r3: usize,
     // committed values in the R1CS: (value-index or None for raw bits, blinding index)
     v_s: Option<usize>,
     v_x: Vec<usize>,              // vcom position of each hash output
@@ -240,7 +233,9 @@ fn layout(cfg: &Cfg, m_max: usize) -> Layout {
     let e_neg = take();
     let r1 = take();
     let r3 = take();
-    let ps_k = take();
+    let w_e_neg = take();
+    let w_r1 = take();
+    let w_r3 = take();
     let mut vblind = vec![];
     let mut vval: Vec<Option<usize>> = vec![];
     let mut v_s = None;
@@ -314,7 +309,9 @@ fn layout(cfg: &Cfg, m_max: usize) -> Layout {
         e_neg,
         r1,
         r3,
-        ps_k,
+        w_e_neg,
+        w_r1,
+        w_r3,
         v_s,
         v_x,
         x_idx,
@@ -587,8 +584,8 @@ fn circuit<CS: ConstraintSystem<Fr>>(
 pub struct Public<'a> {
     pub g: &'a Gens,
     pub w_iss: G2A,
-    pub ps_xt: G2A,
-    pub ps_yt: G2A,
+    /// the witnesses' public key (BBS on r)
+    pub wit_w: G2A,
     pub acc_q: G2A,
     pub gens: &'a [Generation],
     pub pc: PedersenGens<G1A>,
@@ -606,7 +603,8 @@ impl<'a> Public<'a> {
 pub struct Holder {
     pub cred: Credential,
     pub r_u64: u64,
-    pub ps: (G1A, G1A),
+    /// the witness signature (A', e') on r
+    pub wsig: (G1A, Fr),
     pub wits: Vec<NonMemWit>, // one per generation (fallback)
     pub paths: Vec<TreePath>, // one per month (v2 tree)
     /// renewal: the new blinding rho' the holder chose for the re-issued credential (drawn if None)
@@ -640,6 +638,9 @@ fn linear_relations(p: &Public, cfg: &Cfg, lay: &Layout, pr: &Proof) -> Vec<LinR
         t.push(((-g.h[j].into_group()).into_affine(), j));
     }
     rels.push(LinRel::new(g.p1 + g.q1 * domain(), t));
+    // witness signature on the same r: Bbar' = Abar'*(-e') + D'*r1' ;  P1_w = D'*r3' - H_w r
+    rels.push(LinRel::new(pr.wbbar.into(), vec![(pr.wabar, lay.w_e_neg), (pr.wd, lay.w_r1)]));
+    rels.push(LinRel::new(g.wp1.into(), vec![(pr.wd, lay.w_r3), ((-g.wh.into_group()).into_affine(), A_R)]));
     match cfg.backend {
         Backend::Bulletproofs => {
             // each R1CS commitment opens to the hidden value
@@ -710,13 +711,13 @@ fn linear_relations(p: &Public, cfg: &Cfg, lay: &Layout, pr: &Proof) -> Vec<LinR
     rels
 }
 
-fn challenge(cfg: &Cfg, pr: &Proof, ts: &[G1A], ps_t: &PairingOutput<E>, snark_bytes: &[u8]) -> Fr {
+fn challenge(cfg: &Cfg, pr: &Proof, ts: &[G1A], snark_bytes: &[u8]) -> Fr {
     let mut h = Sha256::new();
     h.update(b"EUPC-V1-PRESENTATION");
     h.update(cfg.name.as_bytes());
     h.update(&cfg.context);
     let mut buf = vec![];
-    for p in [pr.abar, pr.bbar, pr.d, pr.s1, pr.s2] {
+    for p in [pr.abar, pr.bbar, pr.d, pr.wabar, pr.wbbar, pr.wd] {
         p.serialize_compressed(&mut buf).unwrap();
     }
     for p in pr.vcoms.iter().chain(pr.clcoms.iter()).chain(pr.dcoms.iter()).chain(pr.outputs.iter()).chain(ts.iter()) {
@@ -733,7 +734,6 @@ fn challenge(cfg: &Cfg, pr: &Proof, ts: &[G1A], ps_t: &PairingOutput<E>, snark_b
     if let Some(c) = pr.cnew {
         c.serialize_compressed(&mut buf).unwrap();
     }
-    ps_t.serialize_compressed(&mut buf).unwrap();
     h.update(&buf);
     h.update(snark_bytes);
     let d = h.finalize();
@@ -800,12 +800,15 @@ pub fn prove<R: RngCore + ark_std::rand::CryptoRng>(
     w[lay.e_neg] = -cr.e;
     w[lay.r1] = r1;
     w[lay.r3] = r2.inverse().unwrap();
-    // PS randomisation
-    let tt = Fr::rand(rng);
-    let kk = Fr::rand(rng);
-    let s1 = hd.ps.0 * tt;
-    let s2 = (hd.ps.1.into_group() + hd.ps.0 * kk) * tt;
-    w[lay.ps_k] = kk;
+    // witness signature on r, randomised the same way
+    let (wr1, wr2) = (Fr::rand(rng), Fr::rand(rng));
+    let wb = g.wp1 + g.wh * cr.m[A_R];
+    let wd = wb * wr2;
+    let wabar = hd.wsig.0 * (wr1 * wr2);
+    let wbbar = wd * wr1 - wabar * hd.wsig.1;
+    w[lay.w_e_neg] = -hd.wsig.1;
+    w[lay.w_r1] = wr1;
+    w[lay.w_r3] = wr2.inverse().unwrap();
     // hashes
     let mut outputs = vec![];
     for (h, hu) in cfg.hashes.iter().enumerate() {
@@ -947,8 +950,10 @@ pub fn prove<R: RngCore + ark_std::rand::CryptoRng>(
         abar: abar.into_affine(),
         bbar: bbar.into_affine(),
         d: d.into_affine(),
-        s1: s1.into_affine(),
-        s2: s2.into_affine(),
+        wabar: wabar.into_affine(),
+        wbbar: wbbar.into_affine(),
+        wd: wd.into_affine(),
+        ts: vec![],
         vcoms,
         r1cs,
         lego,
@@ -974,8 +979,8 @@ pub fn prove<R: RngCore + ark_std::rand::CryptoRng>(
     debug_assert!(sigma::check(&rels, &w).is_none(), "relation {:?} fails", sigma::check(&rels, &w));
     let blind: Vec<Fr> = (0..lay.n).map(|_| Fr::rand(rng)).collect();
     let ts = sigma::commit(&rels, &blind);
-    let ps_t = E::pairing(pr.s1, (p.ps_yt * blind[A_R] + g.g2 * blind[lay.ps_k]).into_affine());
-    let c = challenge(cfg, &pr, &ts, &ps_t, &snark_bytes(&pr));
+    let c = challenge(cfg, &pr, &ts, &snark_bytes(&pr));
+    pr.ts = ts;
     pr.z = (0..lay.n).map(|i| blind[i] + c * w[i]).collect();
     pr.c = c;
     for (gi, (st, l, rho)) in gen_states.into_iter().enumerate() {
@@ -987,106 +992,12 @@ pub fn prove<R: RngCore + ark_std::rand::CryptoRng>(
     pr
 }
 
-/// Compact encoding: rebuild what the sender left out, as a real receiver would. None: nothing left out.
-fn rebuild(p: &Public, cfg: &Cfg, lay: &Layout, pr_in: &Proof) -> Option<Proof> {
-    let g = p.g;
-    if cfg.compact {
-        let mut rebuilt = Proof {
-            abar: pr_in.abar, bbar: pr_in.bbar, d: pr_in.d, s1: pr_in.s1, s2: pr_in.s2,
-            vcoms: pr_in.vcoms.clone(),
-            r1cs: pr_in.r1cs.as_ref().map(|pf| bp_unstrip(&bp_strip(pf))),
-            lego: pr_in.lego.clone(),
-            clcoms: pr_in.clcoms.clone(),
-            gens: vec![],
-            dcoms: pr_in.dcoms.clone(), cnew: pr_in.cnew, outputs: pr_in.outputs.clone(),
-            c: pr_in.c, z: pr_in.z.clone(),
-        };
-        let cl: Vec<G1A> = match cfg.backend {
-            Backend::Bulletproofs => lay.v_bits.iter().map(|vi| pr_in.vcoms[*vi]).collect(),
-            Backend::LegoGroth16 => pr_in.clcoms.clone(),
-        };
-        for (gi, gp) in pr_in.gens.iter().enumerate() {
-            let gen = &p.gens[gi];
-            // the received proof has no c_a, c_b, c_d[0]
-            let mut cd = gp.gk.cd.clone();
-            cd[0] = G1A::zero();
-            let recv = gk::GkProof { ca: vec![], cb: vec![], cd, f: gp.gk.f.clone(), za: gp.gk.za.clone(), zb: gp.gk.zb.clone(), zd: gp.gk.zd };
-            let (ca, cb, cd0) = gk::recompute(g, &gen.vals, &gp.k, &cl[..gen.m], gen.m, &recv, pr_in.c);
-            let mut cd = recv.cd.clone();
-            cd[0] = cd0;
-            rebuilt.gens.push(GenProof { k: gp.k, cp: gp.cp, e: gp.e, cma: gp.cma, gk: gk::GkProof { ca, cb, cd, f: recv.f, za: recv.za, zb: recv.zb, zd: recv.zd } });
-        }
-        Some(rebuilt)
-    } else {
-        None
+/// Check one proof: [`prepare`], then the combinable checks for it alone.
+pub fn verify(p: &Public, cfg: &Cfg, pr: &Proof) -> bool {
+    match prepare(p, cfg, pr) {
+        Some(x) => combined(p, &[&x], &mut rand::rngs::OsRng),
+        None => false,
     }
-}
-
-pub fn verify(p: &Public, cfg: &Cfg, pr_in: &Proof) -> bool {
-    let g = p.g;
-    let pos = p.pos(cfg.width);
-    let mm = m_max(p, cfg);
-    let lay = layout(cfg, mm);
-    let rebuilt = rebuild(p, cfg, &lay, pr_in);
-    let pr: &Proof = rebuilt.as_ref().unwrap_or(pr_in);
-    if pr.abar.is_zero() || pr.s1.is_zero() {
-        return false;
-    }
-    // pairing checks: BBS, and per generation e(E, g2) e(C', Q) = 1
-    if !E::multi_pairing([pr.abar, (-pr.bbar.into_group()).into_affine()], [p.w_iss, g.g2]).is_zero() {
-        return false;
-    }
-    for gp in &pr.gens {
-        if gp.cp.is_zero() || !E::multi_pairing([gp.e, gp.cp], [g.g2, p.acc_q]).is_zero() {
-            return false;
-        }
-    }
-    // SNARK
-    match cfg.backend {
-        Backend::Bulletproofs => {
-            if let Some(pf) = &pr.r1cs {
-                let mut tr = Transcript::new(b"EUPC-R1CS");
-                tr.append_message(b"ctx", &cfg.context);
-                let mut ver = Verifier::new(&mut tr);
-                let vars: Vec<Variable<Fr>> = pr.vcoms.iter().map(|v| ver.commit(*v)).collect();
-                circuit(&mut ver, cfg, &lay, pos, p.pos3, p.pos5, &vars, None);
-                if ver.verify(pf, &p.pc, p.bp).is_err() {
-                    return false;
-                }
-            }
-        }
-        Backend::LegoGroth16 => {
-            if let Some(lp) = &pr.lego {
-                let keys = cfg.lego.as_ref().unwrap();
-                if legogroth16::verify_proof(&keys.pvk, lp, &lego_public_inputs(cfg)).is_err() {
-                    return false;
-                }
-            }
-        }
-    }
-    // sigma relations
-    let rels = linear_relations(p, cfg, &lay, pr);
-    let ts = sigma::recompute(&rels, &pr.z, pr.c);
-    let ps_t = E::multi_pairing(
-        [pr.s1, (pr.s2 * (-pr.c)).into_affine()],
-        [(p.ps_yt * pr.z[A_R] + g.g2 * pr.z[lay.ps_k] + p.ps_xt * pr.c).into_affine(), g.g2],
-    );
-    if challenge(cfg, pr, &ts, &ps_t, &snark_bytes(pr)) != pr.c {
-        return false;
-    }
-    if !cfg.compact {
-        let cl: Vec<G1A> = match cfg.backend {
-            Backend::Bulletproofs => lay.v_bits.iter().map(|vi| pr.vcoms[*vi]).collect(),
-            Backend::LegoGroth16 => pr.clcoms.clone(),
-        };
-        for (gi, gp) in pr.gens.iter().enumerate() {
-            let gen = &p.gens[gi];
-            if !gk::verify(g, &gen.vals, &gp.k, &cl[..gen.m], gen.m, &gp.gk, pr.c) {
-                return false;
-            }
-        }
-    }
-    true
 }
 
 /// Check many proofs at once. Accepts only if every proof would pass [`verify`]; if any is false, it
@@ -1094,12 +1005,11 @@ pub fn verify(p: &Public, cfg: &Cfg, pr_in: &Proof) -> bool {
 /// must be unpredictable to the provers (OsRng): whoever knows the random scalars can make a false
 /// proof cancel out.
 ///
-/// The checks whose verifier side is the same for every proof are combined with a random scalar per
-/// proof: the BBS pairing check (two pairings in all instead of two per proof), the SNARK (Bulletproofs:
-/// one multi-scalar multiplication over all proofs; LegoGroth16: one pairing per proof plus three in
-/// all, one final exponentiation). The Schnorr relations and the PS signature enter each proof's
-/// Fiat-Shamir challenge, so they stay per proof. Proofs with accumulator generations are checked one
-/// by one.
+/// Per proof: the challenge (a hash) and, for LegoGroth16, the public-input sum; for Bulletproofs the
+/// circuit's scalars. Everything else is one sum over the batch, each equation multiplied by a random
+/// scalar: the Schnorr relations (one multi-scalar multiplication, shared bases once), the two BBS
+/// pairing equations (credential and witness signature) and the LegoGroth16 equation (one final
+/// exponentiation for all), and the Bulletproofs check (one multi-scalar multiplication).
 pub fn verify_batch<R: RngCore + ark_std::rand::CryptoRng>(p: &Public, items: &[(&Cfg, &Proof)], rng: &mut R) -> bool {
     let mut prepared = Vec::with_capacity(items.len());
     for (cfg, pr) in items {
@@ -1178,84 +1088,120 @@ fn safe_combined<R: RngCore + ark_std::rand::CryptoRng>(p: &Public, items: &[&Pr
 /// What a proof contributes to a combined check, after its own per-proof checks have passed.
 pub struct Prepared<'a> {
     cfg: &'a Cfg,
-    pr: PrRef<'a>,
+    pr: &'a Proof,
+    /// the challenge, computed from the proof
+    c: Fr,
+    rels: Vec<LinRel>,
     /// LegoGroth16: D, the public-input part of the check
     lego_d: Option<G1A>,
-    /// checked by itself (accumulator generations): nothing to combine
-    alone: bool,
 }
 
-enum PrRef<'a> {
-    B(&'a Proof),
-    O(Box<Proof>),
-}
-
-impl std::ops::Deref for PrRef<'_> {
-    type Target = Proof;
-    fn deref(&self) -> &Proof {
-        match self {
-            PrRef::B(p) => p,
-            PrRef::O(p) => p,
-        }
+/// The per-proof part of [`verify`]: shape checks, the challenge, the relations. None: the proof is
+/// false. (The accumulator fallback and the compact encoding of the benchmark are not part of this
+/// prototype's proofs.)
+fn prepare<'a>(p: &Public, cfg: &'a Cfg, pr: &'a Proof) -> Option<Prepared<'a>> {
+    if cfg.compact || cfg.n_gens > 0 || !pr.gens.is_empty() {
+        return None;
     }
-}
-
-/// The per-proof part of [`verify`]: everything but the combinable checks. None: the proof is false.
-fn prepare<'a>(p: &Public, cfg: &'a Cfg, pr_in: &'a Proof) -> Option<Prepared<'a>> {
-    if !pr_in.gens.is_empty() {
-        return verify(p, cfg, pr_in).then_some(Prepared { cfg, pr: PrRef::B(pr_in), lego_d: None, alone: true });
+    if pr.abar.is_zero() || pr.wabar.is_zero() {
+        return None;
     }
-    let g = p.g;
     let lay = layout(cfg, m_max(p, cfg));
-    let pr = match rebuild(p, cfg, &lay, pr_in) {
-        Some(x) => PrRef::O(Box::new(x)),
-        None => PrRef::B(pr_in),
-    };
-    if !pr.gens.is_empty() || pr.abar.is_zero() || pr.s1.is_zero() {
+    if pr.z.len() != lay.n {
+        return None;
+    }
+    let rels = linear_relations(p, cfg, &lay, pr);
+    if pr.ts.len() != rels.len() {
         return None;
     }
     let mut lego_d = None;
-    match cfg.backend {
-        Backend::Bulletproofs => {}
-        Backend::LegoGroth16 => {
-            if let Some(lp) = &pr.lego {
-                let keys = cfg.lego.as_ref()?;
-                lego_d = Some(legogroth16::verifier::calculate_d(&keys.pvk, lp, &lego_public_inputs(cfg)).ok()?);
-            }
+    if cfg.backend == Backend::LegoGroth16 {
+        if let Some(lp) = &pr.lego {
+            let keys = cfg.lego.as_ref()?;
+            lego_d = Some(legogroth16::verifier::calculate_d(&keys.pvk, lp, &lego_public_inputs(cfg)).ok()?);
         }
     }
-    // sigma relations and PS: per proof (they feed the challenge)
-    let rels = linear_relations(p, cfg, &lay, &pr);
-    let ts = sigma::recompute(&rels, &pr.z, pr.c);
-    let ps_t = E::multi_pairing(
-        [pr.s1, (pr.s2 * (-pr.c)).into_affine()],
-        [(p.ps_yt * pr.z[A_R] + g.g2 * pr.z[lay.ps_k] + p.ps_xt * pr.c).into_affine(), g.g2],
-    );
-    if challenge(cfg, &pr, &ts, &ps_t, &snark_bytes(&pr)) != pr.c {
-        return None;
-    }
-    Some(Prepared { cfg, pr, lego_d, alone: false })
+    let c = challenge(cfg, pr, &pr.ts, &snark_bytes(pr));
+    Some(Prepared { cfg, pr, c, rels, lego_d })
 }
 
-/// The combinable checks of prepared proofs, with a fresh random scalar per proof.
+/// The combinable checks of prepared proofs, with fresh random scalars.
 fn combined<R: RngCore + ark_std::rand::CryptoRng>(p: &Public, items: &[&Prepared], rng: &mut R) -> bool {
+    use std::collections::HashMap;
     let g = p.g;
-    let items: Vec<&Prepared> = items.iter().copied().filter(|x| !x.alone).collect();
     if items.is_empty() {
         return true;
     }
-    // BBS: sum_i r_i (e(Abar_i, W) - e(Bbar_i, g2)) = 0
-    let rs: Vec<Fr> = items.iter().map(|_| Fr::rand(rng)).collect();
-    let abar: Vec<G1A> = items.iter().map(|x| x.pr.abar).collect();
-    let bbar: Vec<G1A> = items.iter().map(|x| x.pr.bbar).collect();
-    let a = <E as Pairing>::G1::msm(&abar, &rs).unwrap().into_affine();
-    let b = <E as Pairing>::G1::msm(&bbar, &rs).unwrap();
-    if !E::multi_pairing([a, (-b).into_affine()], [p.w_iss, g.g2]).is_zero() {
+    // Schnorr relations: for every proof i and relation k, sum_j base_j z[idx_j] - c target - T_k = 0;
+    // add them all up with a random scalar each, merging bases that occur more than once.
+    let mut acc: HashMap<G1A, Fr> = HashMap::new();
+    for x in items {
+        let targets = G1::normalize_batch(&x.rels.iter().map(|r| r.target).collect::<Vec<_>>());
+        for ((r, t), tk) in x.rels.iter().zip(targets.iter()).zip(x.pr.ts.iter()) {
+            let rho = Fr::rand(rng);
+            for (b, idx) in &r.terms {
+                *acc.entry(*b).or_insert_with(Fr::zero) += rho * x.pr.z[*idx];
+            }
+            *acc.entry(*t).or_insert_with(Fr::zero) -= rho * x.c;
+            *acc.entry(*tk).or_insert_with(Fr::zero) -= rho;
+        }
+    }
+    let (bases, scalars): (Vec<G1A>, Vec<Fr>) = acc.into_iter().filter(|(b, _)| !b.is_zero()).unzip();
+    if !G1::msm(&bases, &scalars).unwrap().is_zero() {
         return false;
     }
+    // Pairing equations, one Miller loop and one final exponentiation for all:
+    //   credential  e(Abar, W_iss)  = e(Bbar, g2)
+    //   witness     e(Abar', W_wit) = e(Bbar', g2)
+    //   LegoGroth16 e(A, B) = e(alpha, beta) e(D, gamma) e(C, delta)
+    let mut g1s: Vec<G1A> = vec![];
+    let mut g2s: Vec<<E as Pairing>::G2Prepared> = vec![];
+    let r1: Vec<Fr> = items.iter().map(|_| Fr::rand(rng)).collect();
+    let r2: Vec<Fr> = items.iter().map(|_| Fr::rand(rng)).collect();
+    let pts = |f: &dyn Fn(&Prepared) -> G1A| items.iter().map(|x| f(x)).collect::<Vec<G1A>>();
+    let a = G1::msm(&pts(&|x| x.pr.abar), &r1).unwrap();
+    let wa = G1::msm(&pts(&|x| x.pr.wabar), &r2).unwrap();
+    let b = G1::msm(&pts(&|x| x.pr.bbar), &r1).unwrap() + G1::msm(&pts(&|x| x.pr.wbbar), &r2).unwrap();
+    g1s.extend([a.into_affine(), wa.into_affine(), (-b).into_affine()]);
+    g2s.extend([p.w_iss.into(), p.wit_w.into(), g.g2.into()]);
+    let lg: Vec<&&Prepared> = items.iter().filter(|x| x.cfg.backend == Backend::LegoGroth16).collect();
+    if !lg.is_empty() {
+        let keys = match lg[0].cfg.lego.as_ref() {
+            Some(k) => k.clone(),
+            None => return false,
+        };
+        // one key set per batch
+        if lg.iter().any(|x| !x.cfg.lego.as_ref().is_some_and(|k| Arc::ptr_eq(k, &keys))) {
+            return false;
+        }
+        let vk = &keys.pvk.vk;
+        let rs: Vec<Fr> = lg.iter().map(|_| Fr::rand(rng)).collect();
+        let (mut cs, mut ds) = (vec![], vec![]);
+        for (x, r) in lg.iter().zip(rs.iter()) {
+            let (Some(lp), Some(d)) = (x.pr.lego.as_ref(), x.lego_d) else { return false };
+            g1s.push((lp.a * r).into_affine());
+            g2s.push(lp.b.into());
+            cs.push(lp.c);
+            ds.push(d);
+        }
+        let sr: Fr = rs.iter().sum();
+        g1s.push(G1::msm(&cs, &rs).unwrap().into_affine());
+        g2s.push(keys.pvk.delta_g2_neg_pc.clone());
+        g1s.push(G1::msm(&ds, &rs).unwrap().into_affine());
+        g2s.push(keys.pvk.gamma_g2_neg_pc.clone());
+        g1s.push((vk.alpha_g1 * (-sr)).into_affine());
+        g2s.push(vk.beta_g2.into());
+    }
+    match E::final_exponentiation(E::multi_miller_loop(g1s, g2s)) {
+        Some(x) if x.is_zero() => {}
+        _ => return false,
+    }
     // Bulletproofs: one multi-scalar multiplication for all
-    let bp: Vec<&&Prepared> = items.iter().filter(|x| x.cfg.backend == Backend::Bulletproofs && x.pr.r1cs.is_some()).collect();
+    let bp: Vec<&&Prepared> = items.iter().filter(|x| x.cfg.backend == Backend::Bulletproofs).collect();
     if !bp.is_empty() {
+        if bp.iter().any(|x| x.pr.r1cs.is_none()) {
+            return false;
+        }
         let mut trs: Vec<Transcript> = bp
             .iter()
             .map(|x| {
@@ -1272,50 +1218,8 @@ fn combined<R: RngCore + ark_std::rand::CryptoRng>(p: &Public, items: &[&Prepare
             circuit(&mut ver, x.cfg, &lay, p.pos(x.cfg.width), p.pos3, p.pos5, &vars, None);
             verifiers.push((ver, x.pr.r1cs.as_ref().unwrap()));
         }
-        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ark_bulletproofs::r1cs::batch_verify(rng, verifiers, &p.pc, p.bp).is_ok())).unwrap_or(false);
-        if !ok {
+        if ark_bulletproofs::r1cs::batch_verify(rng, verifiers, &p.pc, p.bp).is_err() {
             return false;
-        }
-    }
-    // LegoGroth16: e(A_i, B_i) = e(alpha, beta) e(D_i, gamma) e(C_i, delta) for all i, combined:
-    // prod_i e(r_i A_i, B_i) * e(-sum r_i C_i, delta) * e(-sum r_i D_i, gamma) * e(-(sum r_i) alpha, beta) = 1
-    let lg: Vec<&&Prepared> = items.iter().filter(|x| x.cfg.backend == Backend::LegoGroth16 && x.pr.lego.is_some()).collect();
-    if !lg.is_empty() {
-        let keys = match lg[0].cfg.lego.as_ref() {
-            Some(k) => k.clone(),
-            None => return false,
-        };
-        // one key set per batch
-        if lg.iter().any(|x| !x.cfg.lego.as_ref().is_some_and(|k| Arc::ptr_eq(k, &keys))) {
-            return false;
-        }
-        let vk = &keys.pvk.vk;
-        let rs: Vec<Fr> = lg.iter().map(|_| Fr::rand(rng)).collect();
-        let mut g1s: Vec<G1A> = vec![];
-        let mut g2s: Vec<<E as Pairing>::G2Prepared> = vec![];
-        let (mut cs, mut ds) = (vec![], vec![]);
-        for (x, r) in lg.iter().zip(rs.iter()) {
-            let lp = x.pr.lego.as_ref().unwrap();
-            g1s.push((lp.a * r).into_affine());
-            g2s.push(lp.b.into());
-            cs.push(lp.c);
-            match x.lego_d {
-                Some(d) => ds.push(d),
-                None => return false,
-            }
-        }
-        let sc = <E as Pairing>::G1::msm(&cs, &rs).unwrap();
-        let sd = <E as Pairing>::G1::msm(&ds, &rs).unwrap();
-        let sr: Fr = rs.iter().sum();
-        g1s.push(sc.into_affine());
-        g2s.push(keys.pvk.delta_g2_neg_pc.clone());
-        g1s.push(sd.into_affine());
-        g2s.push(keys.pvk.gamma_g2_neg_pc.clone());
-        g1s.push((vk.alpha_g1 * (-sr)).into_affine());
-        g2s.push(vk.beta_g2.into());
-        match E::final_exponentiation(E::multi_miller_loop(g1s, g2s)) {
-            Some(x) if x.is_zero() => {}
-            _ => return false,
         }
     }
     true
@@ -1324,7 +1228,7 @@ fn combined<R: RngCore + ark_std::rand::CryptoRng>(p: &Public, items: &[&Prepare
 pub fn sizes(pr: &Proof, compact: bool) -> SizeBreakdown {
     let mut s = SizeBreakdown::default();
     s.bbs = 3 * G1_BYTES + 3 * FR_BYTES + N_ATTR * FR_BYTES; // Abar,Bbar,D + e^,r1^,r3^ + hidden m^
-    s.ps = 2 * G1_BYTES + FR_BYTES; // sigma1', sigma2' + k^
+    s.ps = 3 * G1_BYTES + 3 * FR_BYTES; // witness signature: Abar', Bbar', D' + e'^, r1'^, r3'^
     s.r1cs_proof = match (&pr.r1cs, &pr.lego) {
         (Some(p), _) => if compact { bp_strip(p).len() } else { p.compressed_size() },
         (_, Some(l)) => l.compressed_size(),
@@ -1340,9 +1244,9 @@ pub fn sizes(pr: &Proof, compact: bool) -> SizeBreakdown {
     s.distrust = pr.dcoms.len() * (G1_BYTES + 3 * FR_BYTES);
     s.reissue = if pr.cnew.is_some() { G1_BYTES + FR_BYTES } else { 0 };
     s.outputs = pr.outputs.len() * G1_BYTES;
-    let accounted = N_ATTR + 3 + 1 + pr.gens.len() * 4 + pr.dcoms.len() * 3 + if pr.cnew.is_some() { 1 } else { 0 };
+    let accounted = N_ATTR + 3 + 3 + pr.gens.len() * 4 + pr.dcoms.len() * 3 + if pr.cnew.is_some() { 1 } else { 0 };
     s.other_responses = (pr.z.len() - accounted) * FR_BYTES; // commitment-link blindings, hash exponents, bits
-    s.challenge = FR_BYTES;
+    s.challenge = pr.ts.len() * G1_BYTES; // commitment form: the Schnorr commitments, not the challenge
     s.total = s.bbs + s.ps + s.r1cs_proof + s.r1cs_commitments + s.per_generation * s.generations
         + s.distrust + s.reissue + s.outputs + s.other_responses + s.challenge;
     s
