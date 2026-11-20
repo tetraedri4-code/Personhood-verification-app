@@ -100,6 +100,9 @@ async fn handle(State(s): State<Arc<Gw>>, headers: HeaderMap, body: Bytes) -> Re
     };
     let mut m = bhttp::Message::response(bhttp::StatusCode::try_from(status.as_u16()).unwrap_or(bhttp::StatusCode::OK));
     m.put_header("content-type", ct);
+    // the server's time, for the holder's clock (pop_protocol::clock): inside the encryption, so that
+    // the relay can neither read nor change it
+    m.put_header("date", httpdate::fmt_http_date(std::time::SystemTime::now()));
     let sizes = &s.gw.1;
     m.put_header(crate::PAD_HEADER, sizes.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","));
     m.write_content(&content);

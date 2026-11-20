@@ -987,15 +987,11 @@ pub fn prove<R: RngCore + ark_std::rand::CryptoRng>(
     pr
 }
 
-pub fn verify(p: &Public, cfg: &Cfg, pr_in: &Proof) -> bool {
+/// Compact encoding: rebuild what the sender left out, as a real receiver would. None: nothing left out.
+fn rebuild(p: &Public, cfg: &Cfg, lay: &Layout, pr_in: &Proof) -> Option<Proof> {
     let g = p.g;
-    let pos = p.pos(cfg.width);
-    let mm = m_max(p, cfg);
-    let lay = layout(cfg, mm);
-    // Compact encoding: rebuild what the sender left out, as a real receiver would.
-    let mut rebuilt;
-    let pr: &Proof = if cfg.compact {
-        rebuilt = Proof {
+    if cfg.compact {
+        let mut rebuilt = Proof {
             abar: pr_in.abar, bbar: pr_in.bbar, d: pr_in.d, s1: pr_in.s1, s2: pr_in.s2,
             vcoms: pr_in.vcoms.clone(),
             r1cs: pr_in.r1cs.as_ref().map(|pf| bp_unstrip(&bp_strip(pf))),
@@ -1020,10 +1016,19 @@ pub fn verify(p: &Public, cfg: &Cfg, pr_in: &Proof) -> bool {
             cd[0] = cd0;
             rebuilt.gens.push(GenProof { k: gp.k, cp: gp.cp, e: gp.e, cma: gp.cma, gk: gk::GkProof { ca, cb, cd, f: recv.f, za: recv.za, zb: recv.zb, zd: recv.zd } });
         }
-        &rebuilt
+        Some(rebuilt)
     } else {
-        pr_in
-    };
+        None
+    }
+}
+
+pub fn verify(p: &Public, cfg: &Cfg, pr_in: &Proof) -> bool {
+    let g = p.g;
+    let pos = p.pos(cfg.width);
+    let mm = m_max(p, cfg);
+    let lay = layout(cfg, mm);
+    let rebuilt = rebuild(p, cfg, &lay, pr_in);
+    let pr: &Proof = rebuilt.as_ref().unwrap_or(pr_in);
     if pr.abar.is_zero() || pr.s1.is_zero() {
         return false;
     }
@@ -1079,6 +1084,238 @@ pub fn verify(p: &Public, cfg: &Cfg, pr_in: &Proof) -> bool {
             if !gk::verify(g, &gen.vals, &gp.k, &cl[..gen.m], gen.m, &gp.gk, pr.c) {
                 return false;
             }
+        }
+    }
+    true
+}
+
+/// Check many proofs at once. Accepts only if every proof would pass [`verify`]; if any is false, it
+/// fails except with probability about 2^-255, and does not say which ([`sieve_batch`] does). `rng`
+/// must be unpredictable to the provers (OsRng): whoever knows the random scalars can make a false
+/// proof cancel out.
+///
+/// The checks whose verifier side is the same for every proof are combined with a random scalar per
+/// proof: the BBS pairing check (two pairings in all instead of two per proof), the SNARK (Bulletproofs:
+/// one multi-scalar multiplication over all proofs; LegoGroth16: one pairing per proof plus three in
+/// all, one final exponentiation). The Schnorr relations and the PS signature enter each proof's
+/// Fiat-Shamir challenge, so they stay per proof. Proofs with accumulator generations are checked one
+/// by one.
+pub fn verify_batch<R: RngCore + ark_std::rand::CryptoRng>(p: &Public, items: &[(&Cfg, &Proof)], rng: &mut R) -> bool {
+    let mut prepared = Vec::with_capacity(items.len());
+    for (cfg, pr) in items {
+        match prepare(p, cfg, pr) {
+            Some(x) => prepared.push(x),
+            None => return false,
+        }
+    }
+    let all: Vec<&Prepared> = prepared.iter().collect();
+    combined(p, &all, rng)
+}
+
+/// Which of the proofs are valid: like [`verify`] on each, but checking the combinable parts in
+/// batches and, where a batch fails, in halves (binary search), so that false proofs cannot sink the
+/// true ones of their batch. The per-proof parts are done once per proof; with m false proofs among n
+/// the combined parts cost about n (log2 m + 2) proofs' worth instead of n.
+pub fn sieve_batch<R: RngCore + ark_std::rand::CryptoRng>(p: &Public, items: &[(&Cfg, &Proof)], rng: &mut R) -> Vec<bool> {
+    // a malformed proof that makes the code panic is false by itself, and must not sink the others
+    let prepared: Vec<Option<Prepared>> = items
+        .iter()
+        .map(|(cfg, pr)| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prepare(p, cfg, pr))).ok().flatten())
+        .collect();
+    let live: Vec<usize> = (0..items.len()).filter(|i| prepared[*i].is_some()).collect();
+    // Halving costs about n (log2 m + 2) proofs' worth of combined checks with m false among n; when
+    // many are false that exceeds checking each alone. Past a budget of 3n, the rest are checked alone.
+    let budget = 3 * live.len();
+    struct S<'b, 'c, R> {
+        p: &'b Public<'b>,
+        pre: &'b [Option<Prepared<'c>>],
+        ok: Vec<bool>,
+        budget: usize,
+        rng: &'b mut R,
+    }
+    impl<R: RngCore + ark_std::rand::CryptoRng> S<'_, '_, R> {
+        fn check(&mut self, set: &[usize]) -> bool {
+            self.budget = self.budget.saturating_sub(set.len());
+            let refs: Vec<&Prepared> = set.iter().map(|i| self.pre[*i].as_ref().unwrap()).collect();
+            let r = safe_combined(self.p, &refs, self.rng);
+            if r {
+                for i in set {
+                    self.ok[*i] = true;
+                }
+            }
+            r
+        }
+        fn go(&mut self, set: &[usize], known_bad: bool) {
+            if set.is_empty() || (!known_bad && self.check(set)) || set.len() == 1 {
+                return;
+            }
+            if self.budget == 0 {
+                for i in set {
+                    self.check(&[*i]);
+                }
+                return;
+            }
+            let (l, r) = set.split_at(set.len() / 2);
+            if self.check(l) {
+                // the set failed and its left half passed: the right half holds a false proof
+                self.go(r, true);
+            } else {
+                self.go(l, true);
+                self.go(r, false);
+            }
+        }
+    }
+    let mut st = S { p, pre: &prepared, ok: vec![false; items.len()], budget, rng };
+    st.go(&live, false);
+    st.ok
+}
+
+/// [`combined`], with a panic counted as a failed check (the halving then isolates its cause).
+fn safe_combined<R: RngCore + ark_std::rand::CryptoRng>(p: &Public, items: &[&Prepared], rng: &mut R) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| combined(p, items, rng))).unwrap_or(false)
+}
+
+/// What a proof contributes to a combined check, after its own per-proof checks have passed.
+pub struct Prepared<'a> {
+    cfg: &'a Cfg,
+    pr: PrRef<'a>,
+    /// LegoGroth16: D, the public-input part of the check
+    lego_d: Option<G1A>,
+    /// checked by itself (accumulator generations): nothing to combine
+    alone: bool,
+}
+
+enum PrRef<'a> {
+    B(&'a Proof),
+    O(Box<Proof>),
+}
+
+impl std::ops::Deref for PrRef<'_> {
+    type Target = Proof;
+    fn deref(&self) -> &Proof {
+        match self {
+            PrRef::B(p) => p,
+            PrRef::O(p) => p,
+        }
+    }
+}
+
+/// The per-proof part of [`verify`]: everything but the combinable checks. None: the proof is false.
+fn prepare<'a>(p: &Public, cfg: &'a Cfg, pr_in: &'a Proof) -> Option<Prepared<'a>> {
+    if !pr_in.gens.is_empty() {
+        return verify(p, cfg, pr_in).then_some(Prepared { cfg, pr: PrRef::B(pr_in), lego_d: None, alone: true });
+    }
+    let g = p.g;
+    let lay = layout(cfg, m_max(p, cfg));
+    let pr = match rebuild(p, cfg, &lay, pr_in) {
+        Some(x) => PrRef::O(Box::new(x)),
+        None => PrRef::B(pr_in),
+    };
+    if !pr.gens.is_empty() || pr.abar.is_zero() || pr.s1.is_zero() {
+        return None;
+    }
+    let mut lego_d = None;
+    match cfg.backend {
+        Backend::Bulletproofs => {}
+        Backend::LegoGroth16 => {
+            if let Some(lp) = &pr.lego {
+                let keys = cfg.lego.as_ref()?;
+                lego_d = Some(legogroth16::verifier::calculate_d(&keys.pvk, lp, &lego_public_inputs(cfg)).ok()?);
+            }
+        }
+    }
+    // sigma relations and PS: per proof (they feed the challenge)
+    let rels = linear_relations(p, cfg, &lay, &pr);
+    let ts = sigma::recompute(&rels, &pr.z, pr.c);
+    let ps_t = E::multi_pairing(
+        [pr.s1, (pr.s2 * (-pr.c)).into_affine()],
+        [(p.ps_yt * pr.z[A_R] + g.g2 * pr.z[lay.ps_k] + p.ps_xt * pr.c).into_affine(), g.g2],
+    );
+    if challenge(cfg, &pr, &ts, &ps_t, &snark_bytes(&pr)) != pr.c {
+        return None;
+    }
+    Some(Prepared { cfg, pr, lego_d, alone: false })
+}
+
+/// The combinable checks of prepared proofs, with a fresh random scalar per proof.
+fn combined<R: RngCore + ark_std::rand::CryptoRng>(p: &Public, items: &[&Prepared], rng: &mut R) -> bool {
+    let g = p.g;
+    let items: Vec<&Prepared> = items.iter().copied().filter(|x| !x.alone).collect();
+    if items.is_empty() {
+        return true;
+    }
+    // BBS: sum_i r_i (e(Abar_i, W) - e(Bbar_i, g2)) = 0
+    let rs: Vec<Fr> = items.iter().map(|_| Fr::rand(rng)).collect();
+    let abar: Vec<G1A> = items.iter().map(|x| x.pr.abar).collect();
+    let bbar: Vec<G1A> = items.iter().map(|x| x.pr.bbar).collect();
+    let a = <E as Pairing>::G1::msm(&abar, &rs).unwrap().into_affine();
+    let b = <E as Pairing>::G1::msm(&bbar, &rs).unwrap();
+    if !E::multi_pairing([a, (-b).into_affine()], [p.w_iss, g.g2]).is_zero() {
+        return false;
+    }
+    // Bulletproofs: one multi-scalar multiplication for all
+    let bp: Vec<&&Prepared> = items.iter().filter(|x| x.cfg.backend == Backend::Bulletproofs && x.pr.r1cs.is_some()).collect();
+    if !bp.is_empty() {
+        let mut trs: Vec<Transcript> = bp
+            .iter()
+            .map(|x| {
+                let mut tr = Transcript::new(b"EUPC-R1CS");
+                tr.append_message(b"ctx", &x.cfg.context);
+                tr
+            })
+            .collect();
+        let mut verifiers = vec![];
+        for (tr, x) in trs.iter_mut().zip(bp.iter()) {
+            let lay = layout(x.cfg, m_max(p, x.cfg));
+            let mut ver = Verifier::new(tr);
+            let vars: Vec<Variable<Fr>> = x.pr.vcoms.iter().map(|v| ver.commit(*v)).collect();
+            circuit(&mut ver, x.cfg, &lay, p.pos(x.cfg.width), p.pos3, p.pos5, &vars, None);
+            verifiers.push((ver, x.pr.r1cs.as_ref().unwrap()));
+        }
+        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ark_bulletproofs::r1cs::batch_verify(rng, verifiers, &p.pc, p.bp).is_ok())).unwrap_or(false);
+        if !ok {
+            return false;
+        }
+    }
+    // LegoGroth16: e(A_i, B_i) = e(alpha, beta) e(D_i, gamma) e(C_i, delta) for all i, combined:
+    // prod_i e(r_i A_i, B_i) * e(-sum r_i C_i, delta) * e(-sum r_i D_i, gamma) * e(-(sum r_i) alpha, beta) = 1
+    let lg: Vec<&&Prepared> = items.iter().filter(|x| x.cfg.backend == Backend::LegoGroth16 && x.pr.lego.is_some()).collect();
+    if !lg.is_empty() {
+        let keys = match lg[0].cfg.lego.as_ref() {
+            Some(k) => k.clone(),
+            None => return false,
+        };
+        // one key set per batch
+        if lg.iter().any(|x| !x.cfg.lego.as_ref().is_some_and(|k| Arc::ptr_eq(k, &keys))) {
+            return false;
+        }
+        let vk = &keys.pvk.vk;
+        let rs: Vec<Fr> = lg.iter().map(|_| Fr::rand(rng)).collect();
+        let mut g1s: Vec<G1A> = vec![];
+        let mut g2s: Vec<<E as Pairing>::G2Prepared> = vec![];
+        let (mut cs, mut ds) = (vec![], vec![]);
+        for (x, r) in lg.iter().zip(rs.iter()) {
+            let lp = x.pr.lego.as_ref().unwrap();
+            g1s.push((lp.a * r).into_affine());
+            g2s.push(lp.b.into());
+            cs.push(lp.c);
+            match x.lego_d {
+                Some(d) => ds.push(d),
+                None => return false,
+            }
+        }
+        let sc = <E as Pairing>::G1::msm(&cs, &rs).unwrap();
+        let sd = <E as Pairing>::G1::msm(&ds, &rs).unwrap();
+        let sr: Fr = rs.iter().sum();
+        g1s.push(sc.into_affine());
+        g2s.push(keys.pvk.delta_g2_neg_pc.clone());
+        g1s.push(sd.into_affine());
+        g2s.push(keys.pvk.gamma_g2_neg_pc.clone());
+        g1s.push((vk.alpha_g1 * (-sr)).into_affine());
+        g2s.push(vk.beta_g2.into());
+        match E::final_exponentiation(E::multi_miller_loop(g1s, g2s)) {
+            Some(x) if x.is_zero() => {}
+            _ => return false,
         }
     }
     true

@@ -71,6 +71,7 @@ impl Transport for Oblivious {
             let r = self.http.post(&self.relay).header("content-type", REQ_TYPE).body(enc).send().await.map_err(t)?;
             let status = r.status();
             let ct = r.headers().get("content-type").and_then(|v| v.to_str().ok()).map(String::from);
+            let relay_date = r.headers().get("date").and_then(|v| v.to_str().ok()).map(String::from);
             let body = r.bytes().await.map_err(t)?;
             if status == reqwest::StatusCode::BAD_REQUEST && body.as_ref() == BAD_KEY.as_bytes() && attempt == 0 {
                 continue; // the gateway has a new key; the request did not reach the server
@@ -85,7 +86,8 @@ impl Transport for Oblivious {
             if let Some(s) = resp.header().get(crate::PAD_HEADER.as_bytes()).and_then(crate::parse_pad_sizes) {
                 *self.pad_sizes.lock().unwrap() = s;
             }
-            return Ok(RawResponse { status, body: resp.content().to_vec() });
+            let server_date = resp.header().get(b"date").and_then(|v| std::str::from_utf8(v).ok()).map(String::from);
+            return Ok(RawResponse { status, body: resp.content().to_vec(), server_date, relay_date });
         }
         Err(t("the gateway's key keeps changing"))
     }

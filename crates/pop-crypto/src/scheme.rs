@@ -747,6 +747,55 @@ impl Scheme {
         Ok(())
     }
 
+    /// Check many like proofs at once ([`statement::verify_batch`]): accepts only if every one would pass
+    /// [`Scheme::verify_like`]. On failure it does not say which ([`Scheme::sieve_likes`] does).
+    /// Items: (context, post, proof).
+    pub fn verify_likes<R: RngCore + CryptoRng>(&self, rng: &mut R, vc: &VerifyCtx, cutoff: Day, items: &[(&str, &str, &LikeProof)]) -> Result<()> {
+        let mut decoded = Vec::with_capacity(items.len());
+        for it in items {
+            decoded.push(self.decode_like(vc, cutoff, it)?.ok_or(CryptoError::InvalidProof)?);
+        }
+        let p = self.public(vc.issuer, vc.witness);
+        let pairs: Vec<(&Cfg, &statement::Proof)> = decoded.iter().map(|(c, pr)| (c, pr)).collect();
+        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| statement::verify_batch(&p, &pairs, rng))).unwrap_or(false);
+        if ok { Ok(()) } else { Err(CryptoError::InvalidProof) }
+    }
+
+    /// Which like proofs are valid, each as [`Scheme::verify_like`] would say, checked in batches and,
+    /// where a batch fails, in halves ([`statement::sieve_batch`]): false proofs cannot sink true ones.
+    pub fn sieve_likes<R: RngCore + CryptoRng>(&self, rng: &mut R, vc: &VerifyCtx, cutoff: Day, items: &[(&str, &str, &LikeProof)]) -> Result<Vec<bool>> {
+        let mut decoded = Vec::with_capacity(items.len());
+        for it in items {
+            decoded.push(self.decode_like(vc, cutoff, it)?);
+        }
+        let idx: Vec<usize> = (0..items.len()).filter(|i| decoded[*i].is_some()).collect();
+        let pairs: Vec<(&Cfg, &statement::Proof)> = idx.iter().map(|i| decoded[*i].as_ref().map(|(c, pr)| (c, pr)).unwrap()).collect();
+        let p = self.public(vc.issuer, vc.witness);
+        let flags = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| statement::sieve_batch(&p, &pairs, rng))).unwrap_or_else(|_| vec![false; pairs.len()]);
+        let mut out = vec![false; items.len()];
+        for (k, i) in idx.iter().enumerate() {
+            out[*i] = flags[k];
+        }
+        Ok(out)
+    }
+
+    /// The statement and decoded proof of a like, after the checks that need no cryptography. Ok(None): the
+    /// proof is false; Err: the keys are missing.
+    fn decode_like(&self, vc: &VerifyCtx, cutoff: Day, (ctx, post, lp): &(&str, &str, &LikeProof)) -> Result<Option<(Cfg, statement::Proof)>> {
+        let st = Stmt::Like { ctx: (*ctx).into(), post: (*post).into(), today: vc.today, cutoff, root: vc.revocation_root, bind: vec![] };
+        let cfg = self.cfg_for(&st);
+        if self.config.proof_system == ProofSystem::LegoGroth16 && cfg.lego.is_none() {
+            return Err(CryptoError::MissingKeys(st.kind().name().into()));
+        }
+        let Ok(bytes) = hex::decode(&lp.proof) else { return Ok(None) };
+        let Ok(pr) = codec::decode_proof(&bytes) else { return Ok(None) };
+        let expect_outputs = cfg.hashes.iter().map(|h| h.bases.len()).sum::<usize>();
+        if pr.outputs.len() != expect_outputs || pr.cnew.is_some() != cfg.reissue || !pr.gens.is_empty() || to_hex(&pr.outputs[0]) != lp.tag {
+            return Ok(None);
+        }
+        Ok(Some((cfg, pr)))
+    }
+
     /// The like tag a holder would produce for a post, without a proof (used to undo a like locally).
     pub fn like_tag(&self, cred: &Credential, ctx: &str, post: &str) -> String {
         let hu = HashUse {

@@ -11,6 +11,10 @@ use std::sync::Arc;
 pub struct RawResponse {
     pub status: u16,
     pub body: Vec<u8>,
+    /// the server's `Date` header (through a relay: inside the encrypted answer)
+    pub server_date: Option<String>,
+    /// the relay's own `Date` header, when the request went through one
+    pub relay_date: Option<String>,
 }
 
 /// Carries one request to a server. `base` is the server's address (scheme and host), `path` starts with
@@ -33,8 +37,9 @@ impl Transport for Direct {
         }
         let r = rb.send().await.map_err(|e| ApiError::Transport(e.to_string()))?;
         let status = r.status().as_u16();
+        let server_date = r.headers().get(reqwest::header::DATE).and_then(|v| v.to_str().ok()).map(String::from);
         let body = r.bytes().await.map_err(|e| ApiError::Transport(e.to_string()))?.to_vec();
-        Ok(RawResponse { status, body })
+        Ok(RawResponse { status, body, server_date, relay_date: None })
     }
 }
 
@@ -42,6 +47,8 @@ impl Transport for Direct {
 pub struct HttpClient {
     base: String,
     transport: Arc<dyn Transport>,
+    /// where the dates of answers go, and which server this is
+    clock: Option<(Arc<crate::clock::Clock>, crate::clock::Source)>,
 }
 
 impl HttpClient {
@@ -52,7 +59,12 @@ impl HttpClient {
         Self::with_transport(base, Arc::new(Direct(client)))
     }
     pub fn with_transport(base: &str, transport: Arc<dyn Transport>) -> Self {
-        HttpClient { base: base.trim_end_matches('/').to_string(), transport }
+        HttpClient { base: base.trim_end_matches('/').to_string(), transport, clock: None }
+    }
+    /// Report the dates of this server's answers (and of its relay's) to `clock`.
+    pub fn with_clock(mut self, clock: Arc<crate::clock::Clock>, source: crate::clock::Source) -> Self {
+        self.clock = Some((clock, source));
+        self
     }
     pub fn base(&self) -> &str {
         &self.base
@@ -60,6 +72,14 @@ impl HttpClient {
 
     async fn send(&self, method: &str, path: &str, body: Option<Vec<u8>>) -> Result<Vec<u8>, ApiError> {
         let r = self.transport.send(method, &self.base, path, body).await?;
+        if let Some((c, src)) = &self.clock {
+            if let Some(d) = &r.server_date {
+                c.observe_http_date(*src, d);
+            }
+            if let Some(d) = &r.relay_date {
+                c.observe_http_date(crate::clock::Source::Relay, d);
+            }
+        }
         if (200..300).contains(&r.status) {
             return Ok(r.body);
         }

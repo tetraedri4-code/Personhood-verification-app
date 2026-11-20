@@ -35,7 +35,7 @@ Differences from the design, chosen for the prototype:
 |---|---|---|
 | Trusted setup | yes, one per statement | none |
 | Measured in this repository's tests | binding proof 1.7 KB, like proof 1.2 KB; a binding takes about 2 s end to end in the demo | binding proof 3.7 KB, like proof 2.9 KB; slower |
-| Benchmark (server core) | prove 0.7 s, verify 9 ms, 1.2 KB | prove 6–7 s, verify 0.3 s, 3 KB |
+| Benchmark (server core) | prove 0.7 s, verify 9 to 11 ms, 1.2 KB | prove 6–7 s, verify 0.2 to 0.3 s, 3 KB |
 | Trust | whoever ran the setup can forge proofs | discrete logarithm only |
 
 ```sh
@@ -48,6 +48,35 @@ on each.
 **The setup is the main thing to fix before LegoGroth16 is used for real.** `Scheme::lego_setup` is run
 by the issuer alone, which can therefore forge any proof (though it still cannot link pseudonyms to
 people). The fix is a multi-party ceremony per statement, or Bulletproofs.
+
+## Checking many like proofs at once
+
+`Scheme::verify_likes` checks a batch of like proofs together and accepts only if every one would pass
+`verify_like`; `Scheme::sieve_likes` says which ones are valid, checking halves of a failed batch (binary
+search) so that false proofs cannot sink the true ones in their batch. Halving costs about
+n (log2 m + 2) proofs' worth of combined checks for m false proofs among n; past 3n, the rest are
+checked one by one, so a flood of false proofs costs little more than checking each alone. The issuer still checks each like
+as it arrives; these are for a server that collects likes for a fraction of a second first.
+
+How: every check whose verifier side is the same for all proofs is multiplied by a random scalar per
+proof and added up, so that a false proof makes the sum non-zero except with probability about 2^-255.
+The BBS pairing check becomes two pairings per batch; the Bulletproofs check one multi-scalar
+multiplication for all (ark-bulletproofs `batch_verify`); the LegoGroth16 check one pairing per proof
+plus three and one final exponentiation per batch. The Schnorr relations and the PS signature are
+rebuilt and hashed into each proof's challenge (compact encoding), so they stay per proof. The random
+scalars come from the operating system: a prover who knew them could make a false proof cancel out.
+
+Measured on 20 November 2026 on one core of the development server, like proofs at the default settings
+(tree depth 8), `cargo test --release -p pop-crypto --test batch -- --ignored --nocapture --test-threads 1`:
+
+| | One by one | Batches of 16 | Batches of 64 | Largest batch | Largest, with 1 false | with 4 false |
+|---|---|---|---|---|---|---|
+| Bulletproofs (largest 128) | 175 ms | 46 ms | 40 ms | 39 ms (4.5x) | 44 ms | 59 ms |
+| LegoGroth16 (largest 512) | 10.7 ms | 8.8 ms | 8.3 ms | 7.9 ms (1.3x) | 8.6 ms | 8.9 ms |
+
+Per proof. For LegoGroth16 about 6 ms of the 8 is the per-proof Schnorr and PS work; sending the Schnorr
+commitments instead of the challenge, and a BBS signature instead of PS for the handle, would make those
+combinable too (not built).
 
 ## Adding a third proof system
 

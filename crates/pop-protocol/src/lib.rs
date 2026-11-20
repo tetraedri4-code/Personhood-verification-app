@@ -12,6 +12,7 @@
 //! This crate depends only on `pop-crypto`. Servers, identity providers and platform adapters depend on
 //! it, never on each other.
 pub mod api;
+pub mod clock;
 pub mod http;
 pub mod ids;
 pub mod platform;

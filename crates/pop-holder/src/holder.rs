@@ -120,6 +120,8 @@ pub struct Holder {
     params: std::sync::Mutex<Option<(std::time::Instant, Params)>>,
     /// the revocation list and its tree, so that only new revocations are downloaded
     pub(crate) revs: tokio::sync::Mutex<Option<RevCache>>,
+    /// the time the like windows follow: the middle of the servers' times (pop_protocol::clock)
+    clock: Arc<pop_protocol::clock::Clock>,
 }
 
 pub(crate) struct RevCache {
@@ -142,7 +144,14 @@ fn nonce() -> String {
 
 impl Holder {
     pub fn new(issuer: Arc<dyn IssuerApi>, directory: Arc<dyn DirectoryApi>, platforms: PlatformRegistry, wallet: Arc<dyn WalletStore>) -> Self {
-        Holder { issuer, directory, platforms, wallet, scheme: tokio::sync::OnceCell::new(), busy: tokio::sync::Mutex::new(()), params: std::sync::Mutex::new(None), revs: tokio::sync::Mutex::new(None) }
+        Holder { issuer, directory, platforms, wallet, scheme: tokio::sync::OnceCell::new(), busy: tokio::sync::Mutex::new(()), params: std::sync::Mutex::new(None), revs: tokio::sync::Mutex::new(None), clock: Arc::new(pop_protocol::clock::Clock::new()) }
+    }
+
+    /// Go by `clock` for the like windows; give the same clock to the issuer and directory clients
+    /// (`HttpClient::with_clock`), so that it learns their times. Without it: the device's clock.
+    pub fn with_clock(mut self, clock: Arc<pop_protocol::clock::Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     async fn params(&self) -> Result<Params> {
@@ -395,14 +404,13 @@ impl Holder {
     /// The request carries no account and no pseudonym, and tags of different posts are unlinkable.
     /// The wait before a like is proved and sent, and the longest it can be, in seconds. Likes go out
     /// on a schedule shared by everyone: windows of the issuer's `like_window_secs`, counted from the
-    /// Unix epoch. A like clicked in one window is sent at a random moment of the next, so a public
+    /// Unix epoch by the middle of the servers' times ([`Holder::with_clock`]). A like clicked in one window is sent at a random moment of the next, so a public
     /// count going up, or a send seen by the relay, tells only the window of the click. Without the
     /// wait, the moment a count goes up shows when the person clicked, which a relay that sees their
     /// address could match.
     pub async fn like_delay(&self) -> Result<(std::time::Duration, u64)> {
         let w = self.params().await?.like_window_secs as u64;
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| HolderError::Internal(e.to_string()))?;
-        Ok(like_send_delay(now.as_millis() as u64, w, &mut OsRng))
+        Ok(like_send_delay(self.clock.now_ms(), w, &mut OsRng))
     }
 
     /// Check at once what can be checked before the wait (credential, probation, post id), then queue

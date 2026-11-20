@@ -286,9 +286,30 @@ nothing more; the setting is at most 12 hours, so the longest wait (two windows)
 the extension's display of a waiting like stays bounded; the proof is still made at send time, against
 that moment's revocation root and probation.
 
-Known and not fixed: the windows follow the device's clock, so a device whose clock is minutes off sends
-outside everyone else's windows and can be told apart. The app could take the time from the issuer's
-answers instead.
+Found in the review and then fixed (Osama's suggestion): the windows followed the device's clock, so a
+device whose clock is minutes off sent outside everyone else's windows and could be told apart. They now
+follow the middle of the issuer's, the directory's and the relay's times; the device's clock votes only
+without a relay (tests `one_lying_server_does_not_move_the_clock`,
+`the_clock_learns_the_server_and_the_relay_time_through_the_relay`). Two of the three agreeing to lie
+can still move an app's windows.
+
+### Review of batch checking and the servers' clock, 20 November 2026
+
+Like proofs can be checked in batches (`Scheme::verify_likes`, `Scheme::sieve_likes`, [crypto.md](crypto.md));
+the like windows follow the middle of the issuer's, the directory's and the relay's times. Two passes;
+the second found nothing new.
+
+| # | Problem | Effect | Fix | Test |
+|---|---|---|---|---|
+| 45 | A malformed proof that made the checking code panic failed the whole sieve | One crafted proof would have sunk every true like in its batch | Each proof's own checks, and each combined check, catch a panic as a failure of that proof or set; halving then isolates it | `batch_check_accepts_good_likes_and_refuses_any_bad_one_*` |
+| 46 | With many false proofs, halving costs more than checking each alone (about n log2 n) | Someone sending mostly false proofs could make the server work harder than without batches | Past a budget of 3n proofs' worth, the rest are checked one by one | same |
+
+Checked and found sound: the random scalars come from the operating system's generator, so no prover
+can make a false proof cancel out; LegoGroth16 proofs in one batch must share one key set; proofs that
+fail their own (per-proof) checks never enter a combined check; a proof's parts swapped with another's,
+a proof claimed for another post, or one from another issuer's credential are all caught (tests). The
+server times come from the gateways inside the encryption, so the relay can neither read nor change
+them, and the relay's own time from its answer; an unreadable date is ignored.
 
 ### Checked and found sound
 

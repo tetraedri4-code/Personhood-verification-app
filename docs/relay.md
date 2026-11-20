@@ -84,15 +84,21 @@ Encryption hides what a message says, not how long it is or when it is sent. Bot
   like waits between a moment and two windows (one hour at the default). The extension shows the like at once and keeps showing it until it has surely
   arrived; the holder keeps waiting likes in the wallet across a restart. The proof is made after the
   wait, so it uses the revocation root of that moment. If the app is closed when its like is due, the like
-  stays queued and goes out in the window after the app starts again: later, which tells no more. (`pop devnet` and `pop demo` default to 20 s;
+  stays queued and goes out in the window after the app starts again: later, which tells no more. (`pop devnet` and `pop demo` default to 10 s;
   `--like-window-secs` changes it.)
+- **Whose clock.** The windows follow the middle of three times: the issuer's and the directory's (each
+  in its own answers, inside the encryption) and the relay's (the `Date` of its answers). The device's
+  clock only measures how long ago each answer came. Taking one server's word would let that server give
+  some apps another time and then recognise their likes by when they arrive; one lying server cannot
+  move the middle of three. Without a relay the device's clock is the third vote
+  (`pop_protocol::clock`).
 
 ## What it does not do
 
 - **No mixing and no cover traffic.** The design's relays also mix reports and add dummy ones (§4.7).
   The schedule hides a like among those clicked in the same half-hour; with very few users that window
-  may still hold only one person's likes. The window marks follow the device's clock: a device whose
-  clock is far off sends outside the others' windows and stands out. Bindings and renewals are sent at once: a binding right after an enrolment is
+  may still hold only one person's likes.  If two of the three clocks (issuer, directory, relay)
+  agree to lie, they can move an app's windows and so recognise its likes. Bindings and renewals are sent at once: a binding right after an enrolment is
   still linkable by timing when there are few users.
 - **Size classes are coarse.** Messages in the same class look the same; a like report (about 4 KiB)
   is still in a different class from a small download.

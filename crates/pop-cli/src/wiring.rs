@@ -1,4 +1,5 @@
 //! Builders that turn configuration into running parts.
+use pop_protocol::clock::{Clock, Source as ClockSource};
 use anyhow::Context;
 use pop_crypto::{ProofSystem, Scheme, SchemeConfig};
 use pop_holder::{Holder, WalletStore};
@@ -223,7 +224,7 @@ pub fn platforms(o: &PlatformOpts) -> PlatformRegistry {
 }
 
 pub fn build_holder(issuer_url: &str, directory_url: &str, platforms: PlatformRegistry, wallet: Arc<dyn WalletStore>) -> Holder {
-    Holder::new(Arc::new(HttpClient::new(issuer_url)), Arc::new(HttpClient::new(directory_url)), platforms, wallet)
+    build_holder_via(issuer_url, directory_url, &Relays::default(), platforms, wallet).expect("direct clients cannot fail")
 }
 
 /// Oblivious HTTP relays the holder sends its requests through (docs/relay.md). With the relay of
@@ -235,16 +236,21 @@ pub struct Relays {
     pub directory: Option<String>,
 }
 
-fn client(url: &str, relay: Option<&str>) -> anyhow::Result<HttpClient> {
+fn client(url: &str, relay: Option<&str>, clock: &Arc<Clock>, src: ClockSource) -> anyhow::Result<HttpClient> {
     Ok(match relay {
         Some(r) => HttpClient::with_transport(url, Arc::new(pop_ohttp::Oblivious::new(r)?)),
         None => HttpClient::new(url),
-    })
+    }
+    .with_clock(clock.clone(), src))
 }
 
-/// A holder whose requests go through the given relays.
+/// A holder whose requests go through the given relays. Its like windows follow the middle of the
+/// issuer's, the directory's and the relay's times (pop_protocol::clock).
 pub fn build_holder_via(issuer_url: &str, directory_url: &str, relays: &Relays, platforms: PlatformRegistry, wallet: Arc<dyn WalletStore>) -> anyhow::Result<Holder> {
-    Ok(Holder::new(Arc::new(client(issuer_url, relays.issuer.as_deref())?), Arc::new(client(directory_url, relays.directory.as_deref())?), platforms, wallet))
+    let clock = Arc::new(Clock::new());
+    let issuer = client(issuer_url, relays.issuer.as_deref(), &clock, ClockSource::Issuer)?;
+    let directory = client(directory_url, relays.directory.as_deref(), &clock, ClockSource::Directory)?;
+    Ok(Holder::new(Arc::new(issuer), Arc::new(directory), platforms, wallet).with_clock(clock))
 }
 
 /// A server's routes with an Oblivious HTTP gateway in front (`POST /ohttp`, `GET /ohttp/keys`),

@@ -125,3 +125,18 @@ async fn messages_are_padded_so_their_size_says_little() {
     assert_eq!(s[0], s[2], "requests of different lengths look the same: {s:?}");
     assert_eq!(s[1], s[3], "answers of different lengths look the same: {s:?}");
 }
+
+#[tokio::test]
+async fn the_clock_learns_the_server_and_the_relay_time_through_the_relay() {
+    use pop_protocol::clock::{Clock, Source};
+    let seen: Seen = Default::default();
+    let svc = serve(gateway::wrap(service(seen), gateway::Gateway::generate().unwrap())).await;
+    let rel = serve(relay::router(BTreeMap::from([("svc".to_string(), svc.clone())])).unwrap()).await;
+    let clock = Arc::new(Clock::new());
+    let c = HttpClient::with_transport(&svc, Arc::new(Oblivious::new(&format!("{rel}/svc")).unwrap())).with_clock(clock.clone(), Source::Issuer);
+    let _: Value = c.post("/v1/echo", &json!(1)).await.unwrap();
+    // both answered (the issuer's time inside the encryption, the relay's outside), and both are this
+    // machine's clock, so the middle is within a second of it
+    assert_eq!(clock.sources(), vec![Source::Issuer, Source::Relay]);
+    assert!(clock.offset_ms().abs() < 1_500, "{}", clock.offset_ms());
+}
