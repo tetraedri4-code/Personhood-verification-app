@@ -1,0 +1,21 @@
+[package]
+name = "pop-mailbox"
+description = "Mailbox server for likes from a paired computer without the app: holds encrypted likes until the holder app collects them"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pop-protocol.workspace = true
+pop-storage.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+hex.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+reqwest.workspace = true

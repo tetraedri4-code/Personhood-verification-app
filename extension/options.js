@@ -48,3 +48,48 @@ $("test").onclick = () =>
       if (a) $("out").append(a);
     }
   });
+
+// ---- pairing this computer (background.js, pairing.js)
+const send = (msg) => new Promise((ok) => chrome.runtime.sendMessage(msg, (r) => ok(chrome.runtime.lastError ? { error: chrome.runtime.lastError.message } : r)));
+const pairOut = (t) => ($("pairOut").textContent = t);
+
+function showPairing(r) {
+  const box = $("words");
+  box.replaceChildren();
+  $("unpair").disabled = !r.paired;
+  $("pair").disabled = !!r.paired;
+  if (!r.paired) return;
+  r.words.split(" ").forEach((w, i) => {
+    const el = document.createElement("span");
+    const n = document.createElement("small");
+    n.textContent = String(i + 1);
+    el.append(n, w);
+    box.append(el);
+  });
+  const end = new Date(r.end_ms);
+  pairOut(
+    `Paired until ${end.toLocaleString()}.\n\n` +
+      "Type these nine words into the app on your phone, or let its camera read them, or write them down and type them in later. " +
+      "Only the first four letters of each word matter. Until the end, whoever has the words can leave likes for you to approve, " +
+      "so take the paper with you."
+  );
+}
+
+send({ type: "pair-status" }).then((r) => (r && !r.error ? showPairing(r) : null));
+
+$("pair").onclick = async () => {
+  $("pair").disabled = true;
+  pairOut("Making the words (a second or so)...");
+  const r = await send({ type: "pair-start", minutes: Number($("pairFor").value) });
+  if (!r || r.error) {
+    $("pair").disabled = false;
+    return pairOut("Not paired: " + ((r && r.error) || "no answer"));
+  }
+  showPairing({ paired: true, ...r });
+};
+
+$("unpair").onclick = async () => {
+  const r = await send({ type: "pair-end" });
+  showPairing({ paired: false });
+  pairOut(r && r.closed ? "Unpaired. The words are forgotten here and the mailbox takes no more likes." : "Unpaired here. " + ((r && r.error) || ""));
+};

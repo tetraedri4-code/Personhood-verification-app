@@ -333,6 +333,33 @@ batches never mix days, revocation roots or cutoffs; a like waits at most 50 ms 
 to the checker is bounded (4,096), so a flood makes senders wait instead of filling memory; witness keys
 from before this change are refused with a message (they were PS keys).
 
+### Review of pairing a computer without the app, 20 November 2026
+
+A computer without the app is paired for a chosen period by nine words; its likes wait, encrypted, in a
+mailbox until the app collects them and the person approves them ([pairing.md](pairing.md)). Two passes;
+the second found only a point for the docs (likes left by whoever has the words are sent without asking
+on a pairing with `auto`; pairing.md now says to use it only on one's own devices).
+
+| # | Problem | Effect | Fix | Test |
+|---|---|---|---|---|
+| 50 | Anyone could open up to 100,000 mailboxes with 256 items each (about 30 GB) | Memory or disk exhaustion of the mailbox server | A cap on items over all mailboxes (200,000, about 250 MB); further deposits get 503 until collections free room | `close_limits_and_sweep` |
+| 51 | The first version answered pairing messages (`pair-status` returns the words) from any of the extension's scripts, content scripts included | A content script runs inside a web page: a page that compromised its renderer could read the words and leave likes for the person to approve | Pairing messages are answered only for the extension's own pages (sender URL in the extension's origin). Found while writing; never pushed | extension e2e (pairing from the options page) |
+| 52 | The content script reported a like on any click event on a like button, including `click()` called by the page's own script | A site could make the extension report likes the person never clicked (to the holder app, or now to the mailbox). Present since the first extension | Only trusted events (`event.isTrusted`) count | extension e2e (Playwright clicks are trusted) |
+| 53 | A deposit in the same millisecond as a close was accepted (the check was `now > end`) | A computer could leave one more like right after being unpaired | A closed mailbox refuses every deposit | `a_paired_computer_leaves_likes_for_approval` |
+
+Checked and found sound: the words give 90 bits, stretched by 600,000 PBKDF2 iterations, so the server,
+which sees the mailbox id and the ciphertexts, cannot guess them; the id, encryption and tag keys are
+separate HKDF outputs; AES-GCM nonces are random, and with at most 256 items per key a repeat is
+negligible; every item is padded to 512 bytes, so lengths say nothing of the post; the additional data
+binds an item to its mailbox; the end is vouched for by an HMAC the server cannot make, and the app
+only lets it move earlier; anything the server reports as arriving after the end is dropped; a
+deletion needs the code inside the item; the mailbox id travels only in POST bodies and is stored hashed;
+collected likes are saved before they are deleted from the mailbox, and the last item number keeps them
+from being collected twice; post ids with control characters are refused, so they cannot carry
+terminal escapes into `pop holder pairings`; the extension keeps the words and the posts liked while
+paired in session storage, which content scripts cannot read and which is dropped when the browser closes;
+the Rust and JavaScript formats agree on fixed vectors also computed with Python.
+
 ### Checked and found sound
 
 - **Proof verification.** Points are subgroup-checked on decoding; identity elements are rejected where

@@ -50,6 +50,8 @@ pub enum HolderError {
     Platform(#[from] PlatformError),
     #[error("wallet storage: {0}")]
     Wallet(#[from] std::io::Error),
+    #[error("pairing: {0}")]
+    Pairing(String),
     #[error("internal: {0}")]
     Internal(String),
 }
@@ -121,7 +123,11 @@ pub struct Holder {
     /// the revocation list and its tree, so that only new revocations are downloaded
     pub(crate) revs: tokio::sync::Mutex<Option<RevCache>>,
     /// the time the like windows follow: the middle of the servers' times (pop_protocol::clock)
-    clock: Arc<pop_protocol::clock::Clock>,
+    pub(crate) clock: Arc<pop_protocol::clock::Clock>,
+    /// where paired computers leave likes (crate::paired); none: pairing is off
+    pub(crate) mailbox: Option<Arc<dyn pop_protocol::mailbox::MailboxApi>>,
+    /// one collection from the mailboxes at a time
+    pub(crate) collecting: tokio::sync::Mutex<()>,
 }
 
 pub(crate) struct RevCache {
@@ -144,7 +150,13 @@ fn nonce() -> String {
 
 impl Holder {
     pub fn new(issuer: Arc<dyn IssuerApi>, directory: Arc<dyn DirectoryApi>, platforms: PlatformRegistry, wallet: Arc<dyn WalletStore>) -> Self {
-        Holder { issuer, directory, platforms, wallet, scheme: tokio::sync::OnceCell::new(), busy: tokio::sync::Mutex::new(()), params: std::sync::Mutex::new(None), revs: tokio::sync::Mutex::new(None), clock: Arc::new(pop_protocol::clock::Clock::new()) }
+        Holder { issuer, directory, platforms, wallet, scheme: tokio::sync::OnceCell::new(), busy: tokio::sync::Mutex::new(()), params: std::sync::Mutex::new(None), revs: tokio::sync::Mutex::new(None), clock: Arc::new(pop_protocol::clock::Clock::new()), mailbox: None, collecting: tokio::sync::Mutex::new(()) }
+    }
+
+    /// Let computers without the app be paired, leaving likes in `mailbox` ([`crate::paired`]).
+    pub fn with_mailbox(mut self, mailbox: Arc<dyn pop_protocol::mailbox::MailboxApi>) -> Self {
+        self.mailbox = Some(mailbox);
+        self
     }
 
     /// Go by `clock` for the like windows; give the same clock to the issuer and directory clients

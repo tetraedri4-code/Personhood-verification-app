@@ -18,9 +18,11 @@
 pub mod help;
 pub mod holder;
 pub mod local_api;
+pub mod paired;
 pub mod recovery;
 pub mod wallet;
 
 pub use holder::{BindOutcome, Holder, HolderError, Status, RESET_EID_HELP, RESET_EID_PATH};
+pub use paired::{Approved, PairingInfo};
 pub use recovery::ReplaceOutcome;
 pub use wallet::{FileWallet, MemoryWallet, WalletStore};

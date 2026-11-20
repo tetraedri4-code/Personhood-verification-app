@@ -852,6 +852,9 @@ name = "deranged"
 version = "0.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e9de72ce2ad1f90dc62fa25f0f430ef85eb4b0d8fa0be4f30373bc40a21d28e"
+dependencies = [
+ "serde_core",
+]
 
 [[package]]
 name = "derivative"
@@ -1933,6 +1936,7 @@ dependencies = [
  "pop-holder",
  "pop-idp",
  "pop-issuer",
+ "pop-mailbox",
  "pop-mock-idp",
  "pop-mockfeed",
  "pop-ohttp",
@@ -1945,6 +1949,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "time",
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.23",
@@ -2056,6 +2061,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "pop-mailbox"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "hex",
+ "pop-protocol",
+ "pop-storage",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tower-http 0.5.2",
+ "tracing",
+]
+
+[[package]]
 name = "pop-mock-idp"
 version = "0.1.0"
 dependencies = [
@@ -2142,6 +2164,7 @@ dependencies = [
  "httpdate",
  "pop-crypto",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "sha2 0.10.9",

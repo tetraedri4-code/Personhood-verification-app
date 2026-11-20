@@ -525,3 +525,85 @@ async fn likes_checked_in_one_batch_get_each_their_own_answer() {
     let t: CountTable = dir(d).get("/v1/likes/table?platform=mockfeed").await.unwrap();
     assert!(t.counts["p5"] >= 2 && !t.counts.contains_key("p6"));
 }
+
+/// A computer without the app (here: plain requests, as the extension makes them) is paired by its
+/// words; its likes wait for approval, or go out at once with `auto`.
+#[tokio::test]
+async fn a_paired_computer_leaves_likes_for_approval() {
+    use pop_protocol::mailbox::*;
+    let d = net().await;
+    let alice = Arc::new(enrolled(d, "alice", "T-PAIR-ALICE").await);
+    let computer = dir(d);
+    let now = pop_mailbox::now_ms();
+    let open = |words: String, end_ms: u64| async move {
+        let k = tokio::task::spawn_blocking(move || PairingKeys::derive(&words).unwrap()).await.unwrap();
+        MailboxApi::open(&dir(d), &OpenRequest { mailbox: k.mailbox.clone(), end_ms, tag: k.end_tag(end_ms) }).await.unwrap();
+        k
+    };
+    let leave = |k: &PairingKeys, post: &str| {
+        let (item, dh) = k.seal(&PairedLike::new("mockfeed", post, now)).unwrap();
+        DepositRequest { mailbox: k.mailbox.clone(), item, dh }
+    };
+
+    let words = generate();
+    let k = open(words.clone(), now + 3_600_000).await;
+    computer.deposit(&leave(&k, "p701")).await.unwrap();
+    computer.deposit(&leave(&k, "p702")).await.unwrap();
+    // an item not made with the words is ignored and left alone
+    let stranger = PairingKeys::derive_canonical("zoo zone zinc zero zebra youth young yogurt yoga", 10);
+    computer.deposit(&DepositRequest { mailbox: k.mailbox.clone(), ..leave(&stranger, "p709") }).await.unwrap();
+
+    // typed in capitals, with a typo after the first four letters of one word
+    let typed = words.to_uppercase().replacen(' ', "XX ", 1);
+    let p = alice.pair(&typed, Some("library"), false).await.unwrap();
+    assert!(!p.ended && !p.auto);
+    assert!(matches!(alice.pair(&words, None, false).await, Err(HolderError::Pairing(_))));
+    let inbox = alice.inbox().unwrap();
+    assert_eq!(inbox.iter().map(|i| i.post.as_str()).collect::<Vec<_>>(), ["p701", "p702"]);
+    // collected likes are deleted from the mailbox; the stranger's item stays
+    assert_eq!(MailboxApi::list(&computer, &ListRequest { mailbox: k.mailbox.clone(), after: 0 }).await.unwrap().items.len(), 1);
+
+    let r = alice.approve(&[inbox[0].id]).await.unwrap();
+    assert!(r[0].queued, "{r:?}");
+    assert_eq!(alice.reject(&[inbox[1].id]).await.unwrap(), 1);
+    assert!(alice.inbox().unwrap().is_empty());
+    while alice.queued_likes() > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    let t: CountTable = dir(d).get("/v1/likes/table?platform=mockfeed").await.unwrap();
+    assert!(t.counts.get("p701").copied().unwrap_or(0) >= 1 && !t.counts.contains_key("p702"));
+
+    // unpaired: the computer can leave no more
+    alice.unpair("library").await.unwrap();
+    assert!(alice.pairings().unwrap().is_empty());
+    assert_eq!(status(&computer.deposit(&leave(&k, "p703")).await.unwrap_err()), 410);
+
+    // words nobody paired with
+    let e = alice.pair(&generate(), None, false).await.unwrap_err();
+    assert!(e.to_string().contains("no pairing has these words"), "{e}");
+
+    // automatic: queued without asking
+    let words = generate();
+    let k = open(words.clone(), now + 3_600_000).await;
+    alice.pair(&words, Some("own laptop"), true).await.unwrap();
+    computer.deposit(&leave(&k, "p704")).await.unwrap();
+    assert_eq!(alice.collect_pairings().await.unwrap(), 1);
+    assert!(alice.inbox().unwrap().is_empty());
+    while alice.queued_likes() > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    let t: CountTable = dir(d).get("/v1/likes/table?platform=mockfeed").await.unwrap();
+    assert!(t.counts.get("p704").copied().unwrap_or(0) >= 1);
+
+    // a pairing given after its end (words from paper): what was left before the end is collected
+    // once, and the pairing is not kept
+    let words = generate();
+    let k = open(words.clone(), now + 3_600_000).await;
+    computer.deposit(&leave(&k, "p705")).await.unwrap();
+    computer.close(&CloseRequest { mailbox: k.mailbox.clone() }).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    // (the end margin keeps it a few minutes; here the close is seconds old)
+    let p = alice.pair(&words, Some("paper"), false).await.unwrap();
+    assert!(p.ended);
+    assert!(alice.inbox().unwrap().iter().any(|i| i.post == "p705" && i.from == "paper"));
+}

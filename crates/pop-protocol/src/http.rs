@@ -187,3 +187,26 @@ impl DirectoryApi for HttpClient {
         self.post("/v1/likes/counts", req).await
     }
 }
+
+#[async_trait]
+impl crate::mailbox::MailboxApi for HttpClient {
+    async fn open(&self, req: &crate::mailbox::OpenRequest) -> Result<(), ApiError> {
+        let _: serde_json::Value = self.post("/v1/mailbox/open", req).await?;
+        Ok(())
+    }
+    async fn deposit(&self, req: &crate::mailbox::DepositRequest) -> Result<u64, ApiError> {
+        let v: serde_json::Value = self.post("/v1/mailbox/deposit", req).await?;
+        v["seq"].as_u64().ok_or_else(|| ApiError::Decode("no seq".into()))
+    }
+    async fn list(&self, req: &crate::mailbox::ListRequest) -> Result<crate::mailbox::MailboxState, ApiError> {
+        self.post("/v1/mailbox/list", req).await
+    }
+    async fn delete(&self, req: &crate::mailbox::DeleteRequest) -> Result<u64, ApiError> {
+        let v: serde_json::Value = self.post("/v1/mailbox/delete", req).await?;
+        Ok(v["deleted"].as_u64().unwrap_or(0))
+    }
+    async fn close(&self, req: &crate::mailbox::CloseRequest) -> Result<(), ApiError> {
+        let _: serde_json::Value = self.post("/v1/mailbox/close", req).await?;
+        Ok(())
+    }
+}

@@ -117,8 +117,9 @@
       const btn = post.likeButton;
       if (!btn || hooked.has(btn)) return;
       hooked.add(btn);
-      btn.addEventListener("click", () => {
-        if (!state.settings.reportLikes) return;
+      btn.addEventListener("click", (ev) => {
+        // only the person's own click: a script of the page can call click() too
+        if (!ev.isTrusted || !state.settings.reportLikes) return;
         // let the site handle the click first, then see whether the post is now liked
         setTimeout(async () => {
           if (!adapter.isLiked(btn)) return;

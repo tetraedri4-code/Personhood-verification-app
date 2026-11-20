@@ -250,7 +250,14 @@ pub fn build_holder_via(issuer_url: &str, directory_url: &str, relays: &Relays, 
     let clock = Arc::new(Clock::new());
     let issuer = client(issuer_url, relays.issuer.as_deref(), &clock, ClockSource::Issuer)?;
     let directory = client(directory_url, relays.directory.as_deref(), &clock, ClockSource::Directory)?;
-    Ok(Holder::new(Arc::new(issuer), Arc::new(directory), platforms, wallet).with_clock(clock))
+    // paired computers leave likes in the mailbox beside the directory, reached the same way
+    Ok(Holder::new(Arc::new(issuer), Arc::new(directory.clone()), platforms, wallet).with_clock(clock).with_mailbox(Arc::new(directory)))
+}
+
+/// The mailbox for paired computers (`pop-mailbox`), stored in `data_dir`/mailbox-db or in memory.
+pub fn mailbox(data_dir: Option<&std::path::Path>) -> anyhow::Result<axum::Router> {
+    let m = pop_mailbox::Mailboxes::new(store(data_dir, "mailbox-db")?, pop_mailbox::MailboxConfig::default());
+    Ok(pop_mailbox::router(Arc::new(m)))
 }
 
 /// A server's routes with an Oblivious HTTP gateway in front (`POST /ohttp`, `GET /ohttp/keys`),

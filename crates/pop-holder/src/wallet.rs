@@ -28,6 +28,40 @@ pub struct WalletState {
     /// a replacement of the secret that waits for its veto period to pass
     #[serde(default)]
     pub claim: Option<PendingClaim>,
+    /// computers paired to leave likes in a mailbox (crate::paired)
+    #[serde(default)]
+    pub pairings: Vec<Pairing>,
+    /// likes collected from paired computers, waiting for the person's approval
+    #[serde(default)]
+    pub inbox: Vec<InboxLike>,
+    #[serde(default)]
+    pub next_inbox_id: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Pairing {
+    pub name: String,
+    pub keys: pop_protocol::mailbox::PairingKeys,
+    /// the end in force (Unix ms): the vouched end, or an earlier close
+    pub end_ms: u64,
+    /// queue collected likes at once instead of asking first
+    pub auto: bool,
+    /// the last item number collected
+    pub after: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct InboxLike {
+    pub id: u64,
+    /// the pairing it came from
+    pub from: String,
+    pub platform: String,
+    pub post: String,
+    /// when it was clicked, by the paired computer's clock
+    pub clicked_ms: u64,
+    /// why it was not queued at once, when automatic sending failed
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

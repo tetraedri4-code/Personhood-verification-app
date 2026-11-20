@@ -115,6 +115,7 @@ crates/
   pop-mock-idp            local mock identity provider (OpenID Connect)
   pop-mockfeed            local mock social network
   pop-ohttp               Oblivious HTTP: gateway in front of a server, relay, client transport
+  pop-mailbox             mailbox for likes from a paired computer without the app (uses: Store)
   pop-cli                 the `pop` command; the only crate that knows all the others
 extension/                browser extension (Manifest V3), one adapter file per platform
 docs/                     how to replace each mock with the real thing
@@ -134,5 +135,6 @@ No part depends on another part's implementation, only on the interfaces in `pop
 | Add a platform | [docs/adding-a-platform.md](docs/adding-a-platform.md) |
 | Change the proof system or understand the cryptography | [docs/crypto.md](docs/crypto.md) |
 | Hide holders' addresses from the servers with a relay | [docs/relay.md](docs/relay.md) |
+| Like from a computer without the app (library computer): pairing words, mailbox, approval | [docs/pairing.md](docs/pairing.md) |
 | Know how much data the app uses | [docs/data-usage.md](docs/data-usage.md) |
 | Know what was checked and what is still unsafe | [docs/security.md](docs/security.md) |

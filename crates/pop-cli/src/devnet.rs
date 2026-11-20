@@ -225,7 +225,9 @@ pub async fn start(o: DevnetOpts) -> anyhow::Result<Devnet> {
         DirectoryConfig { bucket_posts: o.bucket_posts.unwrap_or(DirectoryConfig::default().bucket_posts), ..Default::default() },
     )
     .await?;
-    serve(l_dir, wiring::with_gateway(pop_directory::router(dir), &pad_sizes)?);
+    // the mailbox for paired computers runs beside the directory, behind the same gateway
+    let mailbox = wiring::mailbox(o.data_dir.as_deref())?;
+    serve(l_dir, wiring::with_gateway(pop_directory::router(dir).merge(mailbox), &pad_sizes)?);
     // in a real deployment someone other than the operator of the servers runs the relay
     serve(l_relay, pop_ohttp::relay::router([("issuer".to_string(), issuer_url.clone()), ("directory".to_string(), directory_url.clone())].into())?);
 

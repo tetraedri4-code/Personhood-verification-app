@@ -11,7 +11,12 @@
   .check { display: flex; gap: .6rem; align-items: flex-start; font-weight: 400; }
   p.note { color: GrayText; margin: .25rem 0 0; font-size: .9em; }
   button { margin-top: 1.2rem; padding: .5rem 1.2rem; font: inherit; }
-  #out { margin-top: 1rem; white-space: pre-wrap; }
+  #out, #pairOut { margin-top: 1rem; white-space: pre-wrap; }
+  h2 { margin-top: 2.5rem; font-size: 1.15rem; }
+  select { padding: .4rem; font: inherit; }
+  #words { display: grid; grid-template-columns: repeat(3, 1fr); gap: .5rem; margin-top: 1rem; }
+  #words span { font: 600 1.3rem/1.4 ui-monospace, monospace; padding: .4rem .5rem; border: 1px solid GrayText; border-radius: 6px; text-align: center; }
+  #words span small { display: block; font: .75rem system-ui, sans-serif; color: GrayText; }
 </style>
 <h1>Personhood badges</h1>
 <label for="directoryUrl">Directory address</label>
@@ -30,5 +35,21 @@
   <span class="note">Off by default. A report shows that some enrolled person liked the post. It carries no account and no pseudonym, and reports for different posts cannot be linked to each other. A like can reveal opinions, so this needs your explicit choice.</span></span></label>
 <button id="save">Save</button> <button id="test">Test holder app</button>
 <div id="out" role="status"></div>
+
+<h2>Pair this computer</h2>
+<p class="note">For a computer without your app, such as a library computer. Likes you make here go, encrypted, to a mailbox; your app collects them and asks you before sending them. Nothing that can prove you are you is kept here. The pairing ends at the time you choose, or when you unpair. Closing the browser forgets the words here.</p>
+<label for="pairFor">Pair for</label>
+<select id="pairFor">
+  <option value="30">30 minutes</option>
+  <option value="60">1 hour</option>
+  <option value="180" selected>3 hours</option>
+  <option value="480">8 hours</option>
+  <option value="1440">1 day</option>
+  <option value="10080">7 days</option>
+  <option value="43200">30 days</option>
+</select>
+<button id="pair">Pair</button> <button id="unpair">Unpair now</button>
+<div id="words" aria-live="polite"></div>
+<div id="pairOut" role="status"></div>
 <script src="options.js"></script>
 </html>

@@ -92,6 +92,64 @@ try {
   });
   assert.ok(r === "blocked" || r === 401, `page-origin call to the holder app must fail, got ${r}`);
   if (shots) await page.screenshot({ path: path.join(shots, "feed-after-like.png") });
+
+  // ---- Pairing: this browser is now a computer without the app. Reporting is still off, the holder
+  // token is removed, and the pairing words go to the app by hand.
+  await sw.evaluate(() => chrome.storage.local.set({ token: "" }));
+  const opts = await ctx.newPage();
+  await opts.goto(`chrome-extension://${new URL(sw.url()).host}/options.html`);
+  await opts.selectOption("#pairFor", "60");
+  await opts.click("#pair");
+  opts.on("console", (m) => console.log("options:", m.text()));
+  await opts.locator("#words span").nth(8).waitFor({ timeout: 30_000 }).catch(async (e) => {
+    console.log("pairOut:", await opts.locator("#pairOut").textContent());
+    throw e;
+  });
+  const words = (await opts.locator("#words span").evaluateAll((els) => els.map((e) => e.lastChild.textContent))).join(" ");
+  assert.equal(words.split(" ").length, 9);
+  if (shots) await opts.screenshot({ path: path.join(shots, "pairing.png") });
+  const api = async (p, body) => {
+    const r = await fetch(`http://127.0.0.1:4010${p}`, { method: body ? "POST" : "GET", headers: { "content-type": "application/json", "x-pop-token": token }, body: body ? JSON.stringify(body) : undefined });
+    const text = await r.text();
+    assert.ok(r.ok, `${p}: ${r.status} ${text}`);
+    return JSON.parse(text);
+  };
+  const paired = await api("/v1/pairings", { words, name: "library" });
+  assert.equal(paired.name, "library");
+
+  // a like here goes to the mailbox, then waits in the app for approval
+  await page.reload();
+  await count("p4").waitFor();
+  await page.locator('[data-pop-like="p4"]').click();
+  let inbox = [];
+  for (let i = 0; i < 40 && !inbox.length; i++) {
+    await page.waitForTimeout(500);
+    await api("/v1/pairings/collect", {});
+    inbox = (await api("/v1/pairings")).inbox.filter((x) => x.post === "p4");
+  }
+  assert.equal(inbox.length, 1, "the like reached the app's inbox");
+  assert.equal(inbox[0].from, "library");
+  await page.reload();
+  await count("p4").waitFor();
+  assert.equal(await count("p4").textContent(), "0 verified", "not counted before approval");
+  const ok = await api("/v1/inbox/approve", { ids: [inbox[0].id] });
+  assert.ok(ok.results[0].queued, JSON.stringify(ok));
+  // counted once sent; the extension's copy of the counts is at most a minute old
+  let shown = "";
+  for (let i = 0; i < 40 && shown !== "1 verified"; i++) {
+    await page.waitForTimeout(3000);
+    await page.reload();
+    await count("p4").waitFor();
+    shown = await count("p4").textContent();
+  }
+  assert.equal(shown, "1 verified", "counted after approval");
+
+  // unpaired from this computer: the words are gone and the mailbox takes no more
+  await opts.click("#unpair");
+  await opts.locator("#pairOut").filter({ hasText: "Unpaired." }).waitFor();
+  assert.equal(await opts.locator("#words span").count(), 0);
+  assert.deepEqual(await sw.evaluate(() => chrome.storage.session.get(null)), {});
+  await api("/v1/pairings/unpair", { name: "library" });
   console.log("extension e2e: all checks passed");
 } finally {
   await ctx.close();

@@ -113,4 +113,17 @@ person scrolls. A larger `bucket_posts` hides more and costs proportionally more
 
 Removed claims are remembered for 30 days; a reader away longer downloads the whole list again.
 
-The extension itself is 28 kB.
+The extension itself is 58 kB (25 kB zipped); the pairing word list is 7 kB of it.
+
+## A paired computer ([pairing.md](pairing.md))
+
+| Operation | Bytes sent | Bytes received |
+|---|---|---|
+| Pair (the computer opens the mailbox) | 0.2 kB | under 0.1 kB |
+| One like left in the mailbox | 1.2 kB | under 0.1 kB |
+| The app's collection round, nothing new | 0.1 kB | 0.2 kB |
+| The app's collection round, per like collected | | 1.1 kB, then 0.1 kB to delete it |
+
+A collection round runs every 3 to 4 minutes while a pairing lasts: about 0.1 MB a day when nothing
+arrives. Through a relay, add the Oblivious HTTP framing and padding ([relay.md](relay.md)). The
+approved like then costs what any like costs.

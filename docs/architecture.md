@@ -31,10 +31,11 @@
 |---|---|---|---|
 | `IssuerApi`, `DirectoryApi` | `pop-protocol::api` | `HttpClient` | holder, directory |
 | `Transport` (how `HttpClient` reaches a server) | `pop-protocol::http` | `Direct`, `Oblivious` (in `pop-ohttp`, through a relay) | holder |
+| `MailboxApi` (likes from a paired computer) | `pop-protocol::mailbox` | `HttpClient`; served by `pop-mailbox` | holder |
 | `Platform` | `pop-protocol::platform` | `MockFeed`, `Bluesky` | holder, directory |
 | `IdentityProvider` | `pop-idp` | `OidcProvider`, `StaticProvider` | issuer |
 | `UniquenessService` | `pop-protocol::uniqueness` | `HmacUniqueness` (in `pop-issuer`), `ThresholdUniqueness` (in `pop-uniqueness`) | issuer |
-| `Store` | `pop-storage` | `MemoryStore`, `JsonFileStore` | issuer, directory |
+| `Store` | `pop-storage` | `MemoryStore`, `JsonFileStore` | issuer, directory, mailbox |
 | `WalletStore` | `pop-holder::wallet` | `FileWallet`, `MemoryWallet` | holder |
 | proof system | `pop-crypto::ProofSystem` | LegoGroth16, Bulletproofs | everything, through `Scheme` |
 | extension adapter | `extension/src/core.js` | `mockfeed.js`, `bluesky.js` | extension core |
@@ -58,10 +59,12 @@ These hold today (check with `cargo tree`), and a change that breaks one is a de
 9. `pop-ohttp` (relay, gateway, client) depends only on `pop-protocol`. No server and not the holder
    depend on it: `pop-cli` puts the gateway in front of a server's routes and gives the holder an
    `Oblivious` transport ([relay.md](relay.md)).
+10. `pop-mailbox` depends only on `pop-protocol` and `pop-storage`. The directory does not depend on it:
+   `pop-cli` serves both from one process, and either can run alone ([pairing.md](pairing.md)).
 
 The extension follows the same split: `core.js` knows no site's markup, each file in `adapters/` knows
 one site and nothing about the directory or the holder app, and `background.js` is the only file that
-touches the network (with `ohttp.js` for requests through a relay).
+touches the network (with `ohttp.js` for requests through a relay, and `pairing.js` for the pairing format).
 
 ## Flows
 

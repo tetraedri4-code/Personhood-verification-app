@@ -37,6 +37,7 @@ pub fn router(holder: Arc<Holder>, token: String) -> Router {
             tracing::warn!("queued likes not resumed: {e}");
         }
     });
+    holder.spawn_pairing_collector();
     let st = St { holder, token: Arc::new(token) };
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(|o: &HeaderValue, _| {
@@ -49,6 +50,12 @@ pub fn router(holder: Arc<Holder>, token: String) -> Router {
         .route("/v1/status", get(status))
         .route("/v1/like", post(like))
         .route("/v1/liked", post(liked))
+        .route("/v1/pairings", get(pairings).post(pair))
+        .route("/v1/pairings/collect", post(collect))
+        .route("/v1/pairings/auto", post(set_auto))
+        .route("/v1/pairings/unpair", post(unpair))
+        .route("/v1/inbox/approve", post(approve))
+        .route("/v1/inbox/reject", post(reject))
         .layer(middleware::from_fn_with_state(st.clone(), auth))
         .layer(cors)
         .with_state(st)
@@ -75,7 +82,7 @@ async fn auth(State(s): State<St>, req: Request, next: Next) -> Response {
 fn fail(e: HolderError) -> Response {
     let code = match e {
         HolderError::NotEnrolled => StatusCode::CONFLICT,
-        HolderError::UnknownPlatform(_) | HolderError::Platform(_) => StatusCode::BAD_REQUEST,
+        HolderError::UnknownPlatform(_) | HolderError::Platform(_) | HolderError::Pairing(_) => StatusCode::BAD_REQUEST,
         _ => StatusCode::BAD_GATEWAY,
     };
     (code, Json(json!({"error": e.to_string()}))).into_response()
@@ -116,4 +123,81 @@ struct LikedReq {
 async fn liked(State(s): State<St>, Json(r): Json<LikedReq>) -> Response {
     let v: Vec<&String> = r.posts.iter().filter(|p| s.holder.has_liked(&r.platform, p)).collect();
     Json(json!({"liked": v})).into_response()
+}
+
+// ---- paired computers (crate::paired)
+
+async fn pairings(State(s): State<St>) -> Response {
+    match (s.holder.pairings(), s.holder.inbox()) {
+        (Ok(p), Ok(i)) => Json(json!({"pairings": p, "inbox": i})).into_response(),
+        (Err(e), _) | (_, Err(e)) => fail(e),
+    }
+}
+
+/// Collect now instead of at the next round (every few minutes).
+async fn collect(State(s): State<St>) -> Response {
+    match s.holder.collect_pairings().await {
+        Ok(n) => Json(json!({"collected": n})).into_response(),
+        Err(e) => fail(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct PairReq {
+    words: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    auto: bool,
+}
+
+async fn pair(State(s): State<St>, Json(r): Json<PairReq>) -> Response {
+    match s.holder.pair(&r.words, r.name.as_deref(), r.auto).await {
+        Ok(p) => Json(p).into_response(),
+        Err(e) => fail(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct AutoReq {
+    name: String,
+    auto: bool,
+}
+
+async fn set_auto(State(s): State<St>, Json(r): Json<AutoReq>) -> Response {
+    match s.holder.set_auto(&r.name, r.auto).await {
+        Ok(()) => Json(json!({})).into_response(),
+        Err(e) => fail(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct NameReq {
+    name: String,
+}
+
+async fn unpair(State(s): State<St>, Json(r): Json<NameReq>) -> Response {
+    match s.holder.unpair(&r.name).await {
+        Ok(()) => Json(json!({})).into_response(),
+        Err(e) => fail(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct IdsReq {
+    ids: Vec<u64>,
+}
+
+async fn approve(State(s): State<St>, Json(r): Json<IdsReq>) -> Response {
+    match s.holder.approve(&r.ids).await {
+        Ok(v) => Json(json!({"results": v})).into_response(),
+        Err(e) => fail(e),
+    }
+}
+
+async fn reject(State(s): State<St>, Json(r): Json<IdsReq>) -> Response {
+    match s.holder.reject(&r.ids).await {
+        Ok(n) => Json(json!({"rejected": n})).into_response(),
+        Err(e) => fail(e),
+    }
 }

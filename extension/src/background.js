@@ -4,10 +4,12 @@
 //    directory has few posts with likes, the whole table (synced the same way), else the buckets of the
 //    posts on screen (one request per screen, each bucket about 32 posts, kept a minute)
 //  * holder app on 127.0.0.1 (pairing token): report a like, read which posts this person liked
+//  * paired for a while instead of having the holder app (pairing.js, docs/pairing.md): likes go, encrypted,
+//    to the mailbox beside the directory, for the person's app to collect
 //  * with a relay set, every directory request goes through it, encrypted to the directory (ohttp.js):
 //    the directory does not see this computer's address, the relay does not see the request
 // Settings live in chrome.storage.local.
-importScripts("ohttp.js");
+importScripts("ohttp.js", "words.js", "pairing.js");
 const DEFAULTS = { directoryUrl: "http://127.0.0.1:4003", relayUrl: "", holderUrl: "http://127.0.0.1:4010", token: "", reportLikes: false };
 const TTL_MS = 60_000;
 const cache = new Map();
@@ -198,7 +200,61 @@ async function forgetCounts(dir, platform) {
   }
 }
 
-async function handle(msg) {
+// ---- pairing (pairing.js). Kept in chrome.storage.session: gone when the browser closes, and not
+// readable by content scripts. Only this computer's words and keys are here, never a secret of the person.
+const MIN_PAIR_MINUTES = 15;
+const MAX_PAIR_MINUTES = 30 * 1440;
+
+async function pairing() {
+  const p = (await chrome.storage.session.get("pairing")).pairing;
+  if (!p) return null;
+  if (Date.now() > p.end_ms) {
+    await forgetPairing();
+    return null;
+  }
+  return p;
+}
+
+async function forgetPairing() {
+  await chrome.storage.session.remove(["pairing", "pairedLiked"]);
+}
+
+async function pairStart(s, minutes) {
+  if (!Number.isInteger(minutes) || minutes < MIN_PAIR_MINUTES || minutes > MAX_PAIR_MINUTES) throw new Error("a pairing lasts from 15 minutes to 30 days");
+  if (await pairing()) throw new Error("this computer is already paired; unpair it first");
+  const dir = base(s.directoryUrl);
+  const words = PopPairing.generate();
+  const keys = await PopPairing.derive(words);
+  const end_ms = Date.now() + minutes * 60_000;
+  await dirPost(s, `${dir}/v1/mailbox/open`, { mailbox: keys.mailbox, end_ms, tag: await PopPairing.endTag(keys, end_ms) });
+  await chrome.storage.session.set({ pairing: { words, keys, end_ms, dir } });
+  return { words, end_ms };
+}
+
+async function pairEnd(s) {
+  const p = (await chrome.storage.session.get("pairing")).pairing;
+  await forgetPairing();
+  if (!p) return { closed: false };
+  // the words are gone from here either way; closing tells the mailbox to take no more
+  try {
+    await dirPost(s, `${p.dir}/v1/mailbox/close`, { mailbox: p.keys.mailbox });
+    return { closed: true };
+  } catch (e) {
+    return { closed: false, error: `the mailbox was not told (${e.message}); it closes by itself at the end time` };
+  }
+}
+
+async function pairedLike(s, p, platform, post) {
+  const { item, dh } = await PopPairing.seal(p.keys, platform, post, Date.now());
+  await dirPost(s, `${p.dir}/v1/mailbox/deposit`, { mailbox: p.keys.mailbox, item, dh });
+  const liked = (await chrome.storage.session.get("pairedLiked")).pairedLiked || {};
+  const arr = (liked[platform] ||= []);
+  if (!arr.includes(post)) arr.push(post);
+  await chrome.storage.session.set({ pairedLiked: liked });
+  return { queued: true, paired: true };
+}
+
+async function handle(msg, fromOwnPage) {
   const s = await settings();
   if (msg.type === "data") {
     if (!PLATFORM_RE.test(msg.platform)) throw new Error("bad platform");
@@ -206,7 +262,8 @@ async function handle(msg) {
     const st = await synced(s, dir, msg.platform);
     const seen = (await chrome.storage.local.get("seen")).seen || {};
     const entries = Object.values(st.entries).sort((a, b) => (a.account_id < b.account_id ? -1 : a.account_id > b.account_id ? 1 : 0));
-    return { settings: { reportLikes: !!s.reportLikes }, today: st.today, alarm: st.alarm ?? null, entries, seen: seen[msg.platform] || {} };
+    // a paired computer reports likes: that is what it was paired for
+    return { settings: { reportLikes: !!s.reportLikes || !!(await pairing()) }, today: st.today, alarm: st.alarm ?? null, entries, seen: seen[msg.platform] || {} };
   }
   if (msg.type === "counts") {
     if (!PLATFORM_RE.test(msg.platform)) throw new Error("bad platform");
@@ -221,6 +278,11 @@ async function handle(msg) {
     return {};
   }
   if (msg.type === "like") {
+    const p = await pairing();
+    if (p) {
+      if (!PLATFORM_RE.test(msg.platform) || typeof msg.post !== "string" || msg.post.length > 256) throw new Error("bad like");
+      return pairedLike(s, p, msg.platform, msg.post);
+    }
     if (!s.reportLikes) throw new Error("like reporting is off");
     const r = await holder(s, "/v1/like", { platform: msg.platform, post: msg.post });
     const dir = base(s.directoryUrl);
@@ -241,7 +303,18 @@ async function handle(msg) {
     return r;
   }
   if (msg.type === "status") {
-    return { liked: (await chrome.storage.local.get("liked")).liked || {} };
+    const liked = structuredClone((await chrome.storage.local.get("liked")).liked || {});
+    if (await pairing()) for (const [k, v] of Object.entries((await chrome.storage.session.get("pairedLiked")).pairedLiked || {})) liked[k] = [...new Set([...(liked[k] || []), ...v])];
+    return { liked };
+  }
+  // pairing is for the options page only: a content script runs inside web pages, and the words must
+  // not reach one
+  if (msg.type.startsWith("pair-") && !fromOwnPage) throw new Error("not allowed here");
+  if (msg.type === "pair-start") return pairStart(s, msg.minutes);
+  if (msg.type === "pair-end") return pairEnd(s);
+  if (msg.type === "pair-status") {
+    const p = await pairing();
+    return p ? { paired: true, words: p.words, end_ms: p.end_ms } : { paired: false };
   }
   if (msg.type === "holder-status") {
     return holder(s, "/v1/status");
@@ -256,7 +329,9 @@ async function handle(msg) {
 
 chrome.runtime.onMessage.addListener((msg, sender, reply) => {
   // messages are accepted only from this extension's own scripts
-  if (sender.id !== chrome.runtime.id) return false;
-  handle(msg).then(reply, (e) => reply({ error: String(e && e.message ? e.message : e) }));
+  if (sender.id !== chrome.runtime.id || !msg || typeof msg.type !== "string") return false;
+  // the extension's own pages (options), as opposed to content scripts, whose sender URL is the web page's
+  const fromOwnPage = typeof sender.url === "string" && sender.url.startsWith(chrome.runtime.getURL(""));
+  handle(msg, fromOwnPage).then(reply, (e) => reply({ error: String(e && e.message ? e.message : e) }));
   return true;
 });

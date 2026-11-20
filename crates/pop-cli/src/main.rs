@@ -481,6 +481,26 @@ enum HolderCmd {
         mock_login: Option<String>,
     },
     Status,
+    /// Pair a computer without the app from the nine words its extension shows (now, or later from
+    /// paper): its likes are collected and wait for your approval (`pop holder pairings`)
+    Pair {
+        /// leave out to be asked for them: words on the command line end up in the shell history
+        words: Vec<String>,
+        /// a name to tell pairings apart (default "computer N")
+        #[arg(long)]
+        name: Option<String>,
+        /// send this computer's likes without asking first
+        #[arg(long)]
+        auto: bool,
+    },
+    /// Collect from paired computers, then list the pairings and the likes waiting for approval
+    Pairings,
+    /// Send waiting likes: their numbers from `pop holder pairings`, or `all`
+    Approve { ids: Vec<String> },
+    /// Drop waiting likes without sending them: their numbers, or `all`
+    Reject { ids: Vec<String> },
+    /// End a pairing now: the computer can leave no more likes
+    Unpair { name: String },
     /// Serve the local API for the browser extension
     Serve {
         #[arg(long, default_value = "127.0.0.1:4010")]
@@ -698,6 +718,45 @@ async fn login(url: &str, mock_login: Option<String>) -> anyhow::Result<String> 
     })
 }
 
+fn fmt_ms(ms: u64) -> String {
+    time::OffsetDateTime::from_unix_timestamp((ms / 1000) as i64)
+        .ok()
+        .and_then(|t| t.format(time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]")).ok())
+        .unwrap_or_else(|| ms.to_string())
+}
+
+fn print_inbox(h: &Holder) -> anyhow::Result<()> {
+    let inbox = h.inbox()?;
+    if inbox.is_empty() {
+        println!("No likes wait for approval.");
+        return Ok(());
+    }
+    println!("Waiting for approval (`pop holder approve <numbers|all>`, or `pop holder reject ...`):");
+    for i in inbox {
+        println!("  {:>4}  {} {}  clicked {} UTC on {}{}", i.id, i.platform, i.post, fmt_ms(i.clicked_ms), i.from, i.note.map(|n| format!("  ({n})")).unwrap_or_default());
+    }
+    Ok(())
+}
+
+fn inbox_ids(h: &Holder, args: &[String]) -> anyhow::Result<Vec<u64>> {
+    if args.iter().any(|a| a == "all") {
+        return Ok(h.inbox()?.iter().map(|i| i.id).collect());
+    }
+    args.iter().map(|a| a.parse::<u64>().map_err(|_| anyhow::anyhow!("\"{a}\" is not a number or `all`"))).collect()
+}
+
+/// Queued likes go out at a random moment of the next window: stay until they have.
+async fn wait_for_queue(h: &Holder) {
+    if h.queued_likes() == 0 {
+        return;
+    }
+    println!("Sending at random moments of the next like window; keep this running (or use `pop holder serve`)...");
+    while h.queued_likes() > 0 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    println!("Sent.");
+}
+
 async fn holder_cmd(a: HolderArgs) -> anyhow::Result<()> {
     let wallet_dir = a.wallet.clone();
     let relays = wiring::Relays { issuer: a.issuer_relay.clone(), directory: a.directory_relay.clone() };
@@ -828,6 +887,57 @@ async fn holder_cmd(a: HolderArgs) -> anyhow::Result<()> {
                 );
             }
         }
+        HolderCmd::Pair { words, name, auto } => {
+            let words = if words.is_empty() {
+                println!("Type the nine words the other computer shows and press Enter.");
+                let mut s = String::new();
+                std::io::stdin().read_line(&mut s)?;
+                s
+            } else {
+                words.join(" ")
+            };
+            let p = h.pair(&words, name.as_deref(), auto).await?;
+            let end = pop_crypto::dates::fmt_day((p.end_ms / 86_400_000) as u32);
+            if p.ended {
+                println!("Paired as \"{}\". Its period is over (ended {end}): the likes it left were collected once.", p.name);
+            } else {
+                println!("Paired as \"{}\" until {} UTC ({end}). Likes from it are collected every few minutes while `pop holder serve` runs.", p.name, fmt_ms(p.end_ms));
+            }
+            if auto {
+                wait_for_queue(&h).await;
+            } else {
+                print_inbox(&h)?;
+            }
+        }
+        HolderCmd::Pairings => {
+            let n = h.collect_pairings().await?;
+            for p in h.pairings()? {
+                println!("{}: until {} UTC{}{}", p.name, fmt_ms(p.end_ms), if p.ended { " (ended)" } else { "" }, if p.auto { ", sends without asking" } else { "" });
+            }
+            if n > 0 {
+                println!("{n} new like(s) collected.");
+            }
+            print_inbox(&h)?;
+            wait_for_queue(&h).await;
+        }
+        HolderCmd::Approve { ids } => {
+            let ids = inbox_ids(&h, &ids)?;
+            for r in h.approve(&ids).await? {
+                match r.error {
+                    None => println!("{}: queued", r.id),
+                    Some(e) => println!("{}: not queued: {e}", r.id),
+                }
+            }
+            wait_for_queue(&h).await;
+        }
+        HolderCmd::Reject { ids } => {
+            let ids = inbox_ids(&h, &ids)?;
+            println!("{} like(s) dropped.", h.reject(&ids).await?);
+        }
+        HolderCmd::Unpair { name } => {
+            h.unpair(&name).await?;
+            println!("\"{name}\" unpaired: it can leave no more likes.");
+        }
         HolderCmd::Serve { listen, token } => {
             anyhow::ensure!(listen.ip().is_loopback(), "the local API must listen on a loopback address");
             let tf = wallet_dir.join("pairing-token");
@@ -899,7 +1009,8 @@ async fn main() -> anyhow::Result<()> {
             println!("Directory listening on http://{listen}");
             // the directory's gateway pads to the issuer's size classes
             let pad_sizes = pop_protocol::api::IssuerApi::params(&HttpClient::new(&issuer_url)).await?.pad_sizes;
-            serve(listen, wiring::with_gateway(pop_directory::router(d), &pad_sizes)?).await?;
+            let mailbox = wiring::mailbox(data_dir.as_deref())?;
+            serve(listen, wiring::with_gateway(pop_directory::router(d).merge(mailbox), &pad_sizes)?).await?;
         }
         Cmd::Relay { listen, gateways } => {
             let mut m = std::collections::BTreeMap::new();
