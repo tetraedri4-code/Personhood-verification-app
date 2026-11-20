@@ -251,7 +251,7 @@ impl Issuer {
             providers,
             alarm_cutoff: self.alarm_cutoff(),
             pad_sizes: self.cfg.policy.pad_sizes.clone(),
-            like_delay_max_secs: self.cfg.policy.like_delay_max_secs,
+            like_window_secs: self.cfg.policy.like_window_secs,
         }
     }
 

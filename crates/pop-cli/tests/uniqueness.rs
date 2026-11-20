@@ -13,7 +13,7 @@ fn scheme() -> SchemeConfig {
 }
 
 fn opts(dir: &Path, uniqueness: UniquenessMode) -> DevnetOpts {
-    DevnetOpts { scheme: scheme(), data_dir: Some(dir.to_path_buf()), ports: [0; 5], uniqueness, replace_wait_days: None, bucket_posts: None, like_delay_max_secs: None }
+    DevnetOpts { scheme: scheme(), data_dir: Some(dir.to_path_buf()), ports: [0; 5], uniqueness, replace_wait_days: None, bucket_posts: None, like_window_secs: None }
 }
 
 fn tmp(name: &str) -> PathBuf {

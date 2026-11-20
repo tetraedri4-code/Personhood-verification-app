@@ -393,19 +393,22 @@ impl Holder {
 
     /// Report a like with a one-per-person tag. Returns the verified count of the post.
     /// The request carries no account and no pseudonym, and tags of different posts are unlinkable.
-    /// The random wait before a like is proved and sent: from 0 to the issuer's `like_delay_max_secs`.
-    /// Without it, the moment a public count goes up shows when the person clicked, which a relay that
-    /// sees their address could match.
-    pub async fn like_delay(&self) -> Result<std::time::Duration> {
-        use rand::Rng;
-        let max = self.params().await?.like_delay_max_secs as u64 * 1000;
-        Ok(std::time::Duration::from_millis(OsRng.gen_range(0..=max)))
+    /// The wait before a like is proved and sent, and the longest it can be, in seconds. Likes go out
+    /// on a schedule shared by everyone: windows of the issuer's `like_window_secs`, counted from the
+    /// Unix epoch. A like clicked in one window is sent at a random moment of the next, so a public
+    /// count going up, or a send seen by the relay, tells only the window of the click. Without the
+    /// wait, the moment a count goes up shows when the person clicked, which a relay that sees their
+    /// address could match.
+    pub async fn like_delay(&self) -> Result<(std::time::Duration, u64)> {
+        let w = self.params().await?.like_window_secs as u64;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| HolderError::Internal(e.to_string()))?;
+        Ok(like_send_delay(now.as_millis() as u64, w, &mut OsRng))
     }
 
     /// Check at once what can be checked before the wait (credential, probation, post id), then queue
     /// the like: it is proved and sent after [`Holder::like_delay`]. Survives a restart of the app
     /// ([`Holder::resume_queued_likes`]). Returns the canonical post id and the longest wait in seconds.
-    pub async fn like_later(self: &Arc<Self>, platform: &str, raw_post: &str) -> Result<(String, u32)> {
+    pub async fn like_later(self: &Arc<Self>, platform: &str, raw_post: &str) -> Result<(String, u64)> {
         let (post, new) = {
             let _g = self.busy.lock().await;
             let mut st = self.wallet.load()?;
@@ -421,14 +424,14 @@ impl Holder {
             }
             (post, new)
         };
+        let (delay, within) = self.like_delay().await?;
         if new {
-            self.spawn_queued(platform.to_string(), post.clone()).await?;
+            self.spawn_queued(platform.to_string(), post.clone(), delay);
         }
-        Ok((post, self.params().await?.like_delay_max_secs))
+        Ok((post, within))
     }
 
-    async fn spawn_queued(self: &Arc<Self>, platform: String, post: String) -> Result<()> {
-        let delay = self.like_delay().await?;
+    fn spawn_queued(self: &Arc<Self>, platform: String, post: String, delay: std::time::Duration) {
         let h = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
@@ -442,7 +445,6 @@ impl Holder {
                 let _ = h.wallet.save(&st);
             }
         });
-        Ok(())
     }
 
     /// How many likes wait to be sent.
@@ -450,12 +452,14 @@ impl Holder {
         self.wallet.load().map(|s| s.queued_likes.len()).unwrap_or(0)
     }
 
-    /// Queue again the likes that were waiting when the app stopped, each with a new random wait.
+    /// Queue again the likes that were waiting when the app stopped: each is sent at its own random
+    /// moment of the window after this one.
     pub async fn resume_queued_likes(self: &Arc<Self>) -> Result<usize> {
         let q = self.wallet.load()?.queued_likes;
         for k in &q {
             if let Some((platform, post)) = k.split_once('|') {
-                self.spawn_queued(platform.to_string(), post.to_string()).await?;
+                let (delay, _) = self.like_delay().await?;
+                self.spawn_queued(platform.to_string(), post.to_string(), delay);
             }
         }
         Ok(q.len())
@@ -598,5 +602,39 @@ impl Holder {
 
     pub fn platforms(&self) -> &PlatformRegistry {
         &self.platforms
+    }
+}
+
+/// The wait before sending a like clicked at `now_ms` (Unix time, milliseconds) with windows of
+/// `window_secs`: until a random moment of the next window. Also returns the longest possible wait in
+/// seconds (until the end of the next window). A window of 0 sends at once.
+pub fn like_send_delay(now_ms: u64, window_secs: u64, rng: &mut impl rand::RngCore) -> (std::time::Duration, u64) {
+    use rand::Rng;
+    if window_secs == 0 {
+        return (std::time::Duration::ZERO, 0);
+    }
+    let w = window_secs * 1000;
+    let next = (now_ms / w + 1) * w;
+    let at = next + rng.gen_range(0..w);
+    (std::time::Duration::from_millis(at - now_ms), (next + w - now_ms).div_ceil(1000))
+}
+
+#[cfg(test)]
+mod like_schedule_tests {
+    use super::like_send_delay;
+
+    #[test]
+    fn a_like_goes_out_in_the_next_window_whenever_it_was_clicked() {
+        let mut rng = rand::rngs::OsRng;
+        let w = 1800u64;
+        for now in [0u64, 1, 899_999, 1_799_999, 1_800_000, 1_800_001, 1_763_600_123_456] {
+            for _ in 0..200 {
+                let (d, within) = like_send_delay(now, w, &mut rng);
+                let at = now + d.as_millis() as u64;
+                assert_eq!(at / (w * 1000), now / (w * 1000) + 1, "sent in the window after the click");
+                assert!(d.as_secs() <= within && within <= 2 * w);
+            }
+        }
+        assert_eq!(like_send_delay(5, 0, &mut rng), (std::time::Duration::ZERO, 0));
     }
 }

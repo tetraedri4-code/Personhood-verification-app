@@ -124,7 +124,7 @@
           if (!adapter.isLiked(btn)) return;
           const r = await send({ type: "like", platform: adapter.id, post: id, shown: state.mine.has(id) ? null : Number(state.counts[id] || 0) });
           if (r && !r.error) {
-            // the holder app sends the like after a random wait; show it now
+            // the holder app sends the like in the next window of the schedule; show it now
             if (!state.mine.has(id)) state.counts[id] = Number(state.counts[id] || 0) + 1;
             state.mine.add(id);
             scan();

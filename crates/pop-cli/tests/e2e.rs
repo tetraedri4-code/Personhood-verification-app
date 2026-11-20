@@ -26,7 +26,7 @@ async fn net() -> &'static Devnet {
                     uniqueness: devnet::UniquenessMode::Hmac,
                     replace_wait_days: None,
                     bucket_posts: None,
-                    like_delay_max_secs: Some(2),
+                    like_window_secs: Some(1),
                 })
                 .await
                 .unwrap();

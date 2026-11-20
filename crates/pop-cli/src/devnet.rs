@@ -24,9 +24,9 @@ pub struct DevnetOpts {
     pub replace_wait_days: Option<u32>,
     /// the directory's `bucket_posts` (None = its default, 32)
     pub bucket_posts: Option<u32>,
-    /// the issuer's `like_delay_max_secs` (None = 20 seconds here, so that trying it out is not slow;
-    /// the policy's default for a real deployment is 600)
-    pub like_delay_max_secs: Option<u32>,
+    /// the issuer's `like_window_secs` (None = 10 seconds here, so that trying it out is not slow;
+    /// the policy's default for a real deployment is 1800)
+    pub like_window_secs: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,7 +40,7 @@ pub enum UniquenessMode {
 
 impl Default for DevnetOpts {
     fn default() -> Self {
-        DevnetOpts { scheme: SchemeConfig::default(), data_dir: None, ports: [4000, 4001, 4002, 4003, 4004], uniqueness: UniquenessMode::Hmac, replace_wait_days: None, bucket_posts: None, like_delay_max_secs: None }
+        DevnetOpts { scheme: SchemeConfig::default(), data_dir: None, ports: [4000, 4001, 4002, 4003, 4004], uniqueness: UniquenessMode::Hmac, replace_wait_days: None, bucket_posts: None, like_window_secs: None }
     }
 }
 
@@ -209,7 +209,7 @@ pub async fn start(o: DevnetOpts) -> anyhow::Result<Devnet> {
         uniqueness_key: None,
         policy: pop_issuer::Policy {
             replace_wait_days: o.replace_wait_days.unwrap_or(pop_issuer::Policy::default().replace_wait_days),
-            like_delay_max_secs: o.like_delay_max_secs.unwrap_or(20),
+            like_window_secs: o.like_window_secs.unwrap_or(10),
             ..Default::default()
         },
     })

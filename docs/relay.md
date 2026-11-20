@@ -74,19 +74,25 @@ Encryption hides what a message says, not how long it is or when it is sent. Bot
   download, or match an answer to one of the public count buckets by its length. Both gateways pad
   answers with the issuer's sizes and name them inside every encrypted answer; clients pad requests
   with the sizes of the last answer (the defaults until then).
-- **`like_delay_max_secs`** (default 600). The holder app waits a random time from 0 to this before it
-  proves and sends a like. The relay sees when a person's computer sends something, and anyone can see
-  when a public count goes up; without the wait, the two together would tie the person to the post when
-  there are few users. The extension shows the like at once and keeps showing it until it has surely
+- **`like_window_secs`** (default 1800, half an hour). Likes go out on a schedule that is the same for
+  everyone: windows of this length counted from 1 January 1970 (UTC), so every half-hour mark is a
+  window boundary. A like clicked in one window is proved and sent at a random moment of the next. The
+  relay sees when a person's computer sends something, and anyone can see when a public count goes up;
+  without the schedule, the two together would tie the person to the post when there are few users.
+  With it, both show only the window of the click: every like clicked in that window by anyone looks the
+  same. The sends are spread over the whole next window, so the servers see no spike at the marks. A
+  like waits between a moment and two windows (one hour at the default). The extension shows the like at once and keeps showing it until it has surely
   arrived; the holder keeps waiting likes in the wallet across a restart. The proof is made after the
-  wait, so it uses the revocation root of that moment. (`pop devnet` and `pop demo` default to 20 s;
-  `--like-delay-max-secs` changes it.)
+  wait, so it uses the revocation root of that moment. If the app is closed when its like is due, the like
+  stays queued and goes out in the window after the app starts again: later, which tells no more. (`pop devnet` and `pop demo` default to 20 s;
+  `--like-window-secs` changes it.)
 
 ## What it does not do
 
 - **No mixing and no cover traffic.** The design's relays also mix reports and add dummy ones (§4.7).
-  The random wait spreads likes over ten minutes; with very few users that window may still hold only
-  one person's likes. Bindings and renewals are sent at once: a binding right after an enrolment is
+  The schedule hides a like among those clicked in the same half-hour; with very few users that window
+  may still hold only one person's likes. The window marks follow the device's clock: a device whose
+  clock is far off sends outside the others' windows and stands out. Bindings and renewals are sent at once: a binding right after an enrolment is
   still linkable by timing when there are few users.
 - **Size classes are coarse.** Messages in the same class look the same; a like report (about 4 KiB)
   is still in a different class from a small download.

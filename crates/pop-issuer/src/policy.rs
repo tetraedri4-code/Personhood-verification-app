@@ -44,9 +44,11 @@ pub struct Policy {
     /// that fits; beyond the largest, a multiple of it), so that their length says little
     /// (docs/relay.md). Both gateways and all clients use these.
     pub pad_sizes: Vec<u32>,
-    /// Holders wait a random time from 0 to this many seconds before proving and sending a like, so
-    /// that the moment a public count goes up does not show when someone clicked. 0: at once.
-    pub like_delay_max_secs: u32,
+    /// Likes go out on a fixed schedule of windows this many seconds long, the same for everyone
+    /// (counted from 1 January 1970, UTC). A like clicked in one window is proved and sent at a random
+    /// moment of the next, so a public count going up shows only the window of the click, never the
+    /// moment within it. 0: at once.
+    pub like_window_secs: u32,
 }
 
 impl Default for Policy {
@@ -64,7 +66,7 @@ impl Default for Policy {
             previous_root_grace_secs: 120,
             max_backup_chars: 44_000,
             pad_sizes: vec![1024, 4096, 16384, 65536, 262144, 1048576],
-            like_delay_max_secs: 600,
+            like_window_secs: 1800,
         }
     }
 }
@@ -112,9 +114,10 @@ impl Policy {
         if p.is_empty() || p.len() > 16 || p.windows(2).any(|w| w[0] >= w[1]) || p.iter().any(|&n| !(256..=16 << 20).contains(&n)) {
             return Err("policy.pad_sizes must be 1 to 16 increasing sizes, each from 256 bytes to 16 MiB".into());
         }
-        // the proof is made after the wait, so it needs no fresher root; a day keeps it the same day's
-        if self.like_delay_max_secs > 86_400 {
-            return Err("policy.like_delay_max_secs must be at most 86400 (one day)".into());
+        // the proof is made after the wait, so it needs no fresher root; at most two windows of 12 h
+        // keeps the longest wait within a day
+        if self.like_window_secs > 43_200 {
+            return Err("policy.like_window_secs must be at most 43200 (12 hours)".into());
         }
         self.alarm.validate()
     }
@@ -155,6 +158,6 @@ mod tests {
         assert!(bad(|p| p.pad_sizes = vec![]));
         assert!(bad(|p| p.pad_sizes = vec![4096, 1024]));
         assert!(bad(|p| p.pad_sizes = vec![16]));
-        assert!(bad(|p| p.like_delay_max_secs = 100_000));
+        assert!(bad(|p| p.like_window_secs = 50_000));
     }
 }

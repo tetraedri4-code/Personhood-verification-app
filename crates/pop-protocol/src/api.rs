@@ -45,10 +45,10 @@ pub struct Params {
     /// gateway pads with them too. Empty: the defaults of the relay code.
     #[serde(default)]
     pub pad_sizes: Vec<u32>,
-    /// A holder waits a random time up to this before it proves and sends a like, so that the moment
-    /// a count goes up does not show when the person clicked (`policy.like_delay_max_secs`).
+    /// Likes go out on a shared schedule of windows this long: a like clicked in one window is sent
+    /// at a random moment of the next (`policy.like_window_secs`). 0: at once.
     #[serde(default)]
-    pub like_delay_max_secs: u32,
+    pub like_window_secs: u32,
 }
 
 /// `GET /v1/reports`: how many people said "it wasn't me" per week, and the rule that turns them into

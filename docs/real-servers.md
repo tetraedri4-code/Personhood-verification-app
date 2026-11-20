@@ -143,7 +143,7 @@ at start. The settings in force are public at `GET /v1/policy`.
   "previous_root_grace_secs": 120,         // proofs against the previous revocation root are taken this long
   "max_backup_chars": 44000,               // largest encrypted backup
   "pad_sizes": [1024, 4096, 16384, 65536, 262144, 1048576],  // relay messages are padded to these sizes
-  "like_delay_max_secs": 600               // holders wait a random 0 to 600 s before sending a like
+  "like_window_secs": 1800                // a like clicked in one half-hour is sent at a random moment of the next
 }
 ```
 

@@ -225,10 +225,10 @@ async function handle(msg) {
     const r = await holder(s, "/v1/like", { platform: msg.platform, post: msg.post });
     const dir = base(s.directoryUrl);
     await forgetCounts(dir, msg.platform);
-    // The holder app sends the like after a random wait. Until it has surely arrived and the copies
+    // The holder app sends the like at a random moment of the next window. Until it has surely arrived and the copies
     // here have expired, show at least the count seen at the click plus this like.
     if (r && r.queued && Number.isSafeInteger(msg.shown) && msg.shown >= 0) {
-      const within = Number.isSafeInteger(r.within_secs) ? Math.min(r.within_secs, 86_400) : 600;
+      const within = Number.isSafeInteger(r.within_secs) ? Math.min(r.within_secs, 86_400) : 3600;
       const pending = (await chrome.storage.local.get("pendingLikes")).pendingLikes || {};
       const pk = `${dir}|${msg.platform}|${msg.post}`;
       if (!pending[pk]) pending[pk] = { until: Date.now() + (within + 30) * 1000 + TTL_MS, min: msg.shown + 1 };

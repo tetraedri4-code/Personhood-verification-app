@@ -349,10 +349,10 @@ struct DevnetArgs {
     /// readers sync the whole table; 1 makes them use buckets)
     #[arg(long)]
     bucket_posts: Option<u32>,
-    /// the issuer's longest random wait before a like is sent, in seconds (default 20 here; 600 in a
-    /// real deployment's policy)
+    /// the issuer's window for sending likes, in seconds: a like is sent at a random moment of the
+    /// window after the click (default 10 here; 1800 in a real deployment's policy)
     #[arg(long)]
-    like_delay_max_secs: Option<u32>,
+    like_window_secs: Option<u32>,
 }
 
 #[derive(Args, Clone, Default)]
@@ -491,7 +491,7 @@ fn devnet_opts(a: &DevnetArgs) -> anyhow::Result<DevnetOpts> {
             _ => anyhow::bail!("--uniqueness must be threshold or hmac"),
         },
         bucket_posts: a.bucket_posts,
-        like_delay_max_secs: a.like_delay_max_secs,
+        like_window_secs: a.like_window_secs,
         ..Default::default()
     })
 }
@@ -721,8 +721,8 @@ async fn holder_cmd(a: HolderArgs) -> anyhow::Result<()> {
             println!("Badge withdrawn.");
         }
         HolderCmd::Like { platform, post } => {
-            let wait = h.like_delay().await?;
-            println!("Waiting {} s before sending (a random wait, so the count does not go up the moment you liked)...", wait.as_secs());
+            let (wait, _) = h.like_delay().await?;
+            println!("Waiting {} s before sending (likes go out at a random moment of the next window, so the count does not go up the moment you liked)...", wait.as_secs());
             tokio::time::sleep(wait).await;
             let r = h.like(&platform, &post).await?;
             println!("Reported. New person: {}. Verified likes on this post: {}.", r.new, r.count);

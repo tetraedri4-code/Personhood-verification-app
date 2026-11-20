@@ -96,8 +96,8 @@ struct LikeReq {
     post: String,
 }
 
-/// Queues the like: it is proved and sent after a random wait (the issuer's `like_delay_max_secs`), so
-/// the answer only says it is queued. What can fail early (no credential, probation, a bad post id)
+/// Queues the like: it is proved and sent at a random moment of the next window (the issuer's
+/// `like_window_secs`), so the answer only says it is queued. What can fail early (no credential, probation, a bad post id)
 /// fails here.
 async fn like(State(s): State<St>, Json(r): Json<LikeReq>) -> Response {
     match s.holder.like_later(&r.platform, &r.post).await {

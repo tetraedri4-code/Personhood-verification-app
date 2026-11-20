@@ -272,6 +272,24 @@ buckets, and few other pages give the same set, so the directory can guess that 
 profile. Buckets hide single posts, not pages. Through a relay the directory does not learn who; without
 one it learns the address. Use a relay.
 
+### Review of the schedule for likes, 20 November 2026
+
+The random wait before a like (up to ten minutes) is replaced by a schedule shared by everyone: a like
+clicked in one window (issuer setting, default half an hour) is proved and sent at a random moment of
+the next. Two passes; nothing to fix.
+
+Checked and found sound: the send moment does not depend on when in its window the like was clicked
+(test `a_like_goes_out_in_the_next_window_whenever_it_was_clicked`); each like still has its own proof,
+so likes stay unlinkable; sends are spread over the window, so there is no spike at the marks; a like
+whose window passed while the app was closed goes out in the window after the next start, revealing
+nothing more; the setting is at most 12 hours, so the longest wait (two windows) stays within a day and
+the extension's display of a waiting like stays bounded; the proof is still made at send time, against
+that moment's revocation root and probation.
+
+Known and not fixed: the windows follow the device's clock, so a device whose clock is minutes off sends
+outside everyone else's windows and can be told apart. The app could take the time from the issuer's
+answers instead.
+
 ### Checked and found sound
 
 - **Proof verification.** Points are subgroup-checked on decoding; identity elements are rejected where
